@@ -12,6 +12,7 @@ import {
   type ChatToolReconnectAction,
   type ChatToolReconnectProgress,
   type ChatToolReconnectResult,
+  attributeChatToolError,
   authorityRefusalFromChatToolError,
   type ToolErrorAttribution,
 } from "@/components/tools/error-attribution"
@@ -157,7 +158,9 @@ const Tool = ({
     useChatToolReconnect(toolPart, { onReconnect, onReopenAuthorization })
   const errorAttribution = reconnectAction
     ? reconnectAttribution(reconnectAction, reconnectPresentation?.badgeLabel ?? "Reconnect required")
-    : null
+    : isError && toolPart.errorText
+      ? attributeChatToolError(toolPart.errorText)
+      : null
   // Says what to do about a refused authority, derived from the error text.
   const authorityRefusal = isError && toolPart.errorText
     ? authorityRefusalFromChatToolError(toolPart.errorText)
@@ -201,6 +204,11 @@ const Tool = ({
         data-testid="chat-mcp-reconnect-action" disabled={reconnectPresentation?.disabled}
         aria-label={`${reconnectPresentation?.buttonLabel} ${reconnectAction.connectionName}`}
         onClick={() => void handleReconnect()}>{reconnectPresentation?.buttonLabel}</Button> : null} />
+    {authorityRefusal && errorAttribution ? (
+      <span className="text-xs text-dls-secondary" title={`${errorAttribution.confidence}: ${errorAttribution.description}`}>
+        {errorAttribution.label}
+      </span>
+    ) : null}
     {authorityRefusal ? <AuthorityRefusalNotice refusal={authorityRefusal} /> : null}
   </div>
 
