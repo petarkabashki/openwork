@@ -5,11 +5,11 @@ import {
   Cloud,
   Cog,
   FolderLock,
+  Keyboard,
   LifeBuoy,
   MessageCircle,
   Paintbrush,
   RefreshCcw,
-  ShieldCheck,
   Sparkles,
   Terminal,
   Wrench,
@@ -35,16 +35,16 @@ type SettingsCardDefinition = { tab: SettingsTab; icon: typeof Sparkles } & (
 const workspaceCards: SettingsCardDefinition[] = [
   { tab: "preferences", icon: Cog, title: "Preferences", desc: "Default model, reasoning, and compaction." },
   { tab: "permissions", icon: FolderLock, title: "Permissions", desc: "Authorized folders and file access." },
-  { tab: "advanced", icon: Wrench, title: "Advanced", desc: "Runtime, engine, and developer options." },
+  { tab: "advanced", icon: Wrench, title: "Advanced", desc: "Runtime, engine, recovery, and developer options." },
 ];
 
 const globalCards: SettingsCardDefinition[] = [
   { tab: "ai", icon: Sparkles, title: "AI Providers", desc: "Connect services that provide AI models." },
   { tab: "cloud-account", icon: Cloud, title: "Cloud", desc: "OpenWork Cloud account and organization." },
   { tab: "appearance", icon: Paintbrush, title: "Appearance", desc: "Theme, font size, and display." },
+  { tab: "shortcuts", icon: Keyboard, title: "Keyboard shortcuts", desc: "Keys that switch to your saved models." },
   { tab: "environment", icon: Terminal, title: "Environment", desc: "Environment variables and paths." },
   { tab: "updates", icon: RefreshCcw, title: "Updates", desc: "App version and update channel." },
-  { tab: "recovery", icon: ShieldCheck, title: "Recovery", desc: "Reset onboarding and clear data." },
 ];
 
 function cardTitle(card: SettingsCardDefinition) {

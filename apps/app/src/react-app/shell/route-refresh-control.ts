@@ -1,6 +1,8 @@
 // Concurrency and degraded-state policy for the session route's
 // refreshRouteState. Extracted as pure helpers so the desktop restart
 // recovery contract is unit-testable without rendering the route.
+import type { ResolvedWorkspaceEndpoint } from "@/app/lib/workspace-endpoint";
+import type { RouteWorkspace } from "./route-workspaces";
 
 export type RouteRefreshAttempt = {
   readonly generation: number;
@@ -28,6 +30,214 @@ export type RouteRefreshLifecycle = {
   begin(options?: { supersede?: boolean }): RouteRefreshAttempt | null;
   isInFlight(): boolean;
 };
+
+export type RouteWorkspaceLoadCoalescer = {
+  /**
+   * Share a workspace's active chain only within the same engine/endpoint.
+   * A changed scope starts immediately and makes the old chain stale.
+   */
+  run(workspaceId: string, scope: string, load: (isCurrent: () => boolean) => Promise<void>): Promise<void>;
+  isInFlight(workspaceId: string): boolean;
+  invalidate(workspaceId: string): void;
+};
+
+export type LatestWorkspaceCommitter = {
+  /** Queue the route's newest workspace. Intermediate requests are discarded. */
+  request(workspaceId: string): void;
+  /** Resolve after the current commit and any newer queued commit finish. */
+  settled(): Promise<void>;
+};
+
+export type RouteWorkspaceSelectionCommit = (workspaceId: string) => Promise<void>;
+
+export type RouteWorkspaceSelectionCommitter = {
+  /** Queue the newest route selection, including the route's live commit implementation. */
+  request(workspaceId: string, commit: RouteWorkspaceSelectionCommit): void;
+  /** Resolve after the current commit and any newer queued route selection finish. */
+  settled(): Promise<void>;
+};
+
+/**
+ * Serialize workspace-selection side effects while retaining only the newest
+ * request. Desktop persistence and server activation cannot safely race: an
+ * older, slower request must finish before the final route is committed.
+ */
+export function createLatestWorkspaceCommitter(
+  commit: (workspaceId: string) => Promise<void>,
+): LatestWorkspaceCommitter {
+  const committer = createRouteWorkspaceSelectionCommitter();
+
+  return {
+    request(workspaceId) {
+      committer.request(workspaceId, commit);
+    },
+    settled: () => committer.settled(),
+  };
+}
+
+/**
+ * Serialize workspace selection across route lifetimes. A component-local
+ * queue disappears when navigation unmounts the session route, which lets a
+ * pending session selection race the Settings route's first runtime reads.
+ * Each request carries its route's live commit callback so the shared queue
+ * can outlive either component while retaining only the newest destination.
+ */
+export function createRouteWorkspaceSelectionCommitter(): RouteWorkspaceSelectionCommitter {
+  let pending: { workspaceId: string; commit: RouteWorkspaceSelectionCommit } | null = null;
+  let running: Promise<void> | null = null;
+
+  const drain = async () => {
+    while (pending !== null) {
+      const request = pending;
+      pending = null;
+      let succeeded = true;
+      try {
+        await request.commit(request.workspaceId);
+      } catch {
+        succeeded = false;
+      }
+      // A newer request for the same workspace is satisfied only when this
+      // commit succeeded. After a failure, retain the newer route's callback
+      // because it may hold a freshly resolved connection.
+      const newerRequest = pending as { workspaceId: string; commit: RouteWorkspaceSelectionCommit } | null;
+      if (succeeded && newerRequest?.workspaceId === request.workspaceId) pending = null;
+    }
+  };
+
+  const start = () => {
+    if (running) return;
+    running = drain().finally(() => {
+      running = null;
+      if (pending !== null) start();
+    });
+  };
+
+  return {
+    request(workspaceId, commit) {
+      const id = workspaceId.trim();
+      if (!id) return;
+      pending = { workspaceId: id, commit };
+      start();
+    },
+    async settled() {
+      while (running) await running;
+    },
+  };
+}
+
+/** One last-selection-wins queue shared by session, Settings, and extensions routes. */
+export const routeWorkspaceSelectionCommitter = createRouteWorkspaceSelectionCommitter();
+
+/**
+ * Apply the three workspace-selection side effects in a stable order. The
+ * desktop store implements selected and runtime-active as separate read/write
+ * mutations, so issuing them concurrently can make the last writer restore
+ * stale fields from its earlier read.
+ */
+export async function commitRouteWorkspaceSelection(input: {
+  workspaceId: string;
+  desktopRuntime: boolean;
+  setDesktopSelected: (workspaceId: string) => Promise<unknown>;
+  setDesktopRuntimeActive: (workspaceId: string) => Promise<unknown>;
+  activateWorkspace: (workspaceId: string) => Promise<unknown>;
+}): Promise<void> {
+  const workspaceId = input.workspaceId.trim();
+  if (!workspaceId) return;
+  if (input.desktopRuntime) {
+    await input.setDesktopSelected(workspaceId).catch(() => undefined);
+    await input.setDesktopRuntimeActive(workspaceId).catch(() => undefined);
+  }
+  await input.activateWorkspace(workspaceId);
+}
+
+export async function mapRouteWorkspaceLoads<T, R>(
+  workspaces: readonly T[],
+  load: (workspace: T) => Promise<R>,
+): Promise<R[]> {
+  const batchSize = 4;
+  const results: R[] = [];
+  for (let offset = 0; offset < workspaces.length; offset += batchSize) {
+    results.push(...await Promise.all(workspaces.slice(offset, offset + batchSize).map(load)));
+  }
+  return results;
+}
+
+/**
+ * Coalesce the complete session-list load chain for each workspace.
+ *
+ * Cold OpenCode reads can legitimately outlive a fixed staleness threshold.
+ * Keeping ownership until the promise settles prevents route, settings, and
+ * visibility refreshes from starting overlapping retries for the same
+ * workspace while still allowing different workspaces to load concurrently.
+ * Changed engines/endpoints must not wait for an obsolete, possibly hung read.
+ */
+export function createRouteWorkspaceLoadCoalescer(): RouteWorkspaceLoadCoalescer {
+  const current = new Map<string, { scope: string; promise: Promise<void> | null }>();
+
+  return {
+    run(workspaceId, scope, load) {
+      const existing = current.get(workspaceId);
+      if (existing?.scope === scope && existing.promise) return existing.promise;
+
+      const entry: { scope: string; promise: Promise<void> | null } = { scope, promise: null };
+      const isCurrent = () => current.get(workspaceId) === entry;
+      const request = Promise.resolve().then(() => {
+        if (isCurrent()) return load(isCurrent);
+      });
+      const tracked = request.finally(() => {
+        entry.promise = null;
+      });
+      entry.promise = tracked;
+      current.set(workspaceId, entry);
+      return tracked;
+    },
+    isInFlight: (workspaceId) => Boolean(current.get(workspaceId)?.promise),
+    invalidate: (workspaceId) => { current.delete(workspaceId); },
+  };
+}
+
+/** Unknown local routing is not v1. Remote inventories retain their native transport. */
+export function routeWorkspaceSessionLoadScope(
+  workspace: RouteWorkspace,
+  endpoint: ResolvedWorkspaceEndpoint | null,
+  engineV2ChatRouting: boolean | undefined,
+): string | null {
+  const remote = workspace.workspaceType === "remote";
+  if (!remote && (!endpoint || engineV2ChatRouting === undefined)) return null;
+  return JSON.stringify([
+    workspace.workspaceType,
+    workspace.remoteType,
+    workspace.path,
+    endpoint?.baseUrl,
+    endpoint?.workspaceId,
+    endpoint?.mountedBaseUrl,
+    endpoint?.opencodeBaseUrl,
+    endpoint?.token,
+    remote ? false : engineV2ChatRouting,
+  ]);
+}
+
+/**
+ * Every workspace with an unloaded session index gets a background load, with
+ * the routed workspace first so the visible pane fills fastest. Loading only
+ * the routed workspace left every other workspace's sidebar showing the
+ * "No tasks yet." empty state on launch even when it had sessions, because
+ * nothing else ever fetched their session lists. Session-list loads are
+ * read-only native `session.list` calls, so this does not interact with the
+ * workspace-activation serialization from the switching-coherence fix.
+ */
+export function planRouteWorkspaceLoads(
+  workspaceIds: string[],
+  selectedWorkspaceId: string,
+  loadedWorkspaceIds: ReadonlySet<string>,
+): string[] {
+  const selectedId = selectedWorkspaceId.trim();
+  const selectedFirst = selectedId && !loadedWorkspaceIds.has(selectedId) && workspaceIds.includes(selectedId)
+    ? [selectedId]
+    : [];
+  const remaining = workspaceIds.filter((id) => id !== selectedId && !loadedWorkspaceIds.has(id));
+  return [...selectedFirst, ...remaining];
+}
 
 export function createRouteRefreshLifecycle(): RouteRefreshLifecycle {
   let latestGeneration = 0;

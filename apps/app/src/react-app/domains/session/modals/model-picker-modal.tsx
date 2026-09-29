@@ -17,9 +17,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { useIsMobile } from "@/hooks/use-mobile";
+import { useGatewayModelSelection } from "@/react-app/domains/connections/provider-auth/gateway-model-access";
 import { t } from "@/i18n";
 import { readDenSettings } from "@/app/lib/den";
+import { FAST_PRICING_WARNING, getModelBehaviorControls, getModelBehaviorSelection } from "@/app/lib/model-behavior";
+import {
+  gatewayConnectCopy,
+  gatewayConnectProviderKey,
+  type GatewayConnectProvider,
+  OPENWORK_GATEWAY_BADGE_LABEL,
+} from "@/react-app/domains/connections/provider-auth/cloud-provider-config";
 import { modelEquals, resolveProviderDisplayName } from "../../../../app/utils";
 import type { ModelOption, ModelRef } from "../../../../app/types";
 import { isRecommendedModel } from "../../../../app/defaults";
@@ -49,6 +59,7 @@ export type ModelPickerModalProps = {
   subtitle?: string;
   target: "default" | "session";
   current: ModelRef;
+  currentBehaviorValue?: string | null;
   onSelect: (model: ModelRef) => void;
   onBehaviorChange: (model: ModelRef, value: string | null) => void;
   onToggleProvider?: (providerId: string, enabled: boolean) => void;
@@ -60,6 +71,11 @@ export type ModelPickerModalProps = {
   openWorkModelsSyncing?: boolean;
   onRefreshOrganizationModels?: () => void | Promise<void>;
   restrictToCloud?: boolean;
+  /** Runtime provider ids routed through the OpenWork inference gateway (sync status source "openwork_gateway"). */
+  gatewayProviderIds?: ReadonlySet<string>;
+  /** Gateway providers waiting on this member's sign-in; shown as a compact "Connect" hint. */
+  gatewayConnectProviders?: GatewayConnectProvider[];
+  onConnectGatewayProvider?: (provider: GatewayConnectProvider) => void | Promise<void>;
 };
 
 type ProviderGroup = {
@@ -67,6 +83,7 @@ type ProviderGroup = {
   name: string;
   isNew: boolean;
   isCloud: boolean;
+  isGateway: boolean;
   isDisabled: boolean;
   hasCurrent: boolean;
   recommended: ModelOption[];
@@ -79,6 +96,23 @@ export type ModelPickerEmptyState = {
   showRefreshOrganizationModels: boolean;
   showOrganizationModelsSettings: boolean;
 };
+
+export type ProviderGroupBadge = { label: string; className: string };
+
+/** Header badges for one provider group, in display order. */
+export function resolveProviderGroupBadges(
+  group: Pick<ProviderGroup, "isNew" | "isCloud" | "isGateway" | "hasCurrent">,
+  organizationProviderLabel: string,
+): ProviderGroupBadge[] {
+  const badges: ProviderGroupBadge[] = [];
+  if (group.isNew) badges.push({ label: "New", className: "bg-blue-3 text-blue-11" });
+  if (group.isCloud) badges.push({ label: organizationProviderLabel, className: "bg-blue-3/50 text-blue-11/70" });
+  if (group.isGateway) {
+    badges.push({ label: OPENWORK_GATEWAY_BADGE_LABEL, className: "border-dls-border text-dls-secondary" });
+  }
+  if (group.hasCurrent) badges.push({ label: "Current", className: "bg-green-3 text-green-11" });
+  return badges;
+}
 
 export function resolveModelPickerEmptyState(input: {
   providerGroupCount: number;
@@ -114,6 +148,8 @@ export function resolveModelPickerEmptyState(input: {
 
 export function ModelPickerModal(props: ModelPickerModalProps) {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const isMobile = useIsMobile();
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
   const [refreshingOrganizationModels, setRefreshingOrganizationModels] = useState(false);
   const denAuth = useDenAuth();
@@ -128,19 +164,17 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
     () => new Set(props.disabledProviders ?? []),
     [props.disabledProviders],
   );
+  const gatewaySelection = useGatewayModelSelection(JSON.stringify([props.open, props.current, props.currentBehaviorValue]));
+  const currentOption = props.options.find((option) => !option.gatewayAuthorization && modelEquals(option, props.current));
+  const currentBehavior = getModelBehaviorSelection(currentOption?.behaviorOptions ?? [],
+    props.currentBehaviorValue !== undefined ? props.currentBehaviorValue : currentOption?.behaviorValue ?? null);
+  const behaviorControls = getModelBehaviorControls(currentBehavior.options, currentBehavior.value);
 
   // Reset on open
   useEffect(() => {
     if (props.open) {
       props.setQuery("");
     }
-  }, [props.open]);
-
-  // Focus search
-  useEffect(() => {
-    if (!props.open) return;
-    const frame = requestAnimationFrame(() => searchInputRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
   }, [props.open]);
 
   // Filter by search
@@ -167,7 +201,8 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
           name: opt.description ?? resolveProviderDisplayName(opt.providerID),
           isNew: !!opt.isRecommended,
           isCloud: opt.source === "cloud",
-          isDisabled: disabledSet.has(opt.providerID),
+          isGateway: props.gatewayProviderIds?.has(opt.providerID) === true || Boolean(opt.gatewayAuthorization),
+          isDisabled: opt.disabled === true || disabledSet.has(opt.providerID),
           hasCurrent: false,
           recommended: [],
           other: [],
@@ -194,7 +229,7 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
       if (a.hasCurrent !== b.hasCurrent) return a.hasCurrent ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
-  }, [filteredOptions, props.current, disabledSet]);
+  }, [filteredOptions, props.current, props.gatewayProviderIds, disabledSet]);
 
   // Auto-expand on search
   useEffect(() => {
@@ -240,8 +275,11 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
   }, []);
 
   const handleSelect = useCallback(
-    (opt: ModelOption) => props.onSelect({ providerID: opt.providerID, modelID: opt.modelID }),
-    [props.onSelect],
+    (opt: ModelOption) => {
+      if (opt.disabled || disabledSet.has(opt.providerID)) return;
+      gatewaySelection.select(opt, () => props.onSelect({ providerID: opt.providerID, modelID: opt.modelID }));
+    },
+    [disabledSet, gatewaySelection.select, props.onSelect],
   );
 
   const handleRefreshOrganizationModels = useCallback(async () => {
@@ -264,24 +302,24 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
 
   // Escape
   useEffect(() => {
-    if (!props.open) return;
+    if (!props.open || gatewaySelection.loginOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); props.onClose(); }
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [props.open]);
+  }, [props.open, gatewaySelection.loginOpen]);
 
   return (
     <Dialog
       open={props.open}
       onOpenChange={(open) => {
-        if (!open) props.onClose();
+        if (!open && !gatewaySelection.loginOpen) props.onClose();
       }}
     >
-      <DialogContent className="flex max-h-[calc(100vh-2rem)] min-h-0 w-full max-w-lg flex-col overflow-hidden sm:max-w-lg">
+      <DialogContent initialFocus={() => isMobile ? titleRef.current : searchInputRef.current} className="flex max-h-[calc(100dvh-2rem)] min-h-0 flex-col overflow-hidden lg:max-w-3xl">
         <DialogHeader>
-          <DialogTitle>{t("models.title")}</DialogTitle>
+          <DialogTitle ref={titleRef} tabIndex={-1}>{t("models.title")}</DialogTitle>
           <DialogDescription>
             {resolveModelPickerSubtitle(props.subtitle)}
           </DialogDescription>
@@ -294,7 +332,7 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
             <input
               ref={searchInputRef}
               type="text"
-              className="h-10 w-full rounded-xl border border-dls-border bg-dls-surface pl-9 pr-3 text-sm text-dls-text placeholder:text-dls-secondary focus:outline-none focus:ring-2 focus:ring-[rgba(var(--dls-accent-rgb),0.2)]"
+              className="h-10 w-full rounded-xl border border-dls-border bg-dls-surface pl-9 pr-3 text-base lg:text-sm text-dls-text placeholder:text-dls-secondary focus:outline-none focus:ring-2 focus:ring-[rgba(var(--dls-accent-rgb),0.2)]"
               placeholder={t("models.search_placeholder")}
               value={props.query}
               onChange={(e) => props.setQuery(e.target.value)}
@@ -302,7 +340,7 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
           </div>
 
           {props.openWorkModelsSyncing ? (
-            <div className="mb-3 flex shrink-0 items-center overflow-hidden rounded-2xl border border-amber-6/60 bg-amber-2/40">
+            <div className="mb-3 flex shrink-0 items-center overflow-hidden rounded-2xl border border-dls-border bg-dls-hover">
               <div className="flex min-w-0 flex-1 items-center gap-3 px-3 py-2.5">
                 <ProviderIcon providerId={OPENWORK_MODELS_PROVIDER_ID} providerName={OPENWORK_MODELS_PROVIDER_NAME} size={18} className="shrink-0 text-amber-11" />
                 <div className="min-w-0 flex-1">
@@ -317,8 +355,63 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
             </div>
           ) : null}
 
+          <div className="max-h-40 shrink-0 overflow-x-hidden overflow-y-auto">
+          {props.gatewayConnectProviders?.filter((provider) => !provider.models?.length).map((provider) => (
+            <div
+              key={gatewayConnectProviderKey(provider)}
+              className="mb-3 flex shrink-0 items-center gap-3 rounded-2xl border border-dashed border-dls-border px-3 py-2.5"
+            >
+              <ProviderIcon providerId={provider.providerId} providerName={provider.name} size={18} className="shrink-0 text-dls-secondary" />
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 flex-col items-start gap-1 text-[13px] font-medium text-dls-text">
+                  <span className="max-w-full truncate" title={provider.name}>{provider.name}</span>
+                  <Badge variant="outline" title={OPENWORK_GATEWAY_BADGE_LABEL} className="h-auto min-w-0 max-w-full rounded-md px-1.5 py-0.5 text-[10px] text-dls-secondary">
+                    <span className="truncate">{OPENWORK_GATEWAY_BADGE_LABEL}</span>
+                  </Badge>
+                </div>
+                <div className="truncate text-[11px] text-dls-secondary" title={gatewayConnectCopy(provider.name)}>{gatewayConnectCopy(provider.name)}</div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!props.onConnectGatewayProvider || disabledSet.has(provider.providerId)}
+                onClick={() => void props.onConnectGatewayProvider?.(provider)}
+              >
+                Login
+              </Button>
+            </div>
+          ))}
+
+          </div>
+
           {/* Content */}
-          <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1 -mr-1">
+          <div className="min-h-0 flex-1 space-y-1 overflow-x-hidden overflow-y-auto pr-1 -mr-1">
+            {currentOption && !disabledSet.has(currentOption.providerID) ? (
+              <section aria-label={`Settings for ${currentOption.title}`} className="mb-3 rounded-xl border border-dls-border p-3" data-testid="current-model-settings">
+                <div className="truncate text-xs font-medium" title={`${currentOption.title} · ${currentBehavior.label}`}>{currentOption.title} · {currentBehavior.label}</div>
+                <p role="status" className="mt-1 text-xs text-muted-foreground">{currentBehavior.description}</p>
+                {behaviorControls.hasFast ? (
+                  <div className="mt-2 space-y-1">
+                    <Button type="button" size="sm" variant={behaviorControls.fast ? "secondary" : "outline"}
+                      aria-pressed={behaviorControls.fast} disabled={behaviorControls.toggleValue === undefined}
+                      onClick={() => {
+                        if (behaviorControls.toggleValue !== undefined) props.onBehaviorChange(props.current, behaviorControls.toggleValue);
+                      }}>Fast: {behaviorControls.fast ? "On" : "Off"}</Button>
+                    <p className="text-xs text-muted-foreground">{FAST_PRICING_WARNING}</p>
+                  </div>
+                ) : null}
+                <div role="group" aria-label="Thinking and effort" className="mt-2 flex flex-wrap gap-2">
+                  {behaviorControls.options.map((option) => (
+                    <Button key={option.value === null ? "default" : `variant-${option.value}`} type="button" size="sm"
+                      variant={option.value === currentBehavior.value ? "secondary" : "outline"}
+                      aria-pressed={option.value === currentBehavior.value}
+                      onClick={() => props.onBehaviorChange(props.current, option.value)}>
+                      {option.label}
+                    </Button>
+                  ))}
+                </div>
+              </section>
+            ) : null}
             {emptyState ? (
               <div className="space-y-3 rounded-2xl border border-dls-border bg-dls-hover/30 px-4 py-6 text-center">
                 <div className="text-sm text-dls-secondary">
@@ -361,6 +454,7 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
 
         {/* Footer */}
         <DialogFooter className="shrink-0">
+          {denAuth.isSignedIn ? <Button variant="outline" onClick={() => platform.openLink(new URL("/dashboard/model-connections", readDenSettings().baseUrl).toString())}>My Model Connections</Button> : null}
           <DialogClose render={<Button variant="outline" />}>
             {t("models.done")}
           </DialogClose>
@@ -408,24 +502,27 @@ function ProviderAccordion({
           <Chevron size={14} className="shrink-0 text-dls-secondary" />
           <ProviderIcon providerId={group.id} size={18} className="shrink-0 text-dls-text" />
           <div className="min-w-0 flex-1">
-            <span className="text-[13px] font-medium text-dls-text">{group.name}</span>
+            <div className="flex min-w-0 items-baseline gap-2">
+              <span className="truncate text-[13px] font-medium text-dls-text" title={group.name}>{group.name}</span>
+              {" "}
+              <span className="shrink-0 whitespace-nowrap text-[11px] text-dls-secondary">
+                {totalModels} model{totalModels === 1 ? "" : "s"}
+              </span>
+            </div>
             {" "}
-            <span className="ml-2 text-[11px] text-dls-secondary">
-              {totalModels} model{totalModels === 1 ? "" : "s"}
-            </span>
+            <div className="flex flex-wrap items-center gap-1.5 empty:hidden">
+              {resolveProviderGroupBadges(group, organizationProviderLabel).map((badge) => (
+                <Badge
+                  key={badge.label}
+                  variant="outline"
+                  title={badge.label}
+                  className={`h-auto min-w-0 max-w-full rounded-md border-transparent px-1.5 py-0.5 text-[10px] ${badge.className}`}
+                >
+                  <span className="truncate">{badge.label}</span>
+                </Badge>
+              ))}
+            </div>
           </div>
-          {" "}
-          <span className="flex shrink-0 items-center gap-1.5">
-            {group.isNew ? (
-              <span className="rounded-md bg-blue-3 px-1.5 py-0.5 text-[10px] font-medium text-blue-11">New</span>
-            ) : null}
-            {group.isCloud ? (
-              <span className="rounded-md bg-blue-3/50 px-1.5 py-0.5 text-[10px] font-medium text-blue-11/70">{organizationProviderLabel}</span>
-            ) : null}
-            {group.hasCurrent ? (
-              <span className="rounded-md bg-green-3 px-1.5 py-0.5 text-[10px] font-medium text-green-11">Current</span>
-            ) : null}
-          </span>
         </button>
         {canToggleProvider ? (
           <button
@@ -497,10 +594,10 @@ function DefaultModelRow({
     >
       {recommended ? <Star size={12} className="shrink-0 text-amber-9" /> : <div className="w-3 shrink-0" />}
       <div className="min-w-0 flex-1">
-        <span className={["text-[12px]", active ? "font-medium text-dls-text" : "text-dls-text"].join(" ")}>{opt.title}</span>
-        <span className="ml-2 font-mono text-[10px] text-dls-secondary/60">{opt.modelID}</span>
+        <span className={["block truncate text-[12px]", active ? "font-medium text-dls-text" : "text-dls-text"].join(" ")} title={opt.title}>{opt.title}</span>
+        <span className="block truncate font-mono text-[10px] text-dls-secondary/60" title={opt.modelID}>{opt.modelID}</span>
       </div>
-      {active ? <Check size={14} className="shrink-0 text-green-11" /> : null}
+      {opt.gatewayAuthorization ? <span className="shrink-0 text-xs text-muted-foreground">Sign-in required</span> : active ? <Check size={14} className="shrink-0 text-green-11" /> : null}
     </button>
   );
 }

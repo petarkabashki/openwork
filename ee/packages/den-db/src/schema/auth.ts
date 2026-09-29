@@ -306,6 +306,32 @@ export const OAuthClientAssertionTable = mysqlTable("oauthClientAssertion", {
   expiresAt: timestamp("expires_at", { fsp: 3 }).notNull(),
 })
 
+// OAuth 2.0 Device Authorization Grant (RFC 8628) codes for the Better Auth
+// device-authorization plugin. `organization_id` is Den-owned: the approving
+// person picks the organization the device session starts in.
+export const DeviceCodeTable = mysqlTable(
+  "deviceCode",
+  {
+    id: denTypeIdColumn("deviceCode", "id").notNull().primaryKey(),
+    deviceCode: varchar("device_code", { length: 128 }).notNull(),
+    userCode: varchar("user_code", { length: 32 }).notNull(),
+    userId: denTypeIdColumn("user", "user_id"),
+    organizationId: denTypeIdColumn("organization", "organization_id"),
+    expiresAt: timestamp("expires_at", { fsp: 3 }).notNull(),
+    status: varchar("status", { length: 32 }).notNull(),
+    lastPolledAt: timestamp("last_polled_at", { fsp: 3 }),
+    pollingInterval: int("polling_interval"),
+    clientId: varchar("client_id", { length: 255 }),
+    scope: text("scope"),
+    createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("device_code_device_code").on(table.deviceCode),
+    uniqueIndex("device_code_user_code").on(table.userCode),
+    index("device_code_expires_at").on(table.expiresAt),
+  ],
+)
+
 export const ScimProviderTable = mysqlTable(
   "scim_provider",
   {
@@ -387,10 +413,20 @@ export const SsoConnectionTable = mysqlTable(
     kind: varchar("kind", { length: 16 }).notNull(),
     issuer: varchar("issuer", { length: 2048 }).notNull(),
     domain: varchar("domain", { length: 255 }).notNull(),
-    status: varchar("status", { length: 32 }).notNull().default("enabled"),
+    status: varchar("status", { length: 32 }).notNull().default("disabled"),
     signInPath: varchar("sign_in_path", { length: 2048 }).notNull(),
+    configRevision: varchar("config_revision", { length: 64 }).notNull().default(""),
+    testStatus: varchar("test_status", { length: 32 }).notNull().default("untested"),
     lastTestedAt: timestamp("last_tested_at", { fsp: 3 }),
+    lastTestedRevision: varchar("last_tested_revision", { length: 64 }),
     lastError: text("last_error"),
+    domainVerificationToken: varchar("domain_verification_token", { length: 255 }),
+    activeTestIntentId: varchar("active_test_intent_id", { length: 64 }),
+    activeTestUserId: denTypeIdColumn("user", "active_test_user_id"),
+    activeTestProviderId: varchar("active_test_provider_id", { length: 255 }),
+    activeTestConfigRevision: varchar("active_test_config_revision", { length: 64 }),
+    activeTestExpiresAt: timestamp("active_test_expires_at", { fsp: 3 }),
+    activeTestStartedAt: timestamp("active_test_started_at", { fsp: 3 }),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { fsp: 3 })
       .notNull()
@@ -451,6 +487,7 @@ export const oauthConsent = OAuthConsentTable
 export const oauthResource = OAuthResourceTable
 export const oauthClientResource = OAuthClientResourceTable
 export const oauthClientAssertion = OAuthClientAssertionTable
+export const deviceCode = DeviceCodeTable
 export const scimProvider = ScimProviderTable
 export const scimSyncEvent = ScimSyncEventTable
 export const ssoProvider = SsoProviderTable

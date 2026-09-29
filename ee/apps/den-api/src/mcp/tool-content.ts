@@ -1,4 +1,5 @@
 import sharp from "sharp"
+import { ContentBlockSchema, type ContentBlock } from "@modelcontextprotocol/sdk/types.js"
 
 export type AgentToolContentPart =
   | { type: "text"; text: string }
@@ -6,6 +7,10 @@ export type AgentToolContentPart =
 
 const MAX_INLINE_IMAGE_BYTES = 1024 * 1024
 const MAX_IMAGE_DIMENSION = 1568
+const MAX_MODEL_VISIBLE_BINARY_BYTES = 64 * 1024
+const MAX_MODEL_VISIBLE_TEXT_CHARACTERS = 20_000
+const PRETTY_JSON_MAX_BYTES = 2 * 1024
+const BASE64_FIELD_PATTERN = /^(?:content|data)Base64$/i
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -21,54 +26,110 @@ function isImagePayload(value: unknown): value is Record<string, unknown> & {
     && value.mimeType.startsWith("image/")
 }
 
-export function isKnownToolContentPart(value: unknown): value is AgentToolContentPart {
-  if (!isRecord(value) || typeof value.type !== "string") return false
-  if (value.type === "text") return typeof value.text === "string"
-  if (value.type === "image") {
-    return typeof value.data === "string" && typeof value.mimeType === "string"
-  }
-  return false
+function base64ByteSize(value: string): number {
+  return Buffer.byteLength(value, "base64")
 }
 
-export function externalToolContent(result: unknown): AgentToolContentPart[] {
-  if (isRecord(result) && Array.isArray(result.content) && result.content.every(isKnownToolContentPart)) {
-    return result.content
-  }
-  return [{ type: "text", text: JSON.stringify(result) }]
+function truncationMarker(shownCharacters: number, totalCharacters: number): string {
+  return `\n[truncated: showing ${shownCharacters} of ${totalCharacters} characters. `
+    + "Call this capability from execute_capability_script to read the full value and return the part you need.]"
 }
 
-export async function buildRestToolContent(payload: unknown): Promise<AgentToolContentPart[]> {
-  if (typeof payload === "string") return [{ type: "text", text: payload }]
+/**
+ * Keeps one model-visible string within budget. The cut is always announced
+ * with the real size, because Code Mode scripts receive the untruncated
+ * payload (see invoke.ts `includePayload`) and can read the rest.
+ */
+function truncateModelString(value: string): string {
+  if (value.length <= MAX_MODEL_VISIBLE_TEXT_CHARACTERS) return value
+  const markerLength = truncationMarker(MAX_MODEL_VISIBLE_TEXT_CHARACTERS, value.length).length
+  const shownCharacters = MAX_MODEL_VISIBLE_TEXT_CHARACTERS - markerLength
+  return `${value.slice(0, shownCharacters)}${truncationMarker(shownCharacters, value.length)}`
+}
 
-  const payloadRecord = isRecord(payload) ? payload : undefined
-  let imagePayload: (Record<string, unknown> & { contentBase64: string; mimeType: string }) | undefined
-  let imagePayloadKey: string | undefined
-  if (isImagePayload(payload)) {
-    imagePayload = payload
-  } else if (payloadRecord) {
-    for (const [key, value] of Object.entries(payloadRecord)) {
-      if (isImagePayload(value)) {
-        imagePayload = value
-        imagePayloadKey = key
-        break
-      }
+function sanitizeModelPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeModelPayload)
+  if (typeof value === "string") return truncateModelString(value)
+  if (!isRecord(value)) return value
+
+  const imagePayload = isImagePayload(value)
+  const omittedBase64 = new Map<string, number>()
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" && BASE64_FIELD_PATTERN.test(key)) {
+      const byteSize = base64ByteSize(entry)
+      if (imagePayload || byteSize > MAX_MODEL_VISIBLE_BINARY_BYTES) omittedBase64.set(key, byteSize)
     }
   }
 
-  if (!imagePayload) {
-    return [{ type: "text", text: JSON.stringify(payload, null, 2) }]
+  const reservedMetadata = new Set(
+    [...omittedBase64.keys()].flatMap((key) => [`${key}Omitted`, `${key}Bytes`]),
+  )
+  const sanitizedEntries: [string, unknown][] = []
+  for (const [key, entry] of Object.entries(value)) {
+    if (reservedMetadata.has(key)) continue
+    const byteSize = omittedBase64.get(key)
+    if (byteSize !== undefined) {
+      sanitizedEntries.push(
+        [key, `<${byteSize} binary bytes omitted from model-visible content>`],
+        [`${key}Omitted`, true],
+        [`${key}Bytes`, byteSize],
+      )
+      continue
+    }
+    if (typeof entry === "string" && BASE64_FIELD_PATTERN.test(key)) {
+      sanitizedEntries.push([key, entry])
+      continue
+    }
+    sanitizedEntries.push([key, sanitizeModelPayload(entry)])
   }
+  return Object.fromEntries(sanitizedEntries)
+}
 
-  const byteSize = Buffer.byteLength(imagePayload.contentBase64, "base64")
-  const placeholder = `<${byteSize} bytes delivered as image content>`
-  const redactedImagePayload = { ...imagePayload, contentBase64: placeholder }
-  const redactedPayload = imagePayloadKey === undefined || payloadRecord === undefined
-    ? redactedImagePayload
-    : { ...payloadRecord, [imagePayloadKey]: redactedImagePayload }
+function stringifyModelPayload(value: unknown): string {
+  const compact = JSON.stringify(value)
+  if (compact === undefined) return "null"
+  if (Buffer.byteLength(compact, "utf8") > PRETTY_JSON_MAX_BYTES) return compact
+  return JSON.stringify(value, null, 2)!
+}
+
+function findImagePayload(value: unknown, seen = new WeakSet<object>()): (Record<string, unknown> & {
+  contentBase64: string
+  mimeType: string
+}) | undefined {
+  if (isImagePayload(value)) return value
+  if (typeof value !== "object" || value === null || seen.has(value)) return undefined
+  seen.add(value)
+  const children = Array.isArray(value) ? value : Object.values(value)
+  for (const child of children) {
+    const image = findImagePayload(child, seen)
+    if (image) return image
+  }
+  return undefined
+}
+
+export function isKnownToolContentPart(value: unknown): value is ContentBlock {
+  return ContentBlockSchema.safeParse(value).success
+}
+
+export function externalToolContent(result: unknown): ContentBlock[] {
+  if (isRecord(result) && Array.isArray(result.content) && result.content.every(isKnownToolContentPart)) {
+    return result.content
+  }
+  return [{ type: "text", text: JSON.stringify(result, (key, value) => key === "_meta" ? undefined : value) }]
+}
+
+export async function buildRestToolContent(payload: unknown): Promise<AgentToolContentPart[]> {
+  if (typeof payload === "string") return [{ type: "text", text: truncateModelString(payload) }]
+
+  const imagePayload = findImagePayload(payload)
+
   const textPart: AgentToolContentPart = {
     type: "text",
-    text: JSON.stringify(redactedPayload, null, 2),
+    text: stringifyModelPayload(sanitizeModelPayload(payload)),
   }
+  if (!imagePayload) return [textPart]
+
+  const byteSize = Buffer.byteLength(imagePayload.contentBase64, "base64")
 
   if (byteSize <= MAX_INLINE_IMAGE_BYTES) {
     return [textPart, {

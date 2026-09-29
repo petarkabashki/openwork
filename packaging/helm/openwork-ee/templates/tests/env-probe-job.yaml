@@ -27,7 +27,7 @@ spec:
       {{- end }}
       containers:
         - name: env-probe
-          image: "{{ .Values.denApi.image.repository }}:{{ default .Values.image.tag .Values.denApi.image.tag }}"
+          image: "{{ .Values.denApi.image.repository }}:{{ include "openwork-ee.imageTag" (dict "root" . "componentTag" .Values.denApi.image.tag) }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if .Values.customCa.enabled }}
           volumeMounts:
@@ -46,24 +46,24 @@ spec:
                 ["DEN_ORG_MODE", process.env.OPENWORK_ENV_PROBE_EXPECTED_DEN_ORG_MODE],
                 ["PROVISIONER_MODE", process.env.OPENWORK_ENV_PROBE_EXPECTED_PROVISIONER_MODE],
                 ["OPENWORK_DEV_MODE", process.env.OPENWORK_ENV_PROBE_EXPECTED_OPENWORK_DEV_MODE],
-                ["BETTER_AUTH_URL", process.env.OPENWORK_ENV_PROBE_EXPECTED_BETTER_AUTH_URL],
-                ["DEN_API_PUBLIC_URL", process.env.OPENWORK_ENV_PROBE_EXPECTED_DEN_API_PUBLIC_URL],
+                ["DEN_BASE_URL", process.env.OPENWORK_ENV_PROBE_EXPECTED_DEN_BASE_URL],
                 ["DEN_AUTH_ORIGIN", process.env.OPENWORK_ENV_PROBE_EXPECTED_DEN_AUTH_ORIGIN],
                 ["PORT", process.env.OPENWORK_ENV_PROBE_EXPECTED_PORT],
                 ["NODE_OPTIONS", process.env.OPENWORK_ENV_PROBE_EXPECTED_NODE_OPTIONS],
                 ["DEN_API_NODE_OPTIONS", process.env.OPENWORK_ENV_PROBE_EXPECTED_NODE_OPTIONS],
               ]);
               const required = [
+                {{- if eq .Values.config.databaseMode "mysql" }}
                 "DATABASE_URL",
+                {{- else }}
+                "DATABASE_HOST", "DATABASE_USERNAME", "DATABASE_PASSWORD",
+                {{- end }}
                 "DEN_DB_ENCRYPTION_KEY",
                 "BETTER_AUTH_SECRET",
-                "BETTER_AUTH_URL",
+                "DEN_BASE_URL",
                 "DB_MODE",
                 "DEN_ORG_MODE",
                 "PROVISIONER_MODE",
-                "DEN_API_PUBLIC_URL",
-                "CORS_ORIGINS",
-                "DEN_BETTER_AUTH_TRUSTED_ORIGINS",
                 "DEN_API_BASE",
                 "DEN_AUTH_FALLBACK_BASE",
                 "DEN_AUTH_ORIGIN",
@@ -162,6 +162,7 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            {{- include "openwork-ee.gatewayDeploymentEnv" (dict "root" . "env" .Values.denApi.env) | nindent 12 }}
             - name: OPENWORK_ENV_PROBE_EXPECTED_DB_MODE
               value: {{ .Values.config.databaseMode | quote }}
             - name: OPENWORK_ENV_PROBE_EXPECTED_DEN_ORG_MODE
@@ -170,10 +171,8 @@ spec:
               value: {{ .Values.config.provisioner.mode | quote }}
             - name: OPENWORK_ENV_PROBE_EXPECTED_OPENWORK_DEV_MODE
               value: {{ .Values.config.openworkDevMode | quote }}
-            - name: OPENWORK_ENV_PROBE_EXPECTED_BETTER_AUTH_URL
+            - name: OPENWORK_ENV_PROBE_EXPECTED_DEN_BASE_URL
               value: {{ .Values.config.public.webOrigin | quote }}
-            - name: OPENWORK_ENV_PROBE_EXPECTED_DEN_API_PUBLIC_URL
-              value: {{ .Values.config.public.apiOrigin | quote }}
             - name: OPENWORK_ENV_PROBE_EXPECTED_DEN_AUTH_ORIGIN
               value: {{ .Values.config.public.webOrigin | quote }}
             - name: OPENWORK_ENV_PROBE_EXPECTED_PORT

@@ -78,6 +78,16 @@ function createFakeExec(previewUrlForPort: (port: string) => string): { exec: Da
       const port = portFlag >= 0 ? args[portFlag + 1] ?? "" : "";
       return { stdout: `time=ignored\nPreview URL: ${previewUrlForPort(port)}\n`, stderr: "", code: 0 };
     }
+    const text = args.join(" ");
+    if (text.includes('printf %s "$HOME"')) {
+      return { stdout: "/home/daytona", stderr: "", code: 0 };
+    }
+    if (text.includes("OPENWORK_REMOTE_PID=") && text.includes("subprocess.Popen")) {
+      return { stdout: "OPENWORK_REMOTE_PID=4242\n", stderr: "", code: 0 };
+    }
+    if (text.includes("kill -0 4242")) {
+      return { stdout: "CDP_DOWN\nPROCESS_EXITED\n", stderr: "", code: 0 };
+    }
     return { stdout: "", stderr: "", code: 0 };
   };
   return { exec, calls };
@@ -89,10 +99,14 @@ function successfulPolls(seen: string[] = []): (url: string) => Promise<void> {
   };
 }
 
-function base64AfterEcho(call: ExecCall): string {
-  const echoIndex = call.args.indexOf("echo");
-  assert(echoIndex >= 0, "Expected echo in base64 write call.");
-  return call.args[echoIndex + 1] ?? "";
+/** `daytona exec` runs no shell of its own, so the pipe must live inside one bash -lc argument. */
+function base64FromShellWrite(call: ExecCall): string {
+  const command = call.args.at(-1) ?? "";
+  assert(command.startsWith("bash -lc "), "Expected the base64 write to run inside bash -lc.");
+  assert(!call.args.includes("|") && !call.args.includes(">"), "Shell operators must not be passed as literal arguments.");
+  const match = /printf %s '"'"'([A-Za-z0-9+/=]+)'"'"' \| base64 -d > /.exec(command);
+  assert(match?.[1], "Expected printf of the encoded bootstrap piped to base64 -d.");
+  return match[1];
 }
 
 test("checkedExec retries when the Daytona CLI fails at the transport layer", async () => {
@@ -189,8 +203,11 @@ test("spawnElectron starts isolated Daytona Electron profiles and writes bootstr
   assert.equal(second.meta?.profileOwner, "host");
   assert.deepEqual(polled, ["https://cdp-9825.example.test/json/list", "https://cdp-9830.example.test/json/list"]);
 
+  const firstMkdirIndex = calls.findIndex((call) => argsText(call).includes("mkdir -p") && argsText(call).includes("/profiles/owner-"));
+  assert(firstMkdirIndex >= 0);
+
   const bootstrapCall = findCall(calls, "base64 -d");
-  assert.equal(Buffer.from(base64AfterEcho(bootstrapCall), "base64").toString("utf8"), `${JSON.stringify(bootstrap, null, 2)}\n`);
+  assert.equal(Buffer.from(base64FromShellWrite(bootstrapCall), "base64").toString("utf8"), `${JSON.stringify(bootstrap, null, 2)}\n`);
   assert(argsText(bootstrapCall).includes("/workspace/.openwork-daytona/profiles/owner-"));
   assert(argsText(bootstrapCall).includes("/bootstrap.json"));
 
@@ -215,6 +232,110 @@ test("spawnElectron starts isolated Daytona Electron profiles and writes bootstr
   assert(secondStart.includes("OPENWORK_ELECTRON_USERDATA="));
   assert(secondStart.includes("/workspace/.openwork-daytona/profiles/member-"));
   assert(secondStart.includes("/electron-userdata"));
+});
+
+test("spawnElectron maps the v2 eval lane before Daytona caller overrides", async () => {
+  const previous = process.env.OPENWORK_EVAL_ENGINE;
+  process.env.OPENWORK_EVAL_ENGINE = "v2";
+  const { exec, calls } = createFakeExec((port) => `https://cdp-${port}.example.test`);
+  const host = createDaytonaHost({
+    sandboxId: "openwork-test-v2-lane",
+    log: () => undefined,
+    exec,
+    repoRoot: "/repo",
+    waitForCdp: successfulPolls(),
+  });
+  try {
+    await host.spawnElectron("v2-default");
+    await host.spawnElectron("v2-override", { env: { OPENWORK_ENGINE_V2_PREVIEW: "sidecar" } });
+  } finally {
+    if (previous === undefined) delete process.env.OPENWORK_EVAL_ENGINE;
+    else process.env.OPENWORK_EVAL_ENGINE = previous;
+  }
+
+  const starts = calls.filter((call) => argsText(call).includes("/workspace/.devcontainer/start-daytona-electron.sh"));
+  assert.match(argsText(starts[0] ?? { args: [] }), /OPENWORK_ENGINE_V2_PREVIEW=.*1/);
+  assert.match(argsText(starts[1] ?? { args: [] }), /OPENWORK_ENGINE_V2_PREVIEW=.*sidecar/);
+});
+
+test("retained packaged Electron uses an explicit binary, complete blank profile, and same-profile VM shortcuts", async () => {
+  const { exec, calls } = createFakeExec((port) => `https://cdp-${port}.example.test`);
+  const host = createDaytonaHost({
+    sandboxId: "openwork-test-packaged",
+    log: () => undefined,
+    exec,
+    repoRoot: "/repo",
+    waitForCdp: successfulPolls(),
+  });
+
+  const launched = await host.spawnElectronRetained("published", {
+    binaryPath: "/workspace/releases/openwork-enterprise",
+    profile: "blank",
+    env: {
+      OPENWORK_DEV_MODE: "1",
+      OPENWORK_EVAL_ELECTRON_BINARY: "/workspace/source-electron",
+      OPENAI_API_KEY: "must-not-propagate",
+    },
+  });
+
+  assert.equal(launched.startup.state, "cdp-responsive");
+  assert.equal(launched.handle.meta?.binary, "/workspace/releases/openwork-enterprise");
+  assert.equal(launched.handle.meta?.remotePid, "4242");
+  const commands = calls.map(argsText).join("\n");
+  assert(!commands.includes("start-daytona-electron.sh"));
+  assert(!commands.includes("pnpm"));
+  const setup = findCall(calls, "openwork-release-preview.desktop");
+  const setupText = argsText(setup);
+  assert(setupText.includes("set -euo pipefail"));
+  assert(setupText.includes("x-scheme-handler/openwork"));
+  assert(setupText.includes("xdg-mime default openwork-release-preview.desktop"));
+  assert(setupText.includes("xdg-mime query default x-scheme-handler/openwork"));
+  assert(setupText.includes('= openwork-release-preview.desktop'));
+  assert(setupText.indexOf("set -euo pipefail") < setupText.indexOf("xdg-mime query default"));
+  assert(!setupText.includes('test "$(xdg-mime query default x-scheme-handler/openwork)" = openwork-release-preview.desktop || true'));
+  assert(setupText.includes("OpenWork Release published.desktop"));
+  assert(setupText.includes("Browser published.desktop"));
+  const launchWrite = calls.find((call) => argsText(call).includes("launch-openwork"));
+  assert(launchWrite);
+  const allEncoded = launchWrite.args.join(" ").match(/[A-Za-z0-9+/=]{100,}/g) ?? [];
+  const decoded = allEncoded.map((value) => Buffer.from(value, "base64").toString("utf8")).join("\n");
+  for (const key of ["HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA", "OPENWORK_ELECTRON_USERDATA", "OPENWORK_DESKTOP_BOOTSTRAP_PATH", "OPENWORK_SERVER_CONFIG", "OPENWORK_ENV_STORE", "OPENWORK_TOKEN_STORE", "OPENWORK_RUNTIME_DB", "OPENWORK_DATA_DIR", "OPENCODE_CONFIG_DIR", "OPENCODE_DB"]) {
+    assert(decoded.includes(`${key}=`), `blank launcher must isolate ${key}`);
+  }
+  assert.equal(decoded.match(/cd "\$HOME"/g)?.length, 2, "app and browser launchers must enter the isolated HOME");
+  assert.equal(decoded.match(/OPENWORK_DEV_MODE='0'/g)?.length, 2, "app and browser launchers must explicitly disable dev mode");
+  assert.equal(decoded.match(/compgen -e/g)?.length, 2, "app and browser launchers must clear inherited environment");
+  assert(!decoded.includes("/workspace/source-electron"));
+  assert(!decoded.includes("must-not-propagate"));
+  assert(decoded.includes("/workspace/releases/openwork-enterprise"));
+  assert(decoded.includes('"$@"'));
+
+  await host.disposeSurface(launched.handle);
+});
+
+test("retained packaged Electron reports an app crash without disposing its inspectable host surface", async () => {
+  const { exec, calls } = createFakeExec((port) => `https://cdp-${port}.example.test`);
+  const host = createDaytonaHost({
+    sandboxId: "openwork-test-crashed",
+    log: () => undefined,
+    exec,
+    repoRoot: "/repo",
+    waitForCdp: async () => { throw new Error("CDP stayed down"); },
+  });
+
+  const launched = await host.spawnElectronRetained("broken", {
+    binaryPath: "/bin/false",
+    profile: "blank",
+    startupTimeoutMs: 1,
+  });
+
+  assert.equal(launched.startup.state, "crashed");
+  assert.match(launched.startup.detail, /Process exited.*electron-broken/);
+  const stopCallsBeforeDispose = calls.filter((call) => argsText(call).includes("pkill -f") && argsText(call).includes("remote-debugging-port")).length;
+  assert.equal(stopCallsBeforeDispose, 0);
+  assert.equal((await host.share()).some((link) => link.label.includes("crashed")), true);
+  await host.disposeSurface(launched.handle);
+  assert.equal(calls.some((call) => argsText(call).includes("remote-debugging-port")), true);
 });
 
 test("spawnElectron preserves a caller-owned Daytona profile while generated profiles are removed", async () => {
@@ -293,9 +414,33 @@ test("spawnChrome launches Chromium with Daytona CDP flags and allocates a secon
   assert(firstLaunch.includes("--remote-debugging-address=0.0.0.0"));
   assert(firstLaunch.includes("--remote-debugging-port=9222"));
   assert(firstLaunch.includes("--user-data-dir="));
-  assert(firstLaunch.includes("/tmp/daytona-chrome-browser"));
+  assert(firstLaunch.includes("/tmp/daytona-chrome-browser-"));
   assert(secondLaunch.includes("--remote-debugging-port=9230"));
   assert(/https:\/\/app\.example\.test(["'\s]|$)/.test(secondLaunch));
+});
+
+test("spawnChrome stamps each launch's profile so a second surface with the same name never hits Chromium's profile lock", async () => {
+  const { exec, calls } = createFakeExec((port) => `https://chrome-${port}.example.test`);
+  const host = createDaytonaHost({
+    sandboxId: "openwork-test-chrome-twice",
+    log: () => undefined,
+    exec,
+    repoRoot: "/repo",
+    waitForCdp: successfulPolls(),
+  });
+
+  const first = await host.spawnChrome("spec-web");
+  const second = await host.spawnChrome("spec-web");
+
+  assert(first.profileDir?.startsWith("/tmp/daytona-chrome-spec-web-"));
+  assert(second.profileDir?.startsWith("/tmp/daytona-chrome-spec-web-"));
+  assert.notEqual(first.profileDir, second.profileDir);
+  assert.notEqual(first.meta?.log, second.meta?.log);
+  const launchCalls = calls.filter((call) => argsText(call).includes("nohup \"$CHROME_BIN\""));
+  assert.equal(launchCalls.length, 2);
+  assert(first.profileDir && argsText(launchCalls[0]).includes(first.profileDir));
+  assert(second.profileDir && argsText(launchCalls[1]).includes(second.profileDir));
+  assert(!argsText(launchCalls[1]).includes(first.profileDir));
 });
 
 test("disposeSurface uses self-match-safe pkill patterns in separate execs", async () => {

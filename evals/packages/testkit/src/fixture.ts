@@ -1,34 +1,70 @@
 import { test as evidenceTest } from "@openwork/test-evidence/vitest";
+import { SkipError, resolvePlace } from "@openwork/env";
 import { setBriefTestRegistrar } from "./brief-internal.ts";
-import { SkipError } from "./needs.ts";
-import { resolvePlace } from "./place.ts";
+import type { TestEvidenceRecorder } from "@openwork/test-evidence";
 
-const fixtureTest = evidenceTest.extend<{ place: ReturnType<typeof resolvePlace> }>({
+export const fixtureTest = evidenceTest.extend<{ place: ReturnType<typeof resolvePlace> }>({
   place: [async ({}, use) => {
     await use(resolvePlace(process.env));
-  }, { auto: true }],
+  }, { auto: true, scope: "file" }],
 });
 
 interface WrappedContext {
   place: ReturnType<typeof resolvePlace>;
-  evidence: unknown;
+  evidence: TestEvidenceRecorder;
+  world?: unknown;
+  seed?: unknown;
+  user?: unknown;
+  agent?: unknown;
+  probe?: unknown;
+  step?: unknown;
+  specRuntimeContext?: { step: unknown; checkpointEnd?: () => Promise<void> };
+  task?: { tags?: string[] };
   skip(note?: string): never;
+}
+
+/** Vitest tag: this test's world is worth reopening at its end state (see User.checkpoint). */
+export const CHECKPOINTS_TAG = "checkpoints";
+
+function messageText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 // Vitest does not propagate a test-body error back through fixture `use()`, so
 // the exported test boundary is where SkipError can reliably become ctx.skip().
-function wrapTestApi<T extends (...args: never[]) => unknown>(api: T): T {
+export function wrapTestApi<T extends (...args: never[]) => unknown>(api: T): T {
   return new Proxy(api, {
     apply(target, thisArg, argArray) {
       const args = [...argArray];
       const callback = args.at(-1);
       if (typeof callback === "function") {
-        args[args.length - 1] = async ({ place, evidence, skip }: WrappedContext) => {
+        args[args.length - 1] = async ({ place, evidence, world, seed, user, agent, probe, step, specRuntimeContext, task, skip }: WrappedContext) => {
+          let skipping = false;
+          const wrappedSkip = (note?: string): never => {
+            skipping = true;
+            evidence.setOutcome("skipped", note);
+            return skip(note);
+          };
           try {
-            return await Reflect.apply(callback, undefined, [{ place, evidence, skip }]);
+            const result = await Reflect.apply(callback, undefined, [{
+              place,
+              evidence,
+              world,
+              seed,
+              user,
+              agent,
+              probe,
+              step: typeof step === "function" ? step : specRuntimeContext?.step,
+              skip: wrappedSkip,
+            }]);
+            // Only a passing body reaches here, so the end state is the verified state.
+            if (task?.tags?.includes(CHECKPOINTS_TAG)) await specRuntimeContext?.checkpointEnd?.();
+            evidence.setOutcome("passed");
+            return result;
           } catch (error) {
-            if (!(error instanceof SkipError)) throw error;
-            return skip(`needs: ${error.reason}`);
+            if (error instanceof SkipError) return wrappedSkip(`needs: ${error.reason}`);
+            if (!skipping) evidence.setOutcome("failed", messageText(error));
+            throw error;
           }
         };
       }

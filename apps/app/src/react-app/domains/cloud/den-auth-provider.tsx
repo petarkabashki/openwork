@@ -25,6 +25,7 @@ import {
   type DenUser,
 } from "../../../app/lib/den";
 import { exchangeHandoffAndSignIn } from "../../../app/lib/den-handoff";
+import { connectionDiagnosticHistory, type ConnectionDiagnosticReason, type ConnectionDiagnosticSource } from "../../../app/lib/connection-diagnostic-history";
 import { readOrgSelectionPending } from "../../../app/lib/den-sign-in-intent";
 import { desktopBridge, readDesktopDistributionInfo } from "../../../app/lib/desktop";
 import {
@@ -54,6 +55,13 @@ export type DenAuthStatus =
   | "unavailable"
   | "signed_out";
 
+const authDiagnosticReasons: Record<DenAuthStatus, ConnectionDiagnosticReason> = {
+  checking: "den_auth_checking",
+  signed_in: "den_auth_signed_in",
+  unavailable: "den_auth_unavailable",
+  signed_out: "den_auth_signed_out",
+};
+
 export const DEN_AUTH_SIGNAL_RETRY_COOLDOWN_MS = 5_000;
 export const DEN_AUTH_UNAVAILABLE_RETRY_INTERVAL_MS = 30_000;
 export const DEN_AUTH_ORG_REPAIR_INTERVAL_MS = 30_000;
@@ -64,18 +72,29 @@ export async function resolveDenActiveOrganizationWithRetry(
   wait: (delayMs: number) => Promise<void> = (delayMs) =>
     new Promise((resolveWait) => window.setTimeout(resolveWait, delayMs)),
 ) {
-  for (const delayMs of DEN_ORG_RESOLUTION_RETRY_DELAYS_MS) {
-    if (delayMs > 0) await wait(delayMs);
+  const diagnostics = connectionDiagnosticHistory.createSource();
+  try {
+    for (const delayMs of DEN_ORG_RESOLUTION_RETRY_DELAYS_MS) {
+      if (delayMs > 0) await wait(delayMs);
+      diagnostics.attempt("den_org_retry");
 
-    try {
-      const organization = await resolve();
-      if (organization) return organization;
-    } catch {
-      // A newly accepted membership can take a moment to become visible.
+      try {
+        const organization = await resolve();
+        if (organization) {
+          diagnostics.recovered("den_org_recovered");
+          return organization;
+        }
+      } catch {
+        // A newly accepted membership can take a moment to become visible.
+      }
+      diagnostics.failed();
+      diagnostics.record("den_org_unresolved", "failure");
     }
-  }
 
-  return null;
+    return null;
+  } finally {
+    diagnostics.dispose();
+  }
 }
 
 export function resolveDenAuthFailureStatus(
@@ -117,6 +136,7 @@ export function shouldRetryDenAuthOnSignal(input: {
 export type DenAuthStore = {
   status: DenAuthStatus;
   user: DenUser | null;
+  verifiedIdentity: { principalId: string; organizationId: string } | null;
   error: string | null;
   isSignedIn: boolean;
   refresh: () => Promise<void>;
@@ -187,6 +207,11 @@ function pendingServerSwitchForDeepLink(input: {
 export function DenAuthProvider({ children }: DenAuthProviderProps) {
   const [status, setStatus] = useState<DenAuthStatus>("checking");
   const [user, setUser] = useState<DenUser | null>(null);
+  const [verifiedIdentity, setVerifiedIdentity] = useState<{
+    principalId: string;
+    organizationId: string;
+  } | null>(null);
+  const verifiedCredentialRef = useRef<{ token: string; organizationId: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Monotonic token so stale async refreshes can't clobber a newer result.
   const refreshTokenRef = useRef(0);
@@ -196,7 +221,10 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
   const handledGrantsRef = useRef<Set<string>>(new Set());
   const [pendingServerSwitch, setPendingServerSwitch] = useState<PendingServerSwitch | null>(null);
 
+  const diagnosticsRef = useRef<ConnectionDiagnosticSource | null>(null);
+
   const updateStatus = useCallback((nextStatus: DenAuthStatus) => {
+    diagnosticsRef.current?.transition(authDiagnosticReasons[nextStatus]);
     statusRef.current = nextStatus;
     setStatus(nextStatus);
   }, []);
@@ -219,9 +247,21 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
     const currentRun = ++refreshTokenRef.current;
     const settings = readDenSettings();
     const token = settings.authToken?.trim() ?? "";
+    const organizationId = settings.activeOrgId?.trim() ?? "";
+    const verifiedCredential = verifiedCredentialRef.current;
+
+    if (
+      !verifiedCredential
+      || verifiedCredential.token !== token
+      || verifiedCredential.organizationId !== organizationId
+    ) {
+      verifiedCredentialRef.current = null;
+      setVerifiedIdentity(null);
+    }
 
     if (!token) {
       setUser(null);
+      setVerifiedIdentity(null);
       setError(null);
       lastSignalRetryAtRef.current = null;
       updateStatus("signed_out");
@@ -236,6 +276,8 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
       updateStatus("checking");
     }
 
+    const diagnostics = diagnosticsRef.current;
+    diagnostics?.attempt("den_session_retry");
     try {
       const nextUser = await createDenClient({
         baseUrl: settings.baseUrl,
@@ -258,18 +300,33 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
 
       if (currentRun !== refreshTokenRef.current) return;
 
+      const confirmedSettings = readDenSettings();
+      const confirmedToken = confirmedSettings.authToken?.trim() ?? "";
+      const confirmedOrganizationId = confirmedSettings.activeOrgId?.trim() ?? "";
+      const principalId = nextUser.id.trim();
+      if (confirmedToken === token && principalId && confirmedOrganizationId) {
+        verifiedCredentialRef.current = { token, organizationId: confirmedOrganizationId };
+        setVerifiedIdentity({ principalId, organizationId: confirmedOrganizationId });
+      } else {
+        verifiedCredentialRef.current = null;
+        setVerifiedIdentity(null);
+      }
       setUser(nextUser);
       setError(null);
       lastSignalRetryAtRef.current = null;
+      diagnostics?.recovered("den_session_recovered");
       updateStatus("signed_in");
       syncDesktopSentrySession(nextUser);
     } catch (nextError) {
       if (currentRun !== refreshTokenRef.current) return;
 
+      diagnostics?.failed();
       const failureStatus = resolveDenAuthFailureStatus(nextError);
       if (failureStatus === "signed_out") {
         clearDenSession();
         setUser(null);
+        verifiedCredentialRef.current = null;
+        setVerifiedIdentity(null);
         lastSignalRetryAtRef.current = null;
         clearDesktopSentrySession();
       }
@@ -284,17 +341,28 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
   }, [clearDesktopSentrySession, syncDesktopSentrySession, updateStatus]);
 
   useEffect(() => {
+    const resetDiagnostics = () => {
+      diagnosticsRef.current?.dispose();
+      diagnosticsRef.current = connectionDiagnosticHistory.createSource();
+      diagnosticsRef.current.transition(authDiagnosticReasons[statusRef.current]);
+    };
+    resetDiagnostics();
     void refresh();
 
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined") return () => diagnosticsRef.current?.dispose();
 
     const handleSessionUpdated = () => {
+      resetDiagnostics();
       void refresh();
     };
 
     window.addEventListener(denSessionUpdatedEvent, handleSessionUpdated);
+    window.addEventListener(denSettingsChangedEvent, handleSessionUpdated);
     return () => {
       window.removeEventListener(denSessionUpdatedEvent, handleSessionUpdated);
+      window.removeEventListener(denSettingsChangedEvent, handleSessionUpdated);
+      diagnosticsRef.current?.dispose();
+      diagnosticsRef.current = null;
     };
   }, [refresh]);
 
@@ -400,21 +468,25 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
     }
 
     handledGrantsRef.current.add(handoff.grant);
-    const client = createDenClient({
-      baseUrl: handoff.denBaseUrl,
-    });
-
     void exchangeHandoffAndSignIn(handoff.grant, {
       baseUrl: handoff.denBaseUrl,
-      client,
       activeOrg: { id: handoff.orgId, slug: handoff.orgSlug || null, name: handoff.orgName || null },
+      // The consumed grant is stripped from the persisted bootstrap in the
+      // same durable commit that enrolls the session, so a relaunch can
+      // neither re-exchange it nor lose the enrollment it produced.
+      bootstrap: { clearHandoff: true },
     }).then((result) => {
-      if (!result.ok) {
+      if (result.ok) return;
+      if (!result.grantConsumed) {
+        // The grant never reached the destination; a later bootstrap heal may
+        // retry it.
         handledGrantsRef.current.delete(handoff.grant);
         return;
       }
-      // Best-effort cleanup; not part of the auth success/failure path.
-      clearConsumedBootstrapHandoff(bootstrap, handoff.denBaseUrl);
+      // The one-time grant is spent but the enrollment did not commit. Drop
+      // the grant from disk (best effort) so restarts do not retry it forever;
+      // the user needs a fresh handoff link.
+      clearConsumedBootstrapHandoff(bootstrap, bootstrap.baseUrl);
     });
   }, [clearConsumedBootstrapHandoff]);
 
@@ -435,34 +507,25 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
     isEnterpriseActivation: boolean,
   ) => {
     handledGrantsRef.current.add(grant);
-    const client = createDenClient({
-      baseUrl: denBaseUrl,
-    });
     void exchangeHandoffAndSignIn(grant, {
       baseUrl: denBaseUrl,
-      client,
-    }).then(async (result) => {
-      if (!result.ok) {
+      // Enterprise activation is part of the same durable commit as the
+      // enrollment: the stamp and the session it locks in land together.
+      ...(isEnterpriseActivation
+        ? {
+            bootstrap: {
+              requireSignin: true,
+              enterpriseActivation: {
+                activatedAt: new Date().toISOString(),
+                denBaseUrl,
+              },
+            },
+          }
+        : {}),
+    }).then((result) => {
+      if (!result.ok && !result.grantConsumed) {
         handledGrantsRef.current.delete(grant);
-        return;
       }
-      if (!isEnterpriseActivation) return;
-
-      const bootstrap = readDenBootstrapConfig();
-      await setDenBootstrapConfig({
-        baseUrl: denBaseUrl,
-        requireSignin: true,
-        requireActivation: bootstrap.requireActivation,
-        ...(bootstrap.brandAppName ? { brandAppName: bootstrap.brandAppName } : {}),
-        ...(bootstrap.brandLogoUrl ? { brandLogoUrl: bootstrap.brandLogoUrl } : {}),
-        ...(bootstrap.brandIconUrl ? { brandIconUrl: bootstrap.brandIconUrl } : {}),
-        ...(bootstrap.claimLinks ? { claimLinks: bootstrap.claimLinks } : {}),
-        ...(bootstrap.prepared ? { prepared: bootstrap.prepared } : {}),
-        enterpriseActivation: {
-          activatedAt: new Date().toISOString(),
-          denBaseUrl,
-        },
-      });
     });
   }, []);
 
@@ -507,11 +570,12 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
     () => ({
       status,
       user,
+      verifiedIdentity,
       error,
       isSignedIn: hasRetainedDenSession(status),
       refresh,
     }),
-    [error, refresh, status, user],
+    [error, refresh, status, user, verifiedIdentity],
   );
 
   return (

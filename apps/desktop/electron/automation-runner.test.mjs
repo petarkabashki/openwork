@@ -5,7 +5,9 @@ import {
   classifyAutomationExecutionError,
   createDesktopAutomationRunner,
   executeDesktopAutomation,
+  executeDesktopRemoteSession,
   normalizeRunnerBaseUrl,
+  resolveAssignmentWorkspace,
   runnerTokenAudience,
 } from "./automation-runner.mjs"
 
@@ -141,10 +143,47 @@ function testAssignment() {
   }
 }
 
+function remoteSessionAssignment(overrides = {}) {
+  return {
+    commandId: "command-1",
+    kind: "remote_session_create",
+    title: "Desktop handoff",
+    prompt: "Inspect the repo",
+    model: { providerId: "provider", modelId: "model", variant: "high" },
+    expiresAt: Date.now() + 60_000,
+    ...overrides,
+  }
+}
+
+function opencodeSessionPaths(workspaceId, sessionId) {
+  const base = `/workspace/${encodeURIComponent(workspaceId)}/opencode/session`
+  return {
+    create: base,
+    prompt: `${base}/${encodeURIComponent(sessionId)}/prompt_async`,
+    get: `${base}/${encodeURIComponent(sessionId)}`,
+    messages: `${base}/${encodeURIComponent(sessionId)}/message`,
+    todo: `${base}/${encodeURIComponent(sessionId)}/todo`,
+    status: `${base}/status`,
+    abort: `${base}/${encodeURIComponent(sessionId)}/abort`,
+  }
+}
+
+function respondToSnapshotRequest(parsed, paths, snapshot) {
+  if (parsed.pathname === paths.get) return Response.json(snapshot.session ?? { id: paths.get.split("/").at(-1) })
+  if (parsed.pathname === paths.messages) return Response.json(snapshot.messages ?? [])
+  if (parsed.pathname === paths.todo) return Response.json(snapshot.todos ?? [])
+  if (parsed.pathname === paths.status) {
+    const sessionId = paths.get.split("/").at(-1)
+    return Response.json(snapshot.statuses ?? { [sessionId]: snapshot.status ?? { type: "idle" } })
+  }
+  return null
+}
+
 async function observeAssignmentCredentialRejection(status, deniedRoute) {
   const denRequests = []
   let workRequests = 0
   let snapshotStarted = false
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
   let resolveRejected
   const rejected = new Promise((resolve) => { resolveRejected = resolve })
   const runner = createDesktopAutomationRunner({
@@ -155,10 +194,11 @@ async function observeAssignmentCredentialRejection(status, deniedRoute) {
         if (parsed.pathname === "/workspaces") {
           return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
         }
-        if (parsed.pathname === "/workspace/workspace-1/sessions" && options.method === "POST") {
-          return Response.json({ item: { id: "session-1" } }, { status: 201 })
+        if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+          return Response.json({ id: "session-1" }, { status: 201 })
         }
-        if (parsed.pathname === "/workspace/workspace-1/sessions/session-1/snapshot") {
+        if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+        if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
           snapshotStarted = true
           if (deniedRoute === "heartbeat") {
             return new Promise((resolve, reject) => {
@@ -167,13 +207,13 @@ async function observeAssignmentCredentialRejection(status, deniedRoute) {
               else options.signal?.addEventListener("abort", abort, { once: true })
             })
           }
-          return Response.json({ item: {
+          return respondToSnapshotRequest(parsed, sessionPaths, {
             status: { type: "idle" },
             messages: [{
-              info: { role: "assistant", tokens: { input: 1, output: 1 } },
-              parts: [{ type: "text", text: "Finished" }],
+              info: { id: "msg-finished", role: "assistant", tokens: { input: 1, output: 1 } },
+              parts: [{ id: "part-finished", type: "text", text: "Finished" }],
             }],
-          } })
+          })
         }
         throw new Error(`Unexpected local request ${parsed.pathname}`)
       }
@@ -501,21 +541,23 @@ test("routine credential rotation waits for the active assignment to complete", 
   let snapshotStarted = false
   let finishSnapshot = false
   let localAborts = 0
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
   const runner = createDesktopAutomationRunner({
     getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
     fetchImpl: async (url, options = {}) => {
       const parsed = new URL(url)
       if (parsed.origin === "http://127.0.0.1:3000") {
         if (parsed.pathname === "/workspaces") return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
-        if (parsed.pathname === "/workspace/workspace-1/sessions") return Response.json({ item: { id: "session-1" } })
-        if (parsed.pathname.endsWith("/abort")) { localAborts += 1; return Response.json({ ok: true }) }
-        if (parsed.pathname.endsWith("/snapshot")) {
+        if (parsed.pathname === sessionPaths.create) return Response.json({ id: "session-1" })
+        if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+        if (parsed.pathname === sessionPaths.abort) { localAborts += 1; return Response.json(true) }
+        if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
           snapshotStarted = true
           while (!finishSnapshot) await new Promise((resolve) => setImmediate(resolve))
-          return Response.json({ item: {
+          return respondToSnapshotRequest(parsed, sessionPaths, {
             status: { type: "idle" },
-            messages: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "Finished" }] }],
-          } })
+            messages: [{ info: { id: "msg-finished", role: "assistant" }, parts: [{ id: "part-finished", type: "text", text: "Finished" }] }],
+          })
         }
       }
       const path = parsed.pathname
@@ -558,18 +600,20 @@ test("routine credential rotation waits for an in-flight claim", async () => {
   /** @type {(response: Response) => void} */
   let resolveClaim = () => {}
   const claimResponse = new Promise((resolve) => { resolveClaim = resolve })
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
   const runner = createDesktopAutomationRunner({
     getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
     fetchImpl: async (url, options = {}) => {
       const parsed = new URL(url)
       if (parsed.origin === "http://127.0.0.1:3000") {
         if (parsed.pathname === "/workspaces") return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
-        if (parsed.pathname === "/workspace/workspace-1/sessions") return Response.json({ item: { id: "session-1" } })
-        if (parsed.pathname.endsWith("/snapshot")) {
-          return Response.json({ item: {
+        if (parsed.pathname === sessionPaths.create) return Response.json({ id: "session-1" })
+        if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+        if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+          return respondToSnapshotRequest(parsed, sessionPaths, {
             status: { type: "idle" },
-            messages: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "Finished" }] }],
-          } })
+            messages: [{ info: { id: "msg-finished", role: "assistant" }, parts: [{ id: "part-finished", type: "text", text: "Finished" }] }],
+          })
         }
       }
       const path = parsed.pathname
@@ -670,28 +714,377 @@ test("a healthy work poll resets runner reconnect backoff", async () => {
   assert.deepEqual(delays, [500, 1_000, 2_000, 60_000])
 })
 
+test("waking the machine polls for work immediately without new credentials", async () => {
+  const polls = []
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+    fetchImpl: async (url) => {
+      assert.equal(new URL(url).pathname, "/v1/automation-runner/work")
+      polls.push(String(url))
+      return Response.json({ items: [] })
+    },
+    // Park the loop between polls the way a sleeping machine leaves it.
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await flushTasks()
+  assert.equal(polls.length, 1)
+
+  assert.deepEqual(runner.wake(), { polled: true })
+  await flushTasks()
+  assert.equal(polls.length, 2)
+  runner.stop()
+})
+
+test("waking during an active run keeps its lease and starts no second claim loop", async () => {
+  const paths = []
+  let releaseSnapshot = () => {}
+  const snapshotGate = new Promise((resolve) => { releaseSnapshot = () => resolve(undefined) })
+  let resolveCompleted
+  const completed = new Promise((resolve) => { resolveCompleted = resolve })
+  let offered = false
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      paths.push(parsed.pathname)
+      if (parsed.origin === "http://127.0.0.1:3000") {
+        if (parsed.pathname === "/workspaces") {
+          return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
+        }
+        if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+          return Response.json({ id: "session-1" }, { status: 201 })
+        }
+        if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+        if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+          await snapshotGate
+          return respondToSnapshotRequest(parsed, sessionPaths, {
+            status: { type: "idle" },
+            messages: [{
+              info: { id: "msg-done", role: "assistant", tokens: { input: 1, output: 1 } },
+              parts: [{ id: "part-done", type: "text", text: "done" }],
+            }],
+          })
+        }
+        throw new Error(`Unexpected local request ${parsed.pathname}`)
+      }
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (offered) return Response.json({ items: [] })
+        offered = true
+        return Response.json({ items: [{ runId: "run-1" }] })
+      }
+      if (parsed.pathname.endsWith("/claim")) return Response.json({ assignment: testAssignment() })
+      if (parsed.pathname.endsWith("/events")) return Response.json({ ok: true })
+      if (parsed.pathname.endsWith("/complete")) {
+        resolveCompleted()
+        return Response.json({ ok: true })
+      }
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await flushTasks()
+  assert.equal(paths.filter((path) => path === "/v1/automation-runner/work").length, 1)
+  assert.equal(paths.filter((path) => path.endsWith("/claim")).length, 1)
+  assert.ok([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status]
+    .every((path) => paths.includes(path)), "snapshot endpoints did not start in parallel")
+
+  // The wake joins the reconcile cycle that is already executing run-1 rather
+  // than polling over it, so the desktop cannot double-claim its own work.
+  assert.deepEqual(runner.wake(), { polled: true })
+  await flushTasks()
+  assert.equal(paths.filter((path) => path === "/v1/automation-runner/work").length, 1)
+  assert.equal(paths.filter((path) => path.endsWith("/claim")).length, 1)
+
+  releaseSnapshot()
+  await withTimeout(completed, "active run completion timed out")
+  runner.stop()
+})
+
+test("waking a desktop that was never configured stays disconnected", () => {
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+    fetchImpl: async () => { throw new Error("no network in test") },
+  })
+  assert.deepEqual(runner.wake(), { polled: false })
+  runner.stop()
+})
+
+test("a remote-session work item creates a local session and completes with its real ids", async () => {
+  const tokenA = runnerTokenFor("https://den.example.com")
+  const tokenB = `${tokenA}-fresh`
+  const denRequests = []
+  const localRequests = []
+  let offered = false
+  let releaseCreate = () => {}
+  const createGate = new Promise((resolve) => { releaseCreate = () => resolve(undefined) })
+  let createStarted = false
+  let resolveCompleted
+  const completed = new Promise((resolve) => { resolveCompleted = resolve })
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      const body = options.body ? JSON.parse(options.body) : null
+      const authorization = new Headers(options.headers).get("Authorization")
+      if (parsed.origin === "http://127.0.0.1:3000") {
+        localRequests.push({ path: parsed.pathname, method: options.method ?? "GET", body, authorization })
+        if (parsed.pathname === "/workspaces") {
+          return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
+        }
+        if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+          createStarted = true
+          await createGate
+          return Response.json({ id: "session-1" }, { status: 201 })
+        }
+        if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+        throw new Error(`Unexpected local request ${parsed.pathname}`)
+      }
+      denRequests.push({ path: parsed.pathname, authorization, body })
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (!offered && authorization === `Bearer ${tokenA}`) {
+          offered = true
+          return Response.json({ items: [{ kind: "remote_session_create", commandId: "command-1" }] })
+        }
+        return Response.json({ items: [] })
+      }
+      if (parsed.pathname === "/v1/remote-session-commands/command-1/claim") {
+        return Response.json({ assignment: remoteSessionAssignment() })
+      }
+      if (parsed.pathname === "/v1/remote-session-commands/command-1/complete") {
+        resolveCompleted()
+        return Response.json({ command: { id: "command-1", status: "delivered" } })
+      }
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+
+  runner.configure({ baseUrl: "https://den.example.com", token: tokenA, runnerId: "runner-1" })
+  await waitFor(() => createStarted, "remote session create did not start")
+  assert.equal(runner.configure({ baseUrl: "https://den.example.com", token: tokenB, runnerId: "runner-1" }).connected, true)
+  await flushTasks()
+  assert.equal(denRequests.filter((request) => request.authorization === `Bearer ${tokenB}`).length, 0)
+
+  releaseCreate()
+  await withTimeout(completed, "remote session completion timed out")
+  await waitFor(
+    () => denRequests.some((request) => request.path === "/v1/automation-runner/work" && request.authorization === `Bearer ${tokenB}`),
+    "deferred runner credential did not connect",
+  )
+  runner.stop()
+
+  assert.deepEqual(localRequests, [
+    { path: "/workspaces", method: "GET", body: null, authorization: "Bearer local-client-token" },
+    {
+      path: "/workspace/workspace-1/opencode/session",
+      method: "POST",
+      body: { title: "Desktop handoff" },
+      authorization: "Bearer local-client-token",
+    },
+    {
+      path: "/workspace/workspace-1/opencode/session/session-1/prompt_async",
+      method: "POST",
+      body: {
+        model: { providerID: "provider", modelID: "model" },
+        variant: "high",
+        parts: [{ type: "text", text: "Inspect the repo" }],
+      },
+      authorization: "Bearer local-client-token",
+    },
+  ])
+  assert.equal(denRequests.some((request) => request.path.includes("/automation-runs/")), false)
+  assert.equal(denRequests.some((request) => request.path.endsWith("/heartbeat")), false)
+  assert.deepEqual(
+    denRequests.find((request) => request.path.endsWith("/complete"))?.body,
+    {
+      status: "delivered",
+      sessionId: "session-1",
+      workspaceId: "workspace-1",
+      resultSummary: "Remote session created",
+    },
+  )
+})
+
+test("remote-session creation omits nullable prompt and model fields", async () => {
+  const requests = []
+  const sessionPaths = opencodeSessionPaths("workspace/first", "session-not-started")
+  const result = await executeDesktopRemoteSession(remoteSessionAssignment({ prompt: null, model: null }), {
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      requests.push({ path: parsed.pathname, body: options.body ? JSON.parse(options.body) : null })
+      if (parsed.pathname === "/workspaces") return Response.json({ items: [{ id: "workspace/first" }] })
+      if (parsed.pathname === sessionPaths.create) {
+        return Response.json({ id: "session-not-started" }, { status: 201 })
+      }
+      throw new Error(`Unexpected request ${parsed.pathname}`)
+    },
+    signal: new AbortController().signal,
+  })
+
+  assert.deepEqual(result, { sessionId: "session-not-started", workspaceId: "workspace/first", started: false })
+  assert.deepEqual(requests, [
+    { path: "/workspaces", body: null },
+    { path: "/workspace/workspace%2Ffirst/opencode/session", body: { title: "Desktop handoff" } },
+  ])
+})
+
+test("native OpenCode failures preserve upstream status, message, and workspace context", async () => {
+  const sessionPaths = opencodeSessionPaths("workspace-1", "unused")
+  await assert.rejects(
+    executeDesktopRemoteSession(remoteSessionAssignment({ prompt: null, model: null }), {
+      getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+      fetchImpl: async (url) => {
+        const parsed = new URL(url)
+        if (parsed.pathname === "/workspaces") {
+          return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
+        }
+        if (parsed.pathname === sessionPaths.create) {
+          return Response.json({ message: "OpenCode is temporarily unavailable" }, { status: 503 })
+        }
+        throw new Error(`Unexpected request ${parsed.pathname}`)
+      },
+      signal: new AbortController().signal,
+    }),
+    (error) => error instanceof Error
+      && error.message === "OpenCode is temporarily unavailable"
+      && Reflect.get(error, "status") === 503
+      && Reflect.get(error, "workspaceId") === "workspace-1",
+  )
+})
+
+test("a local remote-session failure completes as failed without leaking the response body", async () => {
+  const sensitiveToken = "local-sensitive-token"
+  const completions = []
+  let offered = false
+  let resolveCompleted
+  const completed = new Promise((resolve) => { resolveCompleted = resolve })
+  const sessionPaths = opencodeSessionPaths("workspace-1", "unused")
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      if (parsed.origin === "http://127.0.0.1:3000") {
+        if (parsed.pathname === "/workspaces") {
+          return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
+        }
+        if (parsed.pathname === sessionPaths.create) {
+          return Response.json({ message: "x".repeat(2_500), token: sensitiveToken }, { status: 500 })
+        }
+      }
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (offered) return Response.json({ items: [] })
+        offered = true
+        return Response.json({ items: [{ kind: "remote_session_create", commandId: "command-1" }] })
+      }
+      if (parsed.pathname.endsWith("/claim")) {
+        return Response.json({ assignment: remoteSessionAssignment({ prompt: null, model: null }) })
+      }
+      if (parsed.pathname.endsWith("/complete")) {
+        completions.push(JSON.parse(options.body))
+        resolveCompleted()
+        return Response.json({ command: { id: "command-1", status: "failed" } })
+      }
+      throw new Error(`Unexpected request ${parsed.pathname}`)
+    },
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await withTimeout(completed, "failed remote session completion timed out")
+  runner.stop()
+
+  assert.equal(completions.length, 1)
+  assert.equal(completions[0].status, "failed")
+  assert.equal(completions[0].error.code, "execution_failed")
+  assert.equal(completions[0].error.message.length, 2_000)
+  assert.equal(completions[0].sessionId, undefined)
+  assert.equal(completions[0].workspaceId, undefined)
+  assert.equal(JSON.stringify(completions[0]).includes(sensitiveToken), false)
+})
+
+test("a work poll left hanging by a suspended machine times out and retries", async () => {
+  const pollSignals = []
+  let resolveRetried
+  const retried = new Promise((resolve) => { resolveRetried = resolve })
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+    fetchImpl: async (url, options = {}) => {
+      assert.equal(new URL(url).pathname, "/v1/automation-runner/work")
+      pollSignals.push(options.signal)
+      if (pollSignals.length === 1) {
+        // A suspended machine leaves the socket half-open: no response and no
+        // error, which without a bound would park the loop indefinitely.
+        return new Promise((_resolve, reject) => {
+          options.signal?.addEventListener(
+            "abort",
+            () => reject(options.signal.reason ?? new Error("aborted")),
+            { once: true },
+          )
+        })
+      }
+      resolveRetried()
+      return Response.json({ items: [] })
+    },
+    workPollTimeoutMs: 5,
+    random: () => 0.5,
+    waitBeforeReconnect: async () => {
+      await new Promise((resolve) => setImmediate(resolve))
+    },
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await withTimeout(retried, "hung work poll was never retried")
+  assert.equal(pollSignals[0]?.aborted, true)
+  runner.stop()
+})
+
 test("desktop Automation execution creates a normal visible local OpenWork thread", async () => {
   const requests = []
-  let snapshots = 0
+  const snapshotReads = new Map()
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
   const fetchImpl = async (url, options = {}) => {
     const parsed = new URL(url)
     const body = options.body ? JSON.parse(options.body) : null
-    requests.push({ path: parsed.pathname, method: options.method ?? "GET", body })
+    requests.push({ path: parsed.pathname, search: parsed.search, method: options.method ?? "GET", body, options })
     if (parsed.pathname === "/workspaces") {
       return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
     }
-    if (parsed.pathname === "/workspace/workspace-1/sessions" && options.method === "POST") {
-      return Response.json({ item: { id: "session-1" }, started: true }, { status: 201 })
+    if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+      return Response.json({ id: "session-1" }, { status: 201 })
     }
-    if (parsed.pathname === "/workspace/workspace-1/sessions/session-1/snapshot") {
-      snapshots += 1
-      return Response.json({ item: {
-        status: { type: snapshots === 1 ? "busy" : "idle" },
-        messages: snapshots === 1 ? [] : [{
-          info: { role: "assistant", tokens: { input: 12, output: 7 } },
-          parts: [{ type: "text", text: "Desktop runner result" }],
+    if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+    if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+      // Force the session route to finish last, as it can on either CI runner.
+      if (parsed.pathname === sessionPaths.get) await new Promise((resolve) => setImmediate(resolve))
+      // Snapshot routes run concurrently; each route advances its own fixture.
+      const snapshots = (snapshotReads.get(parsed.pathname) ?? 0) + 1
+      snapshotReads.set(parsed.pathname, snapshots)
+      return respondToSnapshotRequest(parsed, sessionPaths, {
+        status: { type: snapshots <= 1 ? "busy" : "idle" },
+        messages: snapshots <= 1 ? [] : [{
+          info: { id: "msg-result", role: "assistant", tokens: { input: 12, output: 7 } },
+          parts: [{ id: "part-result", type: "text", text: "Desktop runner result" }],
         }],
-      } })
+      })
     }
     throw new Error(`Unexpected request ${parsed.pathname}`)
   }
@@ -702,7 +1095,7 @@ test("desktop Automation execution creates a normal visible local OpenWork threa
     automationId: "automation-1",
     automationName: "Daily brief",
     instructions: "Prepare the brief",
-    model: { providerId: "opencode", modelId: "big-pickle" },
+    model: { providerId: "opencode", modelId: "big-pickle", variant: "high" },
     timeoutMs: 30_000,
     leaseExpiresAt: Date.now() + 60_000,
     attempt: 1,
@@ -716,29 +1109,355 @@ test("desktop Automation execution creates a normal visible local OpenWork threa
   assert.equal(result.workspaceId, "workspace-1")
   assert.equal(result.resultSummary, "Desktop runner result")
   assert.deepEqual(result.usage, { inputTokens: 12, outputTokens: 7, costMicros: null })
-  const create = requests.find((request) => request.path === "/workspace/workspace-1/sessions")
-  assert.deepEqual(create?.body, {
-    title: "Automation: Daily brief",
-    prompt: "Prepare the brief",
-    providerId: "opencode",
-    modelId: "big-pickle",
-  })
+  const localRequests = requests.filter((request) => request.path !== "/workspaces")
+  assert(localRequests.every((request) => new Headers(request.options.headers).get("x-openwork-task-recovery") === "off"))
+  assert.deepEqual(localRequests.slice(0, 2).map(({ path, method, body }) => ({ path, method, body })), [
+    {
+      path: sessionPaths.create,
+      method: "POST",
+      body: { title: "Automation: Daily brief" },
+    },
+    {
+      path: sessionPaths.prompt,
+      method: "POST",
+      body: {
+        model: { providerID: "opencode", modelID: "big-pickle" },
+        variant: "high",
+        parts: [{ type: "text", text: "Prepare the brief" }],
+      },
+    },
+  ])
+  for (const path of [sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status]) {
+    assert.equal(requests.filter((request) => request.path === path).length, 2)
+  }
+  assert.deepEqual(
+    requests.filter((request) => request.path === sessionPaths.messages).map((request) => request.search),
+    ["?limit=200", "?limit=200"],
+  )
+  assert.ok(requests.every((request) => request.options.signal instanceof AbortSignal))
+  assert.ok(localRequests.every((request) => new Headers(request.options.headers).get("Authorization") === "Bearer local-client-token"))
 })
 
-test("desktop Automation execution surfaces a missing pinned model", async () => {
+test("a pinned workspace wins over the active workspace", () => {
+  const listed = {
+    items: [{ id: "workspace-pinned" }, { id: "workspace-active" }],
+    activeId: "workspace-active",
+  }
+  assert.equal(resolveAssignmentWorkspace(listed, "workspace-pinned").id, "workspace-pinned")
+})
+
+test("an unpinned assignment keeps the legacy active-workspace fallback", () => {
+  const listed = {
+    items: [{ id: "workspace-first" }, { id: "workspace-active" }],
+    activeId: "workspace-active",
+  }
+  assert.equal(resolveAssignmentWorkspace(listed, null).id, "workspace-active")
+  assert.equal(resolveAssignmentWorkspace({ items: [{ id: "workspace-first" }] }, null).id, "workspace-first")
+})
+
+test("a pinned workspace missing locally fails instead of silently retargeting", () => {
+  const listed = { items: [{ id: "workspace-active" }], activeId: "workspace-active" }
+  assert.throws(
+    () => resolveAssignmentWorkspace(listed, "workspace-gone"),
+    (error) => error instanceof Error && Reflect.get(error, "code") === "execution_runtime_unavailable",
+  )
+})
+
+test("desktop Automation execution runs in the assignment's pinned workspace", async () => {
+  const sessionPaths = opencodeSessionPaths("workspace-pinned", "session-pinned")
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url)
+    if (parsed.pathname === "/workspaces") {
+      return Response.json({
+        items: [{ id: "workspace-pinned" }, { id: "workspace-active" }],
+        activeId: "workspace-active",
+      })
+    }
+    if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+      return Response.json({ id: "session-pinned" }, { status: 201 })
+    }
+    if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+    if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+      return respondToSnapshotRequest(parsed, sessionPaths, {
+        messages: [{
+          info: { id: "msg-pinned", role: "assistant", tokens: { input: 5, output: 2 } },
+          parts: [{ id: "part-pinned", type: "text", text: "Pinned result" }],
+        }],
+      })
+    }
+    throw new Error(`Unexpected request ${parsed.pathname}`)
+  }
+
+  const result = await executeDesktopAutomation({ ...testAssignment(), workspaceId: "workspace-pinned" }, {
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+    fetchImpl,
+    signal: new AbortController().signal,
+  })
+  assert.equal(result.workspaceId, "workspace-pinned")
+  assert.equal(result.sessionId, "session-pinned")
+})
+
+test("desktop Automation execution accepts a completed tool-only assistant turn", async () => {
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-tool-only")
   const fetchImpl = async (url, options = {}) => {
     const parsed = new URL(url)
     if (parsed.pathname === "/workspaces") {
       return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
     }
-    if (parsed.pathname === "/workspace/workspace-1/sessions" && options.method === "POST") {
-      return Response.json({ item: { id: "session-1" }, started: true }, { status: 201 })
+    if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+      return Response.json({ id: "session-tool-only" }, { status: 201 })
     }
-    if (parsed.pathname === "/workspace/workspace-1/sessions/session-1/snapshot") {
-      return Response.json({ item: {
+    if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+    if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+      return respondToSnapshotRequest(parsed, sessionPaths, {
+        statuses: {},
+        messages: [{
+          info: { id: "msg-tool", role: "assistant", tokens: { input: 9, output: 3 } },
+          parts: [{ id: "part-tool", type: "tool", tool: "example", state: { status: "completed", output: "done" } }],
+        }],
+      })
+    }
+    throw new Error(`Unexpected request ${parsed.pathname}`)
+  }
+
+  const result = await executeDesktopAutomation(testAssignment(), {
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+    fetchImpl,
+    signal: new AbortController().signal,
+  })
+
+  assert.deepEqual(result, {
+    sessionId: "session-tool-only",
+    workspaceId: "workspace-1",
+    resultSummary: null,
+    usage: { inputTokens: 9, outputTokens: 3, costMicros: null },
+  })
+})
+
+test("failed desktop assignments retain their created local thread in the Den completion", async () => {
+  let offered = false
+  const completions = []
+  let resolveCompleted
+  const completed = new Promise((resolve) => { resolveCompleted = resolve })
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-failed")
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      if (parsed.origin === "http://127.0.0.1:3000") {
+        if (parsed.pathname === "/workspaces") {
+          return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
+        }
+        if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+          return Response.json({ id: "session-failed" }, { status: 201 })
+        }
+        if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+        if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+          return respondToSnapshotRequest(parsed, sessionPaths, {
+            status: { type: "idle" },
+            messages: [{
+              info: {
+                id: "msg-failed",
+                role: "assistant",
+                error: {
+                  name: "ProviderModelNotFoundError",
+                  message: "Model not found: opencode/removed-model",
+                },
+              },
+              parts: [],
+            }],
+          })
+        }
+        throw new Error(`Unexpected local request ${parsed.pathname}`)
+      }
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (offered) return Response.json({ items: [] })
+        offered = true
+        return Response.json({ items: [{ runId: "run-1" }] })
+      }
+      if (parsed.pathname.endsWith("/claim")) return Response.json({ assignment: testAssignment() })
+      if (parsed.pathname.endsWith("/events")) return Response.json({ ok: true })
+      if (parsed.pathname.endsWith("/complete")) {
+        completions.push(JSON.parse(options.body))
+        resolveCompleted()
+        return Response.json({ ok: true })
+      }
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await withTimeout(completed, "failed assignment completion timed out")
+  runner.stop()
+
+  const completionBody = completions[0]
+  assert.ok(completionBody, "the failed assignment never reached a completion")
+  assert.equal(completionBody.status, "failed")
+  assert.equal(completionBody.sessionId, "session-failed")
+  assert.equal(completionBody.workspaceId, "workspace-1")
+  assert.equal(completionBody.error.code, "model_access_lost")
+})
+
+test("cancellation during execution preserves the local thread and reaches a terminal completion", async () => {
+  let offered = false
+  let snapshotStarted = false
+  const completions = []
+  const events = []
+  let resolveCompleted
+  const completed = new Promise((resolve) => { resolveCompleted = resolve })
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-cancelled")
+  const localRequests = []
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      if (parsed.origin === "http://127.0.0.1:3000") {
+        localRequests.push({
+          path: parsed.pathname,
+          method: options.method ?? "GET",
+          authorization: new Headers(options.headers).get("Authorization"),
+          signal: options.signal,
+        })
+        if (parsed.pathname === "/workspaces") {
+          return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
+        }
+        if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+          return Response.json({ id: "session-cancelled" }, { status: 201 })
+        }
+        if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+        if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+          snapshotStarted = true
+          return new Promise((resolve, reject) => {
+            const abort = () => reject(options.signal?.reason ?? new Error("cancelled"))
+            if (options.signal?.aborted) abort()
+            else options.signal?.addEventListener("abort", abort, { once: true })
+          })
+        }
+        if (parsed.pathname === sessionPaths.abort) return Response.json(true)
+        throw new Error(`Unexpected local request ${parsed.pathname}`)
+      }
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (offered) return Response.json({ items: [] })
+        offered = true
+        return Response.json({ items: [{ runId: "run-1" }] })
+      }
+      if (parsed.pathname.endsWith("/claim")) return Response.json({ assignment: testAssignment() })
+      if (parsed.pathname.endsWith("/heartbeat")) {
+        return Response.json({ leaseValid: true, cancelRequested: snapshotStarted })
+      }
+      if (parsed.pathname.endsWith("/events")) {
+        events.push(JSON.parse(options.body))
+        return Response.json({ ok: true })
+      }
+      if (parsed.pathname.endsWith("/complete")) {
+        completions.push(JSON.parse(options.body))
+        resolveCompleted()
+        return Response.json({ ok: true })
+      }
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+    heartbeatIntervalMs: 1,
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await withTimeout(completed, "cancelled assignment completion timed out")
+  runner.stop()
+
+  const completionBody = completions[0]
+  assert.ok(completionBody, "the cancelled assignment never reached a completion")
+  assert.equal(completionBody.status, "cancelled")
+  assert.equal(completionBody.sessionId, "session-cancelled")
+  assert.equal(completionBody.workspaceId, "workspace-1")
+  assert.equal(completionBody.error.code, "cancelled")
+  assert.equal(events.find((entry) => entry.type === "terminal")?.payload.status, "cancelled")
+  const abortRequest = localRequests.find((request) => request.path === sessionPaths.abort)
+  assert.equal(abortRequest?.method, "POST")
+  assert.equal(abortRequest?.authorization, "Bearer local-client-token")
+  assert.equal(abortRequest?.signal?.aborted, false)
+})
+
+test("an explicit assistant provider failure terminates immediately with its local thread", async () => {
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-provider-failure")
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url)
+    if (parsed.pathname === "/workspaces") {
+      return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
+    }
+    if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+      return Response.json({ id: "session-provider-failure" }, { status: 201 })
+    }
+    if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+    if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+      return respondToSnapshotRequest(parsed, sessionPaths, {
         status: { type: "idle" },
         messages: [{
           info: {
+            id: "msg-provider-failure",
+            role: "assistant",
+            error: {
+              name: "APIError",
+              data: { message: "Provider returned HTTP 503 and is temporarily unavailable", statusCode: 503 },
+            },
+          },
+          parts: [],
+        }],
+      })
+    }
+    throw new Error(`Unexpected request ${parsed.pathname}`)
+  }
+
+  await assert.rejects(
+    executeDesktopAutomation(testAssignment(), {
+      getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+      fetchImpl,
+      signal: new AbortController().signal,
+    }),
+    (error) => error instanceof Error
+      && Reflect.get(error, "code") === "execution_failed"
+      && Reflect.get(error, "sessionId") === "session-provider-failure"
+      && Reflect.get(error, "workspaceId") === "workspace-1"
+      && error.message === "Provider returned HTTP 503 and is temporarily unavailable",
+  )
+})
+
+test("a temporarily unavailable workspace fails clearly before session creation", async () => {
+  await assert.rejects(
+    executeDesktopAutomation(testAssignment(), {
+      getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local-client-token" }),
+      fetchImpl: async (url) => {
+        const parsed = new URL(url)
+        if (parsed.pathname === "/workspaces") return Response.json({ items: [], activeId: null })
+        throw new Error(`Unexpected request ${parsed.pathname}`)
+      },
+      signal: new AbortController().signal,
+    }),
+    /No local workspace is available/,
+  )
+})
+
+test("desktop Automation execution surfaces a missing pinned model", async () => {
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url)
+    if (parsed.pathname === "/workspaces") {
+      return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
+    }
+    if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+      return Response.json({ id: "session-1" }, { status: 201 })
+    }
+    if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+    if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+      return respondToSnapshotRequest(parsed, sessionPaths, {
+        status: { type: "idle" },
+        messages: [{
+          info: {
+            id: "msg-missing-model",
             role: "assistant",
             error: {
               name: "ProviderModelNotFoundError",
@@ -747,7 +1466,7 @@ test("desktop Automation execution surfaces a missing pinned model", async () =>
           },
           parts: [],
         }],
-      } })
+      })
     }
     throw new Error(`Unexpected request ${parsed.pathname}`)
   }
@@ -770,6 +1489,409 @@ test("desktop Automation execution surfaces a missing pinned model", async () =>
     }),
     (error) => error instanceof Error
       && Reflect.get(error, "code") === "model_access_lost"
+      && Reflect.get(error, "sessionId") === "session-1"
+      && Reflect.get(error, "workspaceId") === "workspace-1"
       && /Choose a supported model/.test(error.message),
   )
+})
+
+function localExecutionRoutes(sessionPaths, snapshot) {
+  return async (parsed, options) => {
+    if (parsed.pathname === "/workspaces") {
+      return Response.json({ items: [{ id: "workspace-1" }], activeId: "workspace-1" })
+    }
+    if (parsed.pathname === sessionPaths.create && options.method === "POST") {
+      return Response.json({ id: "session-1" }, { status: 201 })
+    }
+    if (parsed.pathname === sessionPaths.prompt) return new Response(null, { status: 204 })
+    if ([sessionPaths.get, sessionPaths.messages, sessionPaths.todo, sessionPaths.status].includes(parsed.pathname)) {
+      return snapshot(parsed, options)
+    }
+    if (parsed.pathname === sessionPaths.abort) return Response.json(true)
+    throw new Error(`Unexpected local request ${parsed.pathname}`)
+  }
+}
+
+function finishedSnapshot(parsed, sessionPaths) {
+  return respondToSnapshotRequest(parsed, sessionPaths, {
+    status: { type: "idle" },
+    messages: [{
+      info: { id: "msg-done", role: "assistant", tokens: { input: 1, output: 1 } },
+      parts: [{ id: "part-done", type: "text", text: "done" }],
+    }],
+  })
+}
+
+test("a heartbeat slower than its interval never overlaps the next probe", async () => {
+  let inflight = 0
+  let maxInflight = 0
+  let settled = 0
+  let releaseSnapshot = () => {}
+  const snapshotGate = new Promise((resolve) => { releaseSnapshot = () => resolve(undefined) })
+  let resolveCompleted
+  const completed = new Promise((resolve) => { resolveCompleted = resolve })
+  let offered = false
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  const local = localExecutionRoutes(sessionPaths, async (parsed) => {
+    await snapshotGate
+    return finishedSnapshot(parsed, sessionPaths)
+  })
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      if (parsed.origin === "http://127.0.0.1:3000") return local(parsed, options)
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (offered) return Response.json({ items: [] })
+        offered = true
+        return Response.json({ items: [{ runId: "run-1" }] })
+      }
+      if (parsed.pathname.endsWith("/claim")) return Response.json({ assignment: testAssignment() })
+      if (parsed.pathname.endsWith("/heartbeat")) {
+        inflight += 1
+        maxInflight = Math.max(maxInflight, inflight)
+        // Ten intervals long: a setInterval heartbeat would pile up here.
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        inflight -= 1
+        settled += 1
+        return Response.json({ leaseValid: true, cancelRequested: false })
+      }
+      if (parsed.pathname.endsWith("/events")) return Response.json({ ok: true })
+      if (parsed.pathname.endsWith("/complete")) {
+        resolveCompleted()
+        return Response.json({ ok: true })
+      }
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+    heartbeatIntervalMs: 1,
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await waitFor(() => settled >= 2, "two heartbeats did not settle")
+  releaseSnapshot()
+  await withTimeout(completed, "completion timed out")
+  runner.stop()
+  assert.ok(settled >= 2, "expected at least two settled heartbeats")
+  assert.equal(maxInflight, 1)
+})
+
+test("a hung completion request is bounded and the runner keeps claiming new work", async () => {
+  const completeSignals = []
+  const completions = []
+  let claims = 0
+  let resolveRunTwoComplete
+  const runTwoCompleted = new Promise((resolve) => { resolveRunTwoComplete = resolve })
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  const local = localExecutionRoutes(sessionPaths, (parsed) => finishedSnapshot(parsed, sessionPaths))
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      if (parsed.origin === "http://127.0.0.1:3000") return local(parsed, options)
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (claims === 0) return Response.json({ items: [{ runId: "run-1" }] })
+        if (claims === 1) return Response.json({ items: [{ runId: "run-2" }] })
+        return Response.json({ items: [] })
+      }
+      if (parsed.pathname.endsWith("/claim")) {
+        claims += 1
+        return Response.json({ assignment: { ...testAssignment(), runId: parsed.pathname.split("/").at(-2) } })
+      }
+      if (parsed.pathname.endsWith("/events")) return Response.json({ ok: true })
+      if (parsed.pathname === "/v1/automation-runs/run-1/complete") {
+        completeSignals.push(options.signal)
+        // A suspended machine leaves the socket half-open: no response and no
+        // error until the request's own deadline aborts it.
+        return new Promise((_resolve, reject) => {
+          options.signal?.addEventListener(
+            "abort",
+            () => reject(options.signal.reason ?? new Error("aborted")),
+            { once: true },
+          )
+        })
+      }
+      if (parsed.pathname === "/v1/automation-runs/run-2/complete") {
+        completions.push(JSON.parse(options.body))
+        resolveRunTwoComplete()
+        return Response.json({ ok: true })
+      }
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+    lifecycleRequestTimeoutMs: 5,
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await withTimeout(runTwoCompleted, "the runner never claimed new work after the hung completion")
+  runner.stop()
+  assert.equal(completeSignals.length, 2, "expected exactly one bounded retry of the hung completion")
+  assert.ok(completeSignals.every((signal) => signal?.aborted === true))
+  assert.equal(completions[0]?.status, "succeeded")
+})
+
+test("transient heartbeat failures below the miss threshold do not abort the run", async () => {
+  let heartbeats = 0
+  let releaseSnapshot = () => {}
+  const snapshotGate = new Promise((resolve) => { releaseSnapshot = () => resolve(undefined) })
+  const completions = []
+  let resolveCompleted
+  const completed = new Promise((resolve) => { resolveCompleted = resolve })
+  let offered = false
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  // The gate is signal-aware so that an abort of the execution controller
+  // fails the run instead of being masked by the scripted response.
+  const local = localExecutionRoutes(sessionPaths, async (parsed, options) => {
+    await new Promise((resolve, reject) => {
+      const abort = () => reject(options.signal?.reason ?? new Error("aborted"))
+      if (options.signal?.aborted) return abort()
+      options.signal?.addEventListener("abort", abort, { once: true })
+      void snapshotGate.then(resolve)
+    })
+    return finishedSnapshot(parsed, sessionPaths)
+  })
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      if (parsed.origin === "http://127.0.0.1:3000") return local(parsed, options)
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (offered) return Response.json({ items: [] })
+        offered = true
+        return Response.json({ items: [{ runId: "run-1" }] })
+      }
+      if (parsed.pathname.endsWith("/claim")) return Response.json({ assignment: testAssignment() })
+      if (parsed.pathname.endsWith("/heartbeat")) {
+        heartbeats += 1
+        if (heartbeats <= 2) return Response.json({ message: "transient" }, { status: 500 })
+        return Response.json({ leaseValid: true, cancelRequested: false })
+      }
+      if (parsed.pathname.endsWith("/events")) return Response.json({ ok: true })
+      if (parsed.pathname.endsWith("/complete")) {
+        completions.push(JSON.parse(options.body))
+        resolveCompleted()
+        return Response.json({ ok: true })
+      }
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+    heartbeatIntervalMs: 1,
+    heartbeatMissLimit: 3,
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await waitFor(() => heartbeats >= 3, "the run did not survive to a third heartbeat")
+  releaseSnapshot()
+  await withTimeout(completed, "completion timed out")
+  runner.stop()
+  assert.equal(completions[0]?.status, "succeeded")
+})
+
+test("consecutive heartbeat misses abort the run and still deliver terminal and completion", async () => {
+  let heartbeats = 0
+  const events = []
+  const completions = []
+  let resolveCompleted
+  const completed = new Promise((resolve) => { resolveCompleted = resolve })
+  let offered = false
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  const local = localExecutionRoutes(sessionPaths, (parsed, options) => new Promise((_resolve, reject) => {
+    const abort = () => reject(options.signal?.reason ?? new Error("aborted"))
+    if (options.signal?.aborted) abort()
+    else options.signal?.addEventListener("abort", abort, { once: true })
+  }))
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      if (parsed.origin === "http://127.0.0.1:3000") return local(parsed, options)
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (offered) return Response.json({ items: [] })
+        offered = true
+        return Response.json({ items: [{ runId: "run-1" }] })
+      }
+      if (parsed.pathname.endsWith("/claim")) return Response.json({ assignment: testAssignment() })
+      if (parsed.pathname.endsWith("/heartbeat")) {
+        heartbeats += 1
+        return Response.json({ message: "boom" }, { status: 500 })
+      }
+      if (parsed.pathname.endsWith("/events")) {
+        events.push(JSON.parse(options.body))
+        return Response.json({ ok: true })
+      }
+      if (parsed.pathname.endsWith("/complete")) {
+        completions.push(JSON.parse(options.body))
+        resolveCompleted()
+        return Response.json({ ok: true })
+      }
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+    heartbeatIntervalMs: 1,
+    heartbeatMissLimit: 3,
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await withTimeout(completed, "the failed run never reached completion")
+  runner.stop()
+  assert.equal(heartbeats, 3, "the run should survive exactly up to the miss threshold")
+  assert.equal(completions[0]?.status, "failed")
+  assert.match(completions[0]?.error.message, /heartbeat failed 3 times/)
+  assert.equal(events.find((entry) => entry.type === "terminal")?.payload.status, "failed")
+})
+
+test("a snapshot poll left hanging by a suspended machine still honors the assignment timeout", async (t) => {
+  // The timer can fire before the wall clock reaches the computed deadline.
+  // Hold that clock still to exercise the abort source deterministically.
+  t.mock.method(Date, "now", () => 1_000)
+  const snapshotSignals = []
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  const local = localExecutionRoutes(sessionPaths, (parsed, options) => {
+    snapshotSignals.push(options.signal)
+    return new Promise((_resolve, reject) => {
+      options.signal?.addEventListener(
+        "abort",
+        () => reject(options.signal.reason ?? new Error("aborted")),
+        { once: true },
+      )
+    })
+  })
+  await assert.rejects(
+    executeDesktopAutomation({ ...testAssignment(), timeoutMs: 20 }, {
+      getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+      fetchImpl: async (url, options = {}) => local(new URL(url), options),
+      signal: new AbortController().signal,
+    }),
+    /Desktop Automation execution timed out/,
+  )
+  assert.equal(snapshotSignals[0]?.aborted, true)
+})
+
+test("a late heartbeat verdict for a finished run cannot cancel its successor", async () => {
+  const completions = []
+  let claims = 0
+  /** @type {((response: Response) => void) | null} */
+  let holdHeartbeat = null
+  let releaseRunOne = () => {}
+  const runOneGate = new Promise((resolve) => { releaseRunOne = () => resolve(undefined) })
+  let releaseRunTwo = () => {}
+  const runTwoGate = new Promise((resolve) => { releaseRunTwo = () => resolve(undefined) })
+  let resolveRunTwoComplete
+  const runTwoCompleted = new Promise((resolve) => { resolveRunTwoComplete = resolve })
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  const local = localExecutionRoutes(sessionPaths, async (parsed) => {
+    await (claims === 1 ? runOneGate : runTwoGate)
+    return finishedSnapshot(parsed, sessionPaths)
+  })
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      if (parsed.origin === "http://127.0.0.1:3000") return local(parsed, options)
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (claims === 0) return Response.json({ items: [{ runId: "run-1" }] })
+        if (claims === 1) return Response.json({ items: [{ runId: "run-2" }] })
+        return Response.json({ items: [] })
+      }
+      if (parsed.pathname.endsWith("/claim")) {
+        claims += 1
+        return Response.json({ assignment: { ...testAssignment(), runId: parsed.pathname.split("/").at(-2) } })
+      }
+      if (parsed.pathname === "/v1/automation-runs/run-1/heartbeat") {
+        return new Promise((resolve) => { holdHeartbeat = resolve })
+      }
+      if (parsed.pathname === "/v1/automation-runs/run-2/heartbeat") {
+        return Response.json({ leaseValid: true, cancelRequested: false })
+      }
+      if (parsed.pathname.endsWith("/events")) return Response.json({ ok: true })
+      if (parsed.pathname.endsWith("/complete")) {
+        completions.push({ runId: parsed.pathname.split("/").at(-2), body: JSON.parse(options.body) })
+        if (parsed.pathname === "/v1/automation-runs/run-2/complete") resolveRunTwoComplete()
+        return Response.json({ ok: true })
+      }
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+    heartbeatIntervalMs: 1,
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await waitFor(() => holdHeartbeat !== null, "run-1's heartbeat did not start")
+  releaseRunOne()
+  await waitFor(() => claims === 2, "run-2 was not claimed")
+  // The stale probe answers with a cancellation verdict for the finished
+  // run-1: it must not touch the successor's execution.
+  holdHeartbeat?.(Response.json({ leaseValid: true, cancelRequested: true }))
+  await flushTasks()
+  releaseRunTwo()
+  await withTimeout(runTwoCompleted, "run-2 completion timed out")
+  runner.stop()
+  assert.equal(completions.find((entry) => entry.runId === "run-1")?.body.status, "succeeded")
+  assert.equal(completions.find((entry) => entry.runId === "run-2")?.body.status, "succeeded")
+})
+
+test("stopping the runner during terminal delivery aborts it without further requests", async () => {
+  const denPaths = []
+  /** @type {AbortSignal | null} */
+  let terminalSignal = null
+  let offered = false
+  const sessionPaths = opencodeSessionPaths("workspace-1", "session-1")
+  const local = localExecutionRoutes(sessionPaths, (parsed) => finishedSnapshot(parsed, sessionPaths))
+  const runner = createDesktopAutomationRunner({
+    getLocalRuntime: async () => ({ baseUrl: "http://127.0.0.1:3000", token: "local" }),
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url)
+      if (parsed.origin === "http://127.0.0.1:3000") return local(parsed, options)
+      denPaths.push(parsed.pathname)
+      if (parsed.pathname === "/v1/automation-runner/work") {
+        if (offered) return Response.json({ items: [] })
+        offered = true
+        return Response.json({ items: [{ runId: "run-1" }] })
+      }
+      if (parsed.pathname.endsWith("/claim")) return Response.json({ assignment: testAssignment() })
+      if (parsed.pathname.endsWith("/events")) {
+        if (JSON.parse(options.body).type !== "terminal") return Response.json({ ok: true })
+        terminalSignal = options.signal
+        return new Promise((_resolve, reject) => {
+          options.signal?.addEventListener(
+            "abort",
+            () => reject(options.signal.reason ?? new Error("aborted")),
+            { once: true },
+          )
+        })
+      }
+      if (parsed.pathname.endsWith("/complete")) return Response.json({ ok: true })
+      throw new Error(`Unexpected Den request ${parsed.pathname}`)
+    },
+    lifecycleRequestTimeoutMs: 10_000,
+    waitBeforeReconnect: () => new Promise(() => {}),
+  })
+  runner.configure({
+    baseUrl: "https://den.example.com",
+    token: runnerTokenFor("https://den.example.com"),
+    runnerId: "runner-1",
+  })
+  await waitFor(() => terminalSignal !== null, "the terminal event did not start")
+  runner.stop()
+  await flushTasks()
+  assert.equal(terminalSignal?.aborted, true)
+  // user, assistant, and usage events plus exactly one terminal attempt: the
+  // retired generation never retries and never posts the completion.
+  assert.equal(denPaths.filter((path) => path.endsWith("/events")).length, 4)
+  assert.equal(denPaths.filter((path) => path.endsWith("/complete")).length, 0)
 })

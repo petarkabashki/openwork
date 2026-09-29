@@ -54,6 +54,7 @@ const validationIssueSchema = z.object({
 export const invalidRequestSchema = z.object({
   error: z.literal("invalid_request"),
   details: z.array(validationIssueSchema),
+  capability: z.string().optional(),
 }).meta({ ref: "InvalidRequestError" })
 
 export const unauthorizedSchema = z.object({
@@ -83,11 +84,29 @@ export const successSchema = z.object({
 
 export const emptyObjectSchema = z.object({}).passthrough().meta({ ref: "OpaqueObject" })
 
+/** `{ ok: true }` acknowledgement returned by several mutation endpoints. */
+export const okSchema = z.object({
+  ok: z.literal(true),
+}).meta({ ref: "OkResponse" })
+
+const binaryStringSchema = z.string().meta({ format: "binary" })
+
 export function jsonResponse(description: string, schema: z.ZodTypeAny) {
   return {
     description,
     content: {
       "application/json": {
+        schema: resolver(schema),
+      },
+    },
+  }
+}
+
+export function scimJsonResponse(description: string, schema: z.ZodTypeAny) {
+  return {
+    description,
+    content: {
+      "application/scim+json": {
         schema: resolver(schema),
       },
     },
@@ -113,6 +132,25 @@ export function textResponse(description: string) {
         schema: resolver(z.string()),
       },
     },
+  }
+}
+
+export function xmlResponse(description: string) {
+  return {
+    description,
+    content: {
+      "application/xml": {
+        schema: resolver(z.string()),
+      },
+    },
+  }
+}
+
+/** Raw bytes served under one of the listed media types (`type: string, format: binary`). */
+export function binaryResponse(description: string, mediaTypes: readonly string[]) {
+  return {
+    description,
+    content: Object.fromEntries(mediaTypes.map((mediaType) => [mediaType, { schema: resolver(binaryStringSchema) }])),
   }
 }
 

@@ -3,7 +3,7 @@ import { timed } from "@openwork/timeline";
 import { attachSurface, describeAppState, dumpScreenState, isInteractive, probeAppStateOnSurface } from "@openwork/cdp";
 import { resolveHost } from "./resolve.ts";
 import type { AppStateProbe, AppSurfaceState, AttachedSurface, Surface, SurfaceHandle } from "@openwork/cdp";
-import type { Host } from "./types.ts";
+import type { DesktopRelease, ElectronStartupObservation, Host } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 180_000;
 const POLL_INTERVAL_MS = 250;
@@ -34,6 +34,8 @@ async function appendDesktopLog(error: unknown, handle: SurfaceHandle): Promise<
 export interface DesktopOptions {
   name?: string;
   mode?: "spawn" | "attach";
+  /** Explicit CDP endpoint for attach mode; falls back to OPENWORK_EVAL_CDP_URL. */
+  cdpUrl?: string;
   /**
    * Where this desktop runs. Defaults to the ambient host (`resolveHost()`).
    * Pass one from `localHost()` / `daytonaSandbox(id)` to place it explicitly —
@@ -45,10 +47,18 @@ export interface DesktopOptions {
     baseUrl: string;
     apiBaseUrl?: string;
     requireSignin?: boolean;
+    /** Seed an installation already activated against its private Den. */
+    enterpriseActivation?: { activatedAt: string; denBaseUrl: string };
   };
   env?: Record<string, string>;
+  /** Root package script used for a source Electron launch. */
+  devCommand?: "dev" | "dev:electron";
+  /** Skip host-side sidecar/helper preparation for an explicitly constrained launch. */
+  prepareSharedResources?: boolean;
   /** Exact caller-owned Electron profile root, for restart scenarios. */
   profileDir?: string;
+  /** Refuse a pooled sandbox: placement provisions one for this desktop alone. */
+  ownSandbox?: boolean;
   timeoutMs?: number;
 }
 
@@ -68,6 +78,53 @@ export interface DesktopHandle extends AttachedSurface {
    */
   workspaceRoot: string | null;
   stop(): Promise<void>;
+}
+
+export interface RetainedDesktopHandle extends AsyncDisposable {
+  handle: SurfaceHandle;
+  startup: ElectronStartupObservation;
+  workspaceRoot: string;
+  stop(): Promise<void>;
+}
+
+export interface RetainedDesktopOptions {
+  name?: string;
+  host: Host;
+  binaryPath?: string;
+  release?: DesktopRelease;
+  profileDir?: string;
+  env?: Record<string, string>;
+  launchArgs?: readonly string[];
+  startupTimeoutMs?: number;
+}
+
+/** Retain the host and viewer when product startup crashes or never exposes CDP. */
+export async function retainedDesktop(opts: RetainedDesktopOptions): Promise<RetainedDesktopHandle> {
+  if (!opts.host.spawnElectronRetained) {
+    throw new Error("The selected desktop host does not support retained Electron launches.");
+  }
+  const launched = await opts.host.spawnElectronRetained(opts.name ?? "retained", {
+    profile: "blank",
+    ...(opts.binaryPath === undefined ? {} : { binaryPath: opts.binaryPath }),
+    ...(opts.release === undefined ? {} : { release: opts.release }),
+    ...(opts.profileDir === undefined ? {} : { profileDir: opts.profileDir }),
+    ...(opts.env === undefined ? {} : { env: opts.env }),
+    ...(opts.launchArgs === undefined ? {} : { launchArgs: opts.launchArgs }),
+    ...(opts.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: opts.startupTimeoutMs }),
+  });
+  let stopped = false;
+  const stop = async (): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    await opts.host.disposeSurface(launched.handle);
+  };
+  return {
+    handle: launched.handle,
+    startup: launched.startup,
+    workspaceRoot: opts.host.workspaceRoot,
+    stop,
+    [Symbol.asyncDispose]: () => stop().catch((error: unknown) => logCleanupError(launched.handle.name, error)),
+  };
 }
 
 async function waitForReadiness(app: Surface, timeoutMs: number): Promise<AppReadiness> {
@@ -110,9 +167,9 @@ export async function desktop(opts: DesktopOptions = {}): Promise<DesktopHandle>
   let handle: SurfaceHandle;
 
   if (mode === "attach") {
-    const cdpUrl = process.env.OPENWORK_EVAL_CDP_URL?.trim();
+    const cdpUrl = opts.cdpUrl?.trim() || process.env.OPENWORK_EVAL_CDP_URL?.trim();
     if (!cdpUrl) {
-      throw new Error('desktop({ mode: "attach" }) requires OPENWORK_EVAL_CDP_URL to point at a running Electron app.');
+      throw new Error('desktop({ mode: "attach" }) requires cdpUrl or OPENWORK_EVAL_CDP_URL to point at a running Electron app.');
     }
     handle = {
       name: opts.name ?? "attached-app",
@@ -127,6 +184,9 @@ export async function desktop(opts: DesktopOptions = {}): Promise<DesktopHandle>
       profileDir: opts.profileDir,
       bootstrap: opts.bootstrap,
       env: opts.env,
+      devCommand: opts.devCommand,
+      prepareSharedResources: opts.prepareSharedResources,
+      ownSandbox: opts.ownSandbox,
     });
   }
 

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Pencil, Trash2 } from "lucide-react";
+import { denApiCredentials, denBrowserEndpoint } from "../app/(den)/_lib/den-api-origin";
 
 type AccessState = "loading" | "ready" | "signed-out" | "forbidden" | "error";
 type ViewMode = "users" | "companies" | "organizations";
@@ -128,11 +129,19 @@ type AdminUser = {
 };
 
 type AdminOrganizationCapabilities = {
+  auditLogs: boolean;
+  modelsAnalytics: boolean;
   installLinks: boolean;
   mcpConnections: boolean;
-  codemodeScripts: boolean;
-  remoteMcpApps: boolean;
-  cloud: boolean;
+};
+
+type AdminOpenWorkWebAccess = {
+  hasAccess: boolean;
+  accessSource: "subscription" | "complimentary" | null;
+  complimentaryAccess: boolean;
+  hasEligibleSubscription: boolean;
+  hasOngoingSubscription: boolean;
+  subscriptionStatus: string | null;
 };
 
 type AdminOrganization = {
@@ -151,6 +160,7 @@ type AdminOrganization = {
   seatsFreeAdditional: number;
   billableSeatCount: number;
   capabilities: AdminOrganizationCapabilities;
+  openworkWebAccess: AdminOpenWorkWebAccess;
 };
 
 type AdminPageInfo = {
@@ -237,6 +247,31 @@ function parseBillingStatus(value: unknown): AdminBillingStatus | null {
     currentPeriodEnd: toStringValue(value.currentPeriodEnd),
     source,
     note: toStringValue(value.note)
+  };
+}
+
+function parseAdminOpenWorkWebAccess(value: unknown): AdminOpenWorkWebAccess {
+  if (!isRecord(value)) {
+    return {
+      hasAccess: false,
+      accessSource: null,
+      complimentaryAccess: false,
+      hasEligibleSubscription: false,
+      hasOngoingSubscription: false,
+      subscriptionStatus: null
+    };
+  }
+
+  const accessSource = value.accessSource === "subscription" || value.accessSource === "complimentary"
+    ? value.accessSource
+    : null;
+  return {
+    hasAccess: value.hasAccess === true,
+    accessSource,
+    complimentaryAccess: value.complimentaryAccess === true,
+    hasEligibleSubscription: value.hasEligibleSubscription === true,
+    hasOngoingSubscription: value.hasOngoingSubscription === true,
+    subscriptionStatus: toStringValue(value.subscriptionStatus)
   };
 }
 
@@ -417,12 +452,12 @@ function parseAdminPayload(payload: unknown): AdminPayload | null {
           seatsFreeAdditional: toNumberValue(value.seatsFreeAdditional),
           billableSeatCount: toNumberValue(value.billableSeatCount),
           capabilities: {
+            auditLogs: capabilities.auditLogs === true,
+            modelsAnalytics: capabilities.modelsAnalytics === true,
             installLinks: capabilities.installLinks === true,
-            mcpConnections: capabilities.mcpConnections === true,
-            codemodeScripts: capabilities.codemodeScripts === true,
-            remoteMcpApps: capabilities.remoteMcpApps === true,
-            cloud: capabilities.cloud === true
-          }
+            mcpConnections: capabilities.mcpConnections === true
+          },
+          openworkWebAccess: parseAdminOpenWorkWebAccess(value.openworkWebAccess)
         };
       })
       .filter((value): value is AdminOrganization => value !== null)
@@ -791,7 +826,15 @@ function buildFixtureOrganization(index: number): AdminOrganization {
     freeSeatCount: target ? 25 : DEFAULT_FREE_SEAT_COUNT,
     seatsFreeAdditional: target ? 20 : 0,
     billableSeatCount: target ? 103 : 0,
-    capabilities: { installLinks: target, mcpConnections: target, codemodeScripts: false, remoteMcpApps: false, cloud: false }
+    capabilities: { auditLogs: false, installLinks: target, mcpConnections: target, modelsAnalytics: false },
+    openworkWebAccess: {
+      hasAccess: target,
+      accessSource: target ? "complimentary" : null,
+      complimentaryAccess: target,
+      hasEligibleSubscription: false,
+      hasOngoingSubscription: false,
+      subscriptionStatus: null
+    }
   };
 }
 
@@ -956,12 +999,8 @@ function adminScaleFixturePayload(path: string): unknown | null {
 
 const AUTH_TOKEN_STORAGE_KEY = "openwork:web:auth-token";
 
-// The den proxy strips cookies from requests whose Origin matches a cloud
-// instance origin (they are bearer-only by design), and browsers always send
-// an Origin header on mutating fetches. Cookie-only admin writes therefore
-// 401 when den-web itself is served from such an origin. Attach the stored
-// bearer token like den-flow's requestJson does; den-api accepts either
-// credential, so cookie-authenticated sessions keep working unchanged.
+// Preserve existing password-login bearer credentials alongside the web-host
+// session cookie. The same-origin browser proxy forwards both to Den API.
 function withStoredBearer(headers: Record<string, string>): Record<string, string> {
   if (typeof window === "undefined") {
     return headers;
@@ -979,9 +1018,10 @@ async function requestJson(path: string, signal?: AbortSignal) {
     return { response: new Response(JSON.stringify(fixturePayload), { status: 200 }), payload: fixturePayload };
   }
 
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denBrowserEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "GET",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     signal,
     headers: withStoredBearer({
       Accept: "application/json"
@@ -1007,9 +1047,10 @@ function isAbortError(error: unknown): boolean {
 }
 
 async function patchJson(path: string, body: unknown) {
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denBrowserEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "PATCH",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     headers: withStoredBearer({
       Accept: "application/json",
       "Content-Type": "application/json"
@@ -1032,9 +1073,10 @@ async function patchJson(path: string, body: unknown) {
 }
 
 async function postJson(path: string, body: unknown) {
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denBrowserEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "POST",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     headers: withStoredBearer({
       Accept: "application/json",
       "Content-Type": "application/json"
@@ -1055,9 +1097,10 @@ async function postJson(path: string, body: unknown) {
 }
 
 async function putJson(path: string, body: unknown) {
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denBrowserEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "PUT",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     headers: withStoredBearer({
       Accept: "application/json",
       "Content-Type": "application/json"
@@ -1080,9 +1123,10 @@ async function putJson(path: string, body: unknown) {
 }
 
 async function deleteJson(path: string) {
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denBrowserEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "DELETE",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     headers: withStoredBearer({
       Accept: "application/json"
     })
@@ -1360,9 +1404,28 @@ function PlanPill({ tier }: { tier: AdminOrganization["plan"]["tier"] }) {
   );
 }
 
+function OpenWorkWebAccessPill({ access }: { access: AdminOpenWorkWebAccess }) {
+  const label = access.hasOngoingSubscription
+    ? "Paid subscription"
+    : access.complimentaryAccess
+      ? "Complimentary"
+      : "No access";
+  const palette = access.hasOngoingSubscription
+    ? "border-violet-200 bg-violet-50 text-violet-700"
+    : access.complimentaryAccess
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : "border-slate-200 bg-slate-100 text-slate-600";
+
+  return (
+    <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[0.68rem] font-semibold uppercase tracking-[0.16em] ${palette}`}>
+      {label}
+    </span>
+  );
+}
+
 function DenAdminLoadingShell() {
   return (
-    <section className="mx-auto w-full max-w-6xl rounded-3xl border border-slate-200 bg-white shadow-sm" aria-busy="true">
+    <section className="mx-auto w-full max-w-6xl rounded-3xl border border-slate-200 bg-white shadow-xs" aria-busy="true">
       <div className="border-b border-slate-200 px-6 py-6 sm:px-8">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
@@ -1431,6 +1494,9 @@ export function DenAdminPanel() {
   const [savingFreeSeatsOrgId, setSavingFreeSeatsOrgId] = useState<string | null>(null);
   const [savingCapabilityOrgId, setSavingCapabilityOrgId] = useState<string | null>(null);
   const [capabilityError, setCapabilityError] = useState<{ orgId: string; message: string } | null>(null);
+  const [openworkWebAccessDialog, setOpenWorkWebAccessDialog] = useState<{ org: AdminOrganization; enabled: boolean; reason: string } | null>(null);
+  const [savingOpenWorkWebAccessOrgId, setSavingOpenWorkWebAccessOrgId] = useState<string | null>(null);
+  const [openworkWebAccessError, setOpenWorkWebAccessError] = useState<{ orgId: string; message: string } | null>(null);
   const [deleteUserDialog, setDeleteUserDialog] = useState<AdminUser | null>(null);
   const [deletingUserId, setDeletingUserId] = useState<string | null>(null);
   const [adminEmail, setAdminEmail] = useState("");
@@ -2095,6 +2161,60 @@ export function DenAdminPanel() {
     }
   }, [setOrganizationCapabilityLocally]);
 
+  const saveOpenWorkWebAccess = useCallback(async () => {
+    if (!openworkWebAccessDialog) {
+      return;
+    }
+
+    const reason = openworkWebAccessDialog.reason.trim();
+    if (reason.length < 3) {
+      setOpenWorkWebAccessError({ orgId: openworkWebAccessDialog.org.id, message: "Add a short reason for the audit log." });
+      return;
+    }
+
+    const { org, enabled } = openworkWebAccessDialog;
+    setSavingOpenWorkWebAccessOrgId(org.id);
+    setOpenWorkWebAccessError(null);
+    setError(null);
+
+    try {
+      const { response, payload: nextPayload } = await putJson(`/v1/admin/organizations/${org.id}/openwork-web-access`, {
+        enabled,
+        reason
+      });
+      if (!response.ok) {
+        const message = getErrorMessage(nextPayload, `Could not update OpenWork Web access for ${org.name}.`);
+        setOpenWorkWebAccessError({ orgId: org.id, message });
+        setError(message);
+        return;
+      }
+
+      const updatedOrganization = isRecord(nextPayload) && isRecord(nextPayload.organization) ? nextPayload.organization : null;
+      if (!updatedOrganization) {
+        throw new Error("The OpenWork Web access response was incomplete.");
+      }
+      const openworkWebAccess = parseAdminOpenWorkWebAccess(updatedOrganization.openworkWebAccess);
+      setPayload((current) => {
+        if (!current) {
+          return current;
+        }
+        return {
+          ...current,
+          organizations: current.organizations.map((entry) => entry.id === org.id
+            ? { ...entry, openworkWebAccess }
+            : entry)
+        };
+      });
+      setOpenWorkWebAccessDialog(null);
+    } catch (nextError) {
+      const message = nextError instanceof Error ? nextError.message : "Unknown network error";
+      setOpenWorkWebAccessError({ orgId: org.id, message });
+      setError(message);
+    } finally {
+      setSavingOpenWorkWebAccessOrgId(null);
+    }
+  }, [openworkWebAccessDialog]);
+
   const deleteUser = useCallback(async () => {
     if (!deleteUserDialog) {
       return;
@@ -2208,7 +2328,7 @@ export function DenAdminPanel() {
         : error ?? "The backoffice request failed before the dashboard could load.";
 
     return (
-      <section className="mx-auto w-full max-w-4xl rounded-3xl border border-slate-200 bg-white p-8 shadow-sm">
+      <section className="mx-auto w-full max-w-4xl rounded-3xl border border-slate-200 bg-white p-8 shadow-xs">
         <p className="text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-slate-500">Den admin</p>
         <h1 className="mt-3 text-3xl font-semibold tracking-[-0.04em] text-slate-950">{title}</h1>
         <p className="mt-3 max-w-2xl text-sm leading-7 text-slate-600">{message}</p>
@@ -2252,7 +2372,7 @@ export function DenAdminPanel() {
   const pageDurationLabel = isAdminScaleFixtureEnabled() ? "fixture computation" : "server";
 
   return (
-    <section className="mx-auto w-full max-w-6xl rounded-3xl border border-slate-200 bg-white shadow-sm">
+    <section className="mx-auto w-full max-w-6xl rounded-3xl border border-slate-200 bg-white shadow-xs">
       <div className="border-b border-slate-200 px-6 py-6 sm:px-8">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
@@ -2319,7 +2439,7 @@ export function DenAdminPanel() {
                 onChange={(event) => setAdminEmail(event.target.value)}
                 placeholder="Email"
                 aria-label="Admin email"
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-hidden focus:border-slate-400"
               />
               <input
                 data-testid="admin-add-note"
@@ -2327,7 +2447,7 @@ export function DenAdminPanel() {
                 onChange={(event) => setAdminNote(event.target.value)}
                 placeholder="Note (optional)"
                 aria-label="Admin note"
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-hidden focus:border-slate-400"
               />
               <button
                 type="button"
@@ -2443,7 +2563,7 @@ export function DenAdminPanel() {
                     setOrganizationQuery(event.target.value);
                   }}
                   placeholder="Org name, slug, or id"
-                  className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                  className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-hidden transition focus:border-slate-400"
                 />
               </label>
               <p className="text-xs leading-5 text-slate-500">
@@ -2493,7 +2613,7 @@ export function DenAdminPanel() {
                     setUserQuery(event.target.value);
                   }}
                   placeholder="Email, name, user id, provider, organization"
-                  className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                  className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-hidden transition focus:border-slate-400"
                 />
               </label>
               <p className="text-xs leading-5 text-slate-500">
@@ -2607,7 +2727,7 @@ export function DenAdminPanel() {
                           onChange={(event) => {
                             void saveOrganizationCapability(org, "installLinks", event.target.checked);
                           }}
-                          className="h-4 w-4 rounded border-slate-300"
+                          className="h-4 w-4 rounded-sm border-slate-300"
                         />
                         Install links
                       </label>
@@ -2620,50 +2740,27 @@ export function DenAdminPanel() {
                           onChange={(event) => {
                             void saveOrganizationCapability(org, "mcpConnections", event.target.checked);
                           }}
-                          className="h-4 w-4 rounded border-slate-300"
+                          className="h-4 w-4 rounded-sm border-slate-300"
                         />
                         OpenWork Connect (alpha)
                       </label>
                       <label className="inline-flex items-center gap-2 text-sm text-slate-700">
                         <input
                           type="checkbox"
-                          data-testid="admin-capability-codemodeScripts"
-                          checked={org.capabilities.codemodeScripts}
+                          data-testid="admin-capability-auditLogs"
+                          checked={org.capabilities.auditLogs}
                           disabled={savingCapabilityOrgId === org.id}
-                          onChange={(event) => {
-                            void saveOrganizationCapability(org, "codemodeScripts", event.target.checked);
-                          }}
-                          className="h-4 w-4 rounded border-slate-300"
+                          onChange={(event) => void saveOrganizationCapability(org, "auditLogs", event.target.checked)}
+                          className="h-4 w-4 rounded-sm border-slate-300"
                         />
-                        Codemode scripts (alpha)
-                      </label>
-                      <label className="inline-flex items-center gap-2 text-sm text-slate-700">
-                        <input
-                          type="checkbox"
-                          data-testid="admin-capability-remoteMcpApps"
-                          checked={org.capabilities.remoteMcpApps}
-                          disabled={savingCapabilityOrgId === org.id}
-                          onChange={(event) => {
-                            void saveOrganizationCapability(org, "remoteMcpApps", event.target.checked);
-                          }}
-                          className="h-4 w-4 rounded border-slate-300"
-                        />
-                        Native MCP Apps (preview)
-                      </label>
-                      <label className="inline-flex items-center gap-2 text-sm text-slate-700">
-                        <input
-                          type="checkbox"
-                          data-testid="admin-capability-cloud"
-                          checked={org.capabilities.cloud}
-                          disabled={savingCapabilityOrgId === org.id}
-                          onChange={(event) => {
-                            void saveOrganizationCapability(org, "cloud", event.target.checked);
-                          }}
-                          className="h-4 w-4 rounded border-slate-300"
-                        />
-                        Cloud (alpha)
+                        Audit logs
                       </label>
                     </div>
+                    <label className="mt-3 inline-flex items-center gap-2 text-sm text-slate-700">
+                      <input type="checkbox" checked={org.capabilities.modelsAnalytics} disabled={savingCapabilityOrgId === org.id}
+                        onChange={(event) => void saveOrganizationCapability(org, "modelsAnalytics", event.target.checked)} />
+                      OpenWork Models task analytics (requires admin opt-in)
+                    </label>
                     {capabilityError?.orgId === org.id ? (
                       <p data-testid="admin-capability-error" className="mt-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
                         Save failed — the change was reverted. {capabilityError.message}
@@ -2673,7 +2770,51 @@ export function DenAdminPanel() {
                     <p className="mt-1 text-xs text-slate-400">On by default. Turn off to hide member-facing org connections, marketplace capabilities on the agent rail, and the desktop Connect tab.</p>
                     <p className="mt-1 text-xs text-slate-400">Confined multi-tool scripts run server-side for this organization.</p>
                     <p className="mt-1 text-xs text-slate-400">Off by default. Requires the deployment master switch and exposes native provider MCP Apps and imported Apps for this organization.</p>
-                    <p className="mt-1 text-xs text-slate-400">Off by default. Turn on to show Cloud alpha access in this organization.</p>
+                  </div>
+
+                  <div className="mt-4 border-t border-slate-200 pt-4" data-testid="admin-openwork-web-access">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-[0.68rem] font-semibold uppercase tracking-[0.14em] text-slate-500">OpenWork Web billing access</p>
+                          <OpenWorkWebAccessPill access={org.openworkWebAccess} />
+                        </div>
+                        <p className="mt-2 text-sm leading-6 text-slate-600">
+                          {org.openworkWebAccess.hasOngoingSubscription
+                            ? `A ${org.openworkWebAccess.subscriptionStatus ?? "current"} Stripe subscription controls access and billing.`
+                            : org.openworkWebAccess.complimentaryAccess
+                              ? "All joined members can use OpenWork Web without a Stripe subscription or per-member charge, even when deployment-wide availability is off."
+                              : "No complimentary grant or ongoing paid OpenWork Web subscription."}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        data-testid="admin-openwork-web-access-action"
+                        onClick={() => setOpenWorkWebAccessDialog({
+                          org,
+                          enabled: !org.openworkWebAccess.complimentaryAccess,
+                          reason: ""
+                        })}
+                        disabled={savingOpenWorkWebAccessOrgId === org.id || (!org.openworkWebAccess.complimentaryAccess && org.openworkWebAccess.hasOngoingSubscription)}
+                        className="inline-flex shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {savingOpenWorkWebAccessOrgId === org.id
+                          ? "Saving..."
+                          : org.openworkWebAccess.complimentaryAccess
+                            ? "Revoke complimentary access"
+                            : "Grant complimentary access"}
+                      </button>
+                    </div>
+                    {!org.openworkWebAccess.complimentaryAccess && org.openworkWebAccess.hasOngoingSubscription ? (
+                      <p className="mt-2 text-xs leading-5 text-amber-700">
+                        Cancel or finish the paid subscription in Stripe before granting complimentary access.
+                      </p>
+                    ) : null}
+                    {openworkWebAccessError?.orgId === org.id ? (
+                      <p data-testid="admin-openwork-web-access-error" className="mt-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
+                        {openworkWebAccessError.message}
+                      </p>
+                    ) : null}
                   </div>
 
                   <div className="mt-4 grid gap-3 border-t border-slate-200 pt-4 lg:grid-cols-[12rem_10rem_auto] lg:items-end">
@@ -2685,7 +2826,7 @@ export function DenAdminPanel() {
                           const tier = event.target.value === "enterprise" || event.target.value === "team" ? event.target.value : "free";
                           setOrgDrafts((current) => ({ ...current, [org.id]: { ...draft, tier } }));
                         }}
-                        className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                        className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-hidden transition focus:border-slate-400"
                       >
                         <option value="free">Free</option>
                         <option value="team">Team</option>
@@ -2700,7 +2841,7 @@ export function DenAdminPanel() {
                         min={1}
                         value={draft.seatLimit}
                         onChange={(event) => setOrgDrafts((current) => ({ ...current, [org.id]: { ...draft, seatLimit: event.target.value } }))}
-                        className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                        className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-hidden transition focus:border-slate-400"
                       />
                     </label>
 
@@ -2972,6 +3113,73 @@ export function DenAdminPanel() {
         <p className="mt-6 text-xs leading-6 text-slate-500">Snapshot generated {formatDateTime(payload.generatedAt)}.</p>
       </div>
 
+      {openworkWebAccessDialog ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 px-4 py-6"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="openwork-web-access-dialog-title"
+          onClick={() => setOpenWorkWebAccessDialog(null)}
+        >
+          <div className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-6 shadow-xl" onClick={(event) => event.stopPropagation()}>
+            <p className="text-[0.68rem] font-semibold uppercase tracking-[0.18em] text-slate-500">Organization billing access</p>
+            <h2 id="openwork-web-access-dialog-title" className="mt-2 text-2xl font-semibold tracking-[-0.04em] text-slate-950">
+              {openworkWebAccessDialog.enabled ? "Grant" : "Revoke"} complimentary OpenWork Web?
+            </h2>
+            <p className="mt-2 text-sm leading-6 text-slate-600">
+              {openworkWebAccessDialog.enabled
+                ? `${openworkWebAccessDialog.org.name} will receive OpenWork Web for every joined member without a Stripe subscription or per-member charge, even when deployment-wide availability is off.`
+                : `${openworkWebAccessDialog.org.name} will lose complimentary access immediately unless an independently eligible paid subscription exists.`}
+            </p>
+
+            <label className="mt-5 grid gap-2">
+              <span className="text-[0.68rem] font-semibold uppercase tracking-[0.14em] text-slate-500">Reason for audit log</span>
+              <textarea
+                data-testid="admin-openwork-web-access-reason"
+                rows={3}
+                maxLength={500}
+                value={openworkWebAccessDialog.reason}
+                onChange={(event) => setOpenWorkWebAccessDialog({ ...openworkWebAccessDialog, reason: event.target.value })}
+                placeholder="For example: Internal OpenWork administration organization"
+                className="resize-none rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-hidden transition focus:border-slate-400"
+              />
+            </label>
+
+            {openworkWebAccessError?.orgId === openworkWebAccessDialog.org.id ? (
+              <p className="mt-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-xs leading-5 text-red-700">
+                {openworkWebAccessError.message}
+              </p>
+            ) : null}
+
+            <div className="mt-6 flex flex-wrap justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setOpenWorkWebAccessDialog(null)}
+                disabled={savingOpenWorkWebAccessOrgId === openworkWebAccessDialog.org.id}
+                className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                data-testid="admin-openwork-web-access-confirm"
+                onClick={() => {
+                  void saveOpenWorkWebAccess();
+                }}
+                disabled={savingOpenWorkWebAccessOrgId === openworkWebAccessDialog.org.id || openworkWebAccessDialog.reason.trim().length < 3}
+                className="inline-flex items-center justify-center rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {savingOpenWorkWebAccessOrgId === openworkWebAccessDialog.org.id
+                  ? "Saving..."
+                  : openworkWebAccessDialog.enabled
+                    ? "Grant access"
+                    : "Revoke access"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {freeSeatsDialog ? (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 px-4 py-6"
@@ -2996,7 +3204,7 @@ export function DenAdminPanel() {
                 min={DEFAULT_FREE_SEAT_COUNT}
                 value={freeSeatsDialog.totalFreeSeats}
                 onChange={(event) => setFreeSeatsDialog({ ...freeSeatsDialog, totalFreeSeats: event.target.value })}
-                className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-400"
+                className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-hidden transition focus:border-slate-400"
               />
             </label>
 

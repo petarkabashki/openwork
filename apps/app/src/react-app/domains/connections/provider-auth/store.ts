@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { CLOUD_MODEL_CONFIG_VERSION } from "@openwork/types/cloud-model-fast";
 
 import { applyEdits, modify, parse } from "jsonc-parser";
 import type {
@@ -14,6 +15,8 @@ import {
   type DenOrgLlmProvider,
   type DenOrgLlmProviderConnection,
 } from "../../../../app/lib/den";
+import { readGatewayUsageScope } from "../../../../app/lib/gateway-usage-scope";
+import { refreshGatewayUsageAfterCloudSync } from "../../cloud/gateway-usage-refresh";
 import { getOpenworkGatewayOrigin } from "../../../../app/lib/gateway-runtime";
 import { unwrap, waitForHealthy } from "../../../../app/lib/opencode";
 import {
@@ -57,6 +60,7 @@ export type ProviderAuthOpenworkServer = {
     "openworkServerStatus" | "openworkServerClient"
   > & {
     openworkServerAuth?: { token?: string; hostToken?: string };
+    openworkServerHostInfo?: { generation: number | null } | null;
     openworkServerCapabilities: { config?: { read?: boolean; write?: boolean }; providerSync?: boolean } | null;
   };
 };
@@ -78,10 +82,13 @@ import {
   getProviderModelIds,
   isCloudManagedProviderKey,
   isCloudProviderOutOfSync,
+  isGatewayModelReady,
+  type GatewayConnectProvider,
   resolveCloudProviderCredentials,
 } from "./cloud-provider-config";
 import { dispatchNewProviders } from "../../../../app/lib/provider-events";
-import { updateManagedDisabledProviders } from "../managed-engine-config";
+import { hasPendingGatewayModelSelection } from "./pending-gateway-model-selection";
+import { readManagedDisabledProviders, updateManagedDisabledProviders } from "../managed-engine-config";
 import {
   DESKTOP_RESTRICTION_OPENCODE_PROVIDER_ID,
   isDesktopProviderBlocked,
@@ -111,12 +118,18 @@ type CloudProviderSyncReason =
 
 type CloudProviderSyncWorkResult = void | OpenworkCloudProviderSyncRun;
 
+type GlobalCloudProviderSyncOutcome = { contextKey: string } & (
+  | { status: "completed"; result: CloudProviderSyncWorkResult }
+  | { status: "cancelled" }
+  | { status: "failed"; error: unknown }
+);
+
 type GlobalCloudProviderSyncBatch = {
   contextKey: string;
   sync: () => Promise<CloudProviderSyncWorkResult>;
-  promise: Promise<CloudProviderSyncWorkResult>;
-  resolve: (outcome: CloudProviderSyncWorkResult) => void;
-  reject: (error: unknown) => void;
+  isCurrent?: () => boolean;
+  promise: Promise<GlobalCloudProviderSyncOutcome>;
+  resolve: (outcome: GlobalCloudProviderSyncOutcome) => void;
 };
 
 let lastGlobalProviderDisposeRefreshAt = 0;
@@ -124,27 +137,47 @@ let activeGlobalCloudProviderSync: GlobalCloudProviderSyncBatch | null = null;
 let trailingGlobalCloudProviderSync: GlobalCloudProviderSyncBatch | null = null;
 let loggedGatewayCloudProviderSyncSkip = false;
 
-function enqueueGlobalCloudProviderSync(
+async function enqueueGlobalCloudProviderSync(
   contextKey: string,
   sync: () => Promise<CloudProviderSyncWorkResult>,
+  isCurrent?: () => boolean,
 ): Promise<CloudProviderSyncWorkResult> {
-  if (activeGlobalCloudProviderSync?.contextKey === contextKey) {
+  // A trailing batch may be replaced or forwarded to an active batch. Match
+  // the executed context, not the context its waiters originally requested.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (isCurrent?.() === false) return;
+    const outcome = await queueGlobalCloudProviderSync(contextKey, sync, isCurrent);
+    if (isCurrent?.() === false) return;
+    if (outcome.contextKey !== contextKey || outcome.status === "cancelled") continue;
+    if (outcome.status === "failed") throw outcome.error;
+    return outcome.result;
+  }
+  throw new Error("Cloud provider sync context kept changing. Try again.");
+}
+
+function queueGlobalCloudProviderSync(
+  contextKey: string,
+  sync: () => Promise<CloudProviderSyncWorkResult>,
+  isCurrent?: () => boolean,
+): Promise<GlobalCloudProviderSyncOutcome> {
+  if (activeGlobalCloudProviderSync?.contextKey === contextKey && activeGlobalCloudProviderSync.isCurrent?.() !== false) {
     const trailing = trailingGlobalCloudProviderSync;
     if (trailing && trailing.contextKey !== contextKey) {
       trailingGlobalCloudProviderSync = null;
-      void activeGlobalCloudProviderSync.promise.then(trailing.resolve, trailing.reject);
+      void activeGlobalCloudProviderSync.promise.then(trailing.resolve);
     }
     return activeGlobalCloudProviderSync.promise;
   }
   if (trailingGlobalCloudProviderSync) {
-    if (trailingGlobalCloudProviderSync.contextKey !== contextKey) {
+    if (trailingGlobalCloudProviderSync.contextKey !== contextKey || trailingGlobalCloudProviderSync.isCurrent?.() === false) {
       trailingGlobalCloudProviderSync.contextKey = contextKey;
       trailingGlobalCloudProviderSync.sync = sync;
+      trailingGlobalCloudProviderSync.isCurrent = isCurrent;
     }
     return trailingGlobalCloudProviderSync.promise;
   }
 
-  const batch = createGlobalCloudProviderSyncBatch(contextKey, sync);
+  const batch = createGlobalCloudProviderSyncBatch(contextKey, sync, isCurrent);
   if (activeGlobalCloudProviderSync) {
     trailingGlobalCloudProviderSync = batch;
   } else {
@@ -156,25 +189,34 @@ function enqueueGlobalCloudProviderSync(
 function createGlobalCloudProviderSyncBatch(
   contextKey: string,
   sync: () => Promise<CloudProviderSyncWorkResult>,
+  isCurrent?: () => boolean,
 ): GlobalCloudProviderSyncBatch {
-  let resolve: (outcome: CloudProviderSyncWorkResult) => void = () => undefined;
-  let reject: (error: unknown) => void = () => undefined;
-  const promise = new Promise<CloudProviderSyncWorkResult>((resolvePromise, rejectPromise) => {
+  let resolve: (outcome: GlobalCloudProviderSyncOutcome) => void = () => undefined;
+  const promise = new Promise<GlobalCloudProviderSyncOutcome>((resolvePromise) => {
     resolve = resolvePromise;
-    reject = rejectPromise;
   });
-  return { contextKey, sync, promise, resolve, reject };
+  return { contextKey, sync, isCurrent, promise, resolve };
 }
 
 function startGlobalCloudProviderSync(batch: GlobalCloudProviderSyncBatch): void {
   activeGlobalCloudProviderSync = batch;
+  const contextKey = batch.contextKey;
+  if (batch.isCurrent?.() === false) {
+    batch.resolve({ contextKey, status: "cancelled" });
+    finishGlobalCloudProviderSync(batch);
+    return;
+  }
   void batch.sync().then(
-    (outcome) => {
-      batch.resolve(outcome);
+    (result) => {
+      batch.resolve(batch.isCurrent?.() === false
+        ? { contextKey, status: "cancelled" }
+        : { contextKey, status: "completed", result });
       finishGlobalCloudProviderSync(batch);
     },
     (error) => {
-      batch.reject(error);
+      batch.resolve(batch.isCurrent?.() === false
+        ? { contextKey, status: "cancelled" }
+        : { contextKey, status: "failed", error });
       finishGlobalCloudProviderSync(batch);
     },
   );
@@ -253,7 +295,14 @@ export type CloudProviderServerSyncState = {
   skippedProviders: Record<string, OpenworkCloudProviderSyncSkippedProvider>;
 };
 
+export type ProviderLoadState = {
+  status: "idle" | "loading" | "ready" | "error";
+  error: string | null;
+};
+
 export type ProviderAuthStoreSnapshot = {
+  providerLoadState: ProviderLoadState;
+  gatewayUsageProviderScope?: number | null;
   providerAuthModalOpen: boolean;
   providerAuthBusy: boolean;
   providerAuthError: string | null;
@@ -289,6 +338,8 @@ type CreateProviderAuthStoreOptions = {
 };
 
 type MutableState = {
+  providerLoadState: ProviderLoadState;
+  gatewayUsageProviderScope?: number | null;
   providerAuthModalOpen: boolean;
   providerAuthBusy: boolean;
   providerAuthError: string | null;
@@ -328,6 +379,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
   let lastWorkspaceKey = "";
 
   let state: MutableState = {
+    providerLoadState: { status: "idle", error: null },
     providerAuthModalOpen: false,
     providerAuthBusy: false,
     providerAuthError: null,
@@ -340,14 +392,16 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     lastSyncError: {},
   };
 
+  let verifiedGatewayUsageContext = "";
   let cloudOrgProvidersLoadKey = "";
   let cloudOrgProvidersInFlightKey = "";
   let cloudOrgProvidersInFlight: Promise<DenOrgLlmProvider[]> | null = null;
   let cloudOrgProvidersGeneration = 0;
   let cloudProviderSyncContextKey = "";
   let lastDenSessionPushKey = "";
-  let denSessionPushKey = "";
-  let denSessionPushInFlight: Promise<void> | null = null;
+  let lastDenIdentityPushKey = "";
+  let denSessionDelivery: { key: string; controller: AbortController } | null = null;
+  let denSessionPushInFlight: { mode: "identity" | "sync"; promise: Promise<boolean> } | null = null;
 
   const emitChange = () => {
     for (const listener of listeners) listener();
@@ -394,7 +448,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
       merged.set(id, {
         id,
         name: provider.name.trim() || id,
-        env: getCloudProviderEnv(provider.providerConfig),
+        env: provider.runtimeEnvKeys ?? getCloudProviderEnv(provider.providerConfig),
       });
     }
 
@@ -432,34 +486,111 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     );
   };
 
-  const pushDenSession = (force = false): Promise<void> => {
+  const getDenSessionDeliveryKey = () => {
     const openworkSnapshot = options.openworkServer.getSnapshot();
-    const openworkClient = openworkSnapshot.openworkServerClient;
+    const settings = readDenSettings();
+    if (!serverHandlesProviderSync() || !settings.authToken?.trim() || !settings.activeOrgId?.trim()) return "";
+    return JSON.stringify([
+      settings.apiBaseUrl ?? resolveDenBaseUrls(settings).apiBaseUrl,
+      settings.activeOrgId.trim(),
+      settings.authToken.trim(),
+      openworkSnapshot.openworkServerClient?.baseUrl,
+      openworkSnapshot.openworkServerAuth?.token,
+      openworkSnapshot.openworkServerAuth?.hostToken,
+      openworkSnapshot.openworkServerHostInfo?.generation,
+    ]);
+  };
+
+  const invalidateDenSessionDelivery = () => {
+    denSessionDelivery?.controller.abort();
+    denSessionDelivery = null;
+    denSessionPushInFlight = null;
+    lastDenSessionPushKey = "";
+    lastDenIdentityPushKey = "";
+    cloudProviderSyncContextKey = "";
+  };
+
+  const syncDenSessionDelivery = () => {
+    const key = getDenSessionDeliveryKey();
+    if (key !== (denSessionDelivery?.key ?? "")) {
+      invalidateDenSessionDelivery();
+      verifiedGatewayUsageContext = "";
+      mutateState((current) => ({ ...current, cloudProviderServerSync: null, gatewayUsageProviderScope: null }));
+      if (key && !disposed) {
+        denSessionDelivery = { key, controller: new AbortController() };
+      }
+    }
+    return denSessionDelivery;
+  };
+
+  const isCurrentDenSessionDelivery = (delivery: typeof denSessionDelivery) =>
+    !disposed && delivery !== null && delivery === denSessionDelivery && delivery.key === getDenSessionDeliveryKey();
+
+  const pushDenSession = (mode: "identity" | "sync" = "sync", force = false): Promise<boolean> => {
+    const delivery = syncDenSessionDelivery();
+    const openworkClient = options.openworkServer.getSnapshot().openworkServerClient;
+    if (!delivery || !openworkClient || disposed) return Promise.resolve(false);
+    if (!force && delivery.key === (mode === "identity" ? lastDenIdentityPushKey : lastDenSessionPushKey)) return Promise.resolve(true);
+    if (denSessionPushInFlight) {
+      if (denSessionPushInFlight.mode === mode) return denSessionPushInFlight.promise;
+      // Readiness can recover during early verification, including an older
+      // server's 404. Serialize the full PUT, but never dedupe it against identity.
+      return denSessionPushInFlight.promise.catch(() => false).then(() =>
+        isCurrentDenSessionDelivery(delivery) ? pushDenSession(mode, force) : false);
+    }
+    if (mode === "sync" && !hasCloudProviderSyncPrerequisites()) return Promise.resolve(false);
+    if (mode === "sync") lastDenSessionPushKey = "";
     const settings = readDenSettings();
     const apiBaseUrl = settings.apiBaseUrl ?? resolveDenBaseUrls(settings).apiBaseUrl;
     const token = settings.authToken?.trim() ?? "";
     const orgId = settings.activeOrgId?.trim() ?? "";
-    if (!serverHandlesProviderSync() || !openworkClient || !token || !orgId) return Promise.resolve();
-    const key = `${apiBaseUrl}::${orgId}::${token}`;
-    if (!force && key === lastDenSessionPushKey) return Promise.resolve();
-    if (key === denSessionPushKey && denSessionPushInFlight) return denSessionPushInFlight;
-    denSessionPushKey = key;
-    const request = openworkClient.putDenSession({ baseUrl: apiBaseUrl, token, orgId });
-    denSessionPushInFlight = request;
-    request.then(
-      () => { lastDenSessionPushKey = key; },
-      () => undefined,
-    ).finally(() => {
-      if (denSessionPushInFlight === request) {
-        denSessionPushInFlight = null;
-        denSessionPushKey = "";
+    const request = (async () => {
+      // Policy verification can fail transiently with 403 policy_unavailable;
+      // auth denials and rate limits remain terminal.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (!isCurrentDenSessionDelivery(delivery)) return false;
+        try {
+          const put = mode === "identity" ? openworkClient.putDenIdentity : openworkClient.putDenSession;
+          await put({ baseUrl: apiBaseUrl, token, orgId }, delivery.controller.signal);
+          if (!isCurrentDenSessionDelivery(delivery)) return false;
+          lastDenIdentityPushKey = delivery.key;
+          lastDenSessionPushKey = mode === "sync" ? delivery.key : "";
+          return true;
+        } catch (error) {
+          if (!isCurrentDenSessionDelivery(delivery)) return false;
+          const retryable = error instanceof OpenworkServerError
+            ? (error.status === 403 && error.code === "policy_unavailable") || error.status === 408 || error.status >= 500
+            : error instanceof TypeError || (error instanceof Error && error.message === "Request timed out.");
+          if (!retryable || attempt === 2) throw error;
+          await new Promise<void>((resolve) => {
+            const finish = () => {
+              clearTimeout(timer);
+              delivery.controller.signal.removeEventListener("abort", finish);
+              resolve();
+            };
+            const timer = setTimeout(finish, 250 * 2 ** attempt);
+            delivery.controller.signal.addEventListener("abort", finish, { once: true });
+          });
+        }
       }
-    });
+      return false;
+    })();
+    denSessionPushInFlight = { mode, promise: request };
+    const clearInFlight = () => {
+      if (denSessionPushInFlight?.promise === request) {
+        denSessionPushInFlight = null;
+      }
+    };
+    void request.then(clearInFlight, clearInFlight);
     return request;
   };
 
   const refreshSnapshot = () => {
     snapshot = {
+      providerLoadState: state.providerLoadState,
+      gatewayUsageProviderScope: state.gatewayUsageProviderScope === readGatewayUsageScope().generation
+        && verifiedGatewayUsageContext === getCloudProviderSyncContextKey()
+        && state.cloudProviderServerSync?.reloadPending !== true ? state.gatewayUsageProviderScope : null,
       providerAuthModalOpen: state.providerAuthModalOpen,
       providerAuthBusy: state.providerAuthBusy,
       providerAuthError: state.providerAuthError,
@@ -499,14 +630,23 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     return "";
   };
 
-  const mirrorOpenWorkModelsVoiceEnv = async (provider: DenOrgLlmProviderConnection, apiKey: string) => {
+  const mirrorCloudProviderEnv = async (
+    provider: DenOrgLlmProviderConnection,
+    apiKey: string,
+    resolvedEnvEntries: Array<{ key: string; value: string }>,
+  ) => {
     const trimmedKey = apiKey.trim();
     if (!trimmedKey) return;
     const openworkClient = options.openworkServer.getSnapshot().openworkServerClient;
     if (!openworkClient) return;
-    const entries = getCloudProviderEnv(provider.providerConfig)
-      .slice(0, 1)
-      .map((key) => ({ key, value: trimmedKey }));
+    const entries = [...resolvedEnvEntries];
+    if (entries.length === 0) {
+      entries.push(
+        ...getCloudProviderEnv(provider.providerConfig)
+          .slice(0, 1)
+          .map((key) => ({ key, value: trimmedKey })),
+      );
+    }
     if (provider.source === "openwork") {
       if (!entries.some((entry) => entry.key === "OPENWORK_API_KEY")) {
         entries.unshift({ key: "OPENWORK_API_KEY", value: trimmedKey });
@@ -547,12 +687,14 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
 
   const writeWorkspaceOpenworkConfigRecord = async (
     config: Record<string, unknown>,
+    isCurrent = () => true,
   ) => {
     const root = options.selectedWorkspaceRoot().trim();
     const isLocalWorkspace =
       options.selectedWorkspaceDisplay().workspaceType === "local";
     const { openworkClient, openworkWorkspaceId, hasOpenworkTarget, canUseOpenworkServer } =
       await resolveOpenworkConfigTarget("write");
+    if (!isCurrent()) return false;
 
     if (canUseOpenworkServer && openworkClient && openworkWorkspaceId) {
       await openworkClient.patchConfig(openworkWorkspaceId, { openwork: config });
@@ -580,23 +722,35 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     return false;
   };
 
-  const refreshImportedCloudProviders = async (refreshOptions?: { strict?: boolean }) => {
+  const cloudImportWorkspaceKey = () => JSON.stringify([
+    currentWorkspaceKey(),
+    options.selectedWorkspaceDisplay().workspaceType,
+    options.providerBaseUrl(),
+    options.openworkServer.getSnapshot().openworkServerClient?.baseUrl,
+  ]);
+
+  const refreshImportedCloudProviders = async (refreshOptions?: { strict?: boolean; verifiedScope?: number }) => {
     try {
       if (serverHandlesProviderSync()) {
+        const delivery = syncDenSessionDelivery();
+        const contextKey = getCloudProviderSyncContextKey();
         const openworkClient = options.openworkServer.getSnapshot().openworkServerClient;
         if (!openworkClient) throw new Error("OpenWork server unavailable.");
         const status = await openworkClient.getCloudProviderSyncStatus();
+        if (!isCurrentDenSessionDelivery(delivery) || contextKey !== getCloudProviderSyncContextKey()) return state.importedCloudProviders;
         const next = Object.fromEntries(status.providers.map((provider) => [provider.cloudProviderId, provider]));
-        setStateField("importedCloudProviders", next);
-        // Carry the server's truth alongside the records: rows must not show
-        // "Connected" while an engine reload is still owed, and skipped
-        // providers must name themselves instead of staying "Syncing".
-        setStateField("cloudProviderServerSync", {
-          reloadPending: status.reloadPending,
-          skippedProviders: Object.fromEntries(
-            status.skippedProviders.map((provider) => [provider.cloudProviderId, provider]),
-          ),
-        });
+        if (status.hasSession && refreshOptions?.verifiedScope === readGatewayUsageScope().generation) {
+          verifiedGatewayUsageContext = contextKey;
+        }
+        mutateState((current) => ({
+          ...current, importedCloudProviders: next,
+          gatewayUsageProviderScope: status.hasSession && verifiedGatewayUsageContext === contextKey
+            ? refreshOptions?.verifiedScope ?? current.gatewayUsageProviderScope : null,
+          cloudProviderServerSync: {
+            reloadPending: status.reloadPending,
+            skippedProviders: Object.fromEntries((status.hasSession ? status.skippedProviders.filter((provider) => provider.reason !== "member_auth_required" || verifiedGatewayUsageContext === contextKey) : []).map((provider) => [provider.credentialSetId ? `${provider.cloudProviderId}:${provider.credentialSetId}` : provider.cloudProviderId, provider])),
+          },
+        }));
         return next;
       }
       // Legacy renderer-side import path (remote/hostless workspaces): the
@@ -604,9 +758,32 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
       if (state.cloudProviderServerSync !== null) {
         setStateField("cloudProviderServerSync", null);
       }
+      const generation = cloudOrgProvidersGeneration;
+      const contextKey = getCloudProviderSyncContextKey();
+      const workspaceKey = cloudImportWorkspaceKey();
       const config = await readWorkspaceOpenworkConfigRecord();
       const cloudImports = readWorkspaceCloudImports(config);
       const next = cloudImports.providers;
+      if (
+        disposed || generation !== cloudOrgProvidersGeneration ||
+        contextKey !== getCloudProviderSyncContextKey() || workspaceKey !== cloudImportWorkspaceKey()
+      ) {
+        const cleanupGeneration = cloudOrgProvidersGeneration;
+        const isCurrent = () => !disposed && cleanupGeneration === cloudOrgProvidersGeneration &&
+          workspaceKey === cloudImportWorkspaceKey() && !readDenSettings().authToken?.trim() && !serverHandlesProviderSync();
+        for (const importedProvider of Object.values(next)) {
+          if (!isCurrent()) break;
+          await removeCloudProviderInternal(importedProvider.cloudProviderId, {
+            silent: true, importedProvider, isCurrent,
+          }).catch(() => undefined);
+          if (!isCurrent()) break;
+          removeProviderFromState(importedProvider.providerId);
+          if (readStoredDefaultModel().providerID === importedProvider.providerId) {
+            writeStoredDefaultModel(DEFAULT_MODEL);
+          }
+        }
+        return state.importedCloudProviders;
+      }
       // Guard: don't overwrite non-empty import state with an empty read.
       // This prevents a transient server unavailability (e.g. during engine
       // restart) from clearing a just-completed import from the badge.
@@ -627,8 +804,10 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
 
   const persistImportedCloudProviders = async (
     nextProviders: Record<string, CloudImportedProvider>,
+    isCurrent = () => true,
   ) => {
     const config = await readWorkspaceOpenworkConfigRecord();
+    if (!isCurrent()) return;
     const cloudImports = readWorkspaceCloudImports(config);
     const nextCloudImports = {
       ...cloudImports,
@@ -637,7 +816,8 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     const nextConfig = withWorkspaceCloudImports(config, {
       ...nextCloudImports,
     });
-    const persisted = await writeWorkspaceOpenworkConfigRecord(nextConfig);
+    const persisted = await writeWorkspaceOpenworkConfigRecord(nextConfig, isCurrent);
+    if (!isCurrent()) return;
     if (!persisted) {
       throw new Error(
         "OpenWork server unavailable. Connect to manage imported cloud providers.",
@@ -668,12 +848,13 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     return null;
   };
 
-  const writeProjectConfigFile = async (content: string) => {
+  const writeProjectConfigFile = async (content: string, isCurrent = () => true) => {
     const root = options.selectedWorkspaceRoot().trim();
     const isLocalWorkspace =
       options.selectedWorkspaceDisplay().workspaceType === "local";
     const { openworkClient, openworkWorkspaceId, hasOpenworkTarget, canUseOpenworkServer } =
       await resolveOpenworkConfigTarget("write");
+    if (!isCurrent()) return false;
 
     if (canUseOpenworkServer && openworkClient && openworkWorkspaceId) {
       const result = await openworkClient.writeOpencodeConfigFile(
@@ -708,9 +889,10 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
    * values upsert, explicit `null` deletes — per-key on the server, so there
    * is no read-modify-write race and no edit of the user's opencode.jsonc.
    */
-  const patchRuntimeProviders = async (update: Record<string, unknown>) => {
+  const patchRuntimeProviders = async (update: Record<string, unknown>, isCurrent = () => true) => {
     const { openworkClient, openworkWorkspaceId, canUseOpenworkServer } =
       await resolveOpenworkConfigTarget("write");
+    if (!isCurrent()) return;
     if (!canUseOpenworkServer || !openworkClient || !openworkWorkspaceId) {
       throw new Error("OpenWork server unavailable. Connect to manage cloud providers.");
     }
@@ -746,7 +928,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
    * into the project opencode.jsonc. Strip them so the runtime entry is the
    * single owner (and stale blocks from older builds stop shadowing state).
    */
-  const stripLegacyCloudProviderBlocks = async (providerIds: Array<string | null | undefined>) => {
+  const stripLegacyCloudProviderBlocks = async (providerIds: Array<string | null | undefined>, isCurrent = () => true) => {
     const ids = [...new Set(providerIds.flatMap((id) => (id?.trim() ? [id.trim()] : [])))];
     if (ids.length === 0) return;
     try {
@@ -756,7 +938,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
           next = formatConfigWithoutCloudProvider(next, id, options.disabledProviders());
         }
         return next;
-      });
+      }, undefined, isCurrent);
     } catch {
       // Legacy cleanup only — the runtime entry already owns the provider.
     }
@@ -765,8 +947,10 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
   const updateProjectConfigFile = async (
     updater: (raw: string) => string,
     fallbackUpdate?: (config: Record<string, unknown>) => Record<string, unknown>,
+    isCurrent = () => true,
   ) => {
     const configFile = await readProjectConfigFile() as { content?: string } | null;
+    if (!isCurrent()) return false;
     if (configFile) {
       const raw = configFile.content?.trim()
         ? configFile.content
@@ -775,8 +959,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
       if (configsAreSemanticallyEqual(raw, next)) {
         return false;
       }
-      await writeProjectConfigFile(next);
-      return true;
+      return await writeProjectConfigFile(next, isCurrent);
     }
 
     if (!fallbackUpdate) {
@@ -871,6 +1054,12 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     const openworkSnapshot = options.openworkServer.getSnapshot();
     const workspaceId = options.runtimeWorkspaceId();
     const workspaceType = options.selectedWorkspaceDisplay().workspaceType;
+    // Before the first workspace exists the client reaches the engine root,
+    // whose config belongs to no workspace a person will open. Leave project
+    // provider rules alone until there is a workspace to hold them.
+    if (!workspaceId?.trim() && !options.selectedWorkspaceRoot().trim()) {
+      return false;
+    }
     const canUseManagedRuntime = Boolean(
       openworkSnapshot.openworkServerClient && workspaceId?.trim() && workspaceType === "local",
     );
@@ -1437,13 +1626,59 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     }
   }
 
-  async function refreshProviders(optionsArg?: { dispose?: boolean; force?: boolean }) {
-    const c = options.client();
-    if (!c) return null;
+  const isIncompatiblePermissionsConfigError = (error: unknown, depth = 0): boolean => {
+    if (depth > 5) return false;
+    if (typeof error === "string") {
+      try {
+        const parsed: unknown = JSON.parse(error);
+        return isIncompatiblePermissionsConfigError(parsed, depth + 1);
+      } catch {
+        return error.includes("V2 permissions are not supported by OpenCode V1");
+      }
+    }
+    if (!isRecord(error)) return false;
+    return isIncompatiblePermissionsConfigError(error.message, depth + 1)
+      || isIncompatiblePermissionsConfigError(error.data, depth + 1)
+      || (Array.isArray(error.issues) && error.issues.some(
+        (issue) => isRecord(issue) && isIncompatiblePermissionsConfigError(issue.message, depth + 1),
+      ));
+  };
 
-    if (optionsArg?.dispose) {
+  let providerRefreshGeneration = 0;
+
+  async function refreshProviders(
+    optionsArg?: {
+      dispose?: boolean;
+      force?: boolean;
+      /**
+       * The caller just rewrote engine config (for example disabled_providers).
+       * Reload even inside the 10s dispose throttle; otherwise the read below
+       * returns the pre-change config and undoes the change in the UI.
+       */
+      configChanged?: boolean;
+    },
+    isCurrent = () => !disposed,
+  ) {
+    const c = options.client();
+    if (!c || !isCurrent()) return null;
+    const generation = ++providerRefreshGeneration;
+    const baseUrl = options.providerBaseUrl();
+    const directory = options.selectedWorkspaceRoot();
+    const isRefreshCurrent = () => !disposed && isCurrent()
+      && generation === providerRefreshGeneration
+      && baseUrl === options.providerBaseUrl()
+      && directory === options.selectedWorkspaceRoot();
+    const force = Boolean(optionsArg?.dispose || optionsArg?.force || state.providerLoadState.error);
+    setStateField("providerLoadState", { status: "loading", error: state.providerLoadState.error });
+
+    const serverClient = options.openworkServer.getSnapshot().openworkServerClient;
+    const liveCatalog = optionsArg?.dispose && serverClient && options.selectedWorkspaceDisplay().workspaceType !== "remote"
+      ? await serverClient.getEngineV2PreviewStatus().then(status => status.enabled && status.chatRouting).catch(() => false)
+      : false;
+    if (optionsArg?.dispose && !liveCatalog) {
       const now = Date.now();
-      const shouldDispose = now - lastGlobalProviderDisposeRefreshAt >= 10_000;
+      const shouldDispose = Boolean(optionsArg?.configChanged)
+        || now - lastGlobalProviderDisposeRefreshAt >= 10_000;
       const shouldUseServerReload = !(
         isDesktopRuntime() && options.selectedWorkspaceDisplay().workspaceType === "local"
       );
@@ -1498,33 +1733,39 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
       }
     }
 
+    if (!isRefreshCurrent()) return null;
     const activeClient = options.client() ?? c;
-    let disabledProviders = options.disabledProviders() ?? [];
     try {
-      const config = unwrap(await activeClient.config.get());
-      disabledProviders = Array.isArray(config.disabled_providers)
-        ? config.disabled_providers
-        : [];
-      options.setDisabledProviders(disabledProviders);
-      refreshSnapshot();
-      emitChange();
-    } catch {
-      // ignore config read failures and continue with current store state
-    }
-
-    try {
+      const disabledProviders = await readManagedDisabledProviders({
+        opencodeClient: activeClient,
+        openworkClient: options.openworkServer.getSnapshot().openworkServerClient,
+        workspaceId: options.runtimeWorkspaceId(),
+        workspaceType: options.selectedWorkspaceDisplay().workspaceType,
+      });
+      if (!isRefreshCurrent()) return null;
       const updated = filterProviderList(
         await ensureProviderListQuery(getReactQueryClient(), {
           client: activeClient,
-          baseUrl: options.providerBaseUrl(),
-          directory: options.selectedWorkspaceRoot(),
-          force: Boolean(optionsArg?.dispose || optionsArg?.force),
+          baseUrl,
+          directory,
+          force,
         }),
         disabledProviders,
       );
+      if (!isRefreshCurrent()) return null;
+      options.setDisabledProviders(disabledProviders);
       applyProviderListState(updated);
+      setStateField("providerLoadState", { status: "ready", error: null });
       return updated;
-    } catch {
+    } catch (error) {
+      if (isRefreshCurrent()) {
+        setStateField("providerLoadState", {
+          status: "error",
+          error: t(isIncompatiblePermissionsConfigError(error)
+            ? "settings.provider_load_incompatible_permissions"
+            : "settings.provider_load_error"),
+        });
+      }
       return null;
     }
   }
@@ -1695,7 +1936,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
           providerID: localProviderId,
           auth: { type: "api", key: primaryApiKey },
         });
-        await mirrorOpenWorkModelsVoiceEnv(provider, primaryApiKey);
+        await mirrorCloudProviderEnv(provider, primaryApiKey, envEntries);
       }
       if (existingImported?.providerId && existingImported.providerId !== localProviderId) {
         try {
@@ -1720,6 +1961,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
           source: provider.source,
           updatedAt: provider.updatedAt ?? null,
           modelIds: getProviderModelIds(provider),
+          modelConfigVersion: CLOUD_MODEL_CONFIG_VERSION,
           importedAt: Date.now(),
         },
       };
@@ -1792,12 +2034,17 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
 
   async function removeCloudProviderInternal(
     cloudProviderId: string,
-    optionsArg?: { silent?: boolean },
+    optionsArg?: { silent?: boolean; importedProvider?: CloudImportedProvider; isCurrent?: () => boolean },
   ) {
+    const isCurrent = optionsArg?.isCurrent ?? (() => true);
+    const assertCurrent = () => {
+      if (!isCurrent()) throw new Error("Cloud provider cleanup context changed.");
+    };
+    assertCurrent();
     if (!optionsArg?.silent) {
       setStateField("providerAuthError", null);
     }
-    const imported = state.importedCloudProviders[cloudProviderId];
+    const imported = optionsArg?.importedProvider ?? state.importedCloudProviders[cloudProviderId];
     if (!imported) {
       throw new Error("This cloud provider has not been imported into the workspace.");
     }
@@ -1814,12 +2061,16 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
       // Runtime-managed: delete the provider entry via the server's per-key
       // merge (`null` deletes), then strip any legacy opencode.jsonc block
       // left by pre-runtime builds. Both are idempotent.
-      await patchRuntimeProviders({ [imported.providerId]: null });
-      await stripLegacyCloudProviderBlocks([imported.providerId]);
+      assertCurrent();
+      await patchRuntimeProviders({ [imported.providerId]: null }, isCurrent);
+      assertCurrent();
+      await stripLegacyCloudProviderBlocks([imported.providerId], isCurrent);
+      assertCurrent();
 
       const nextImportedProviders = { ...state.importedCloudProviders };
       delete nextImportedProviders[cloudProviderId];
-      await persistImportedCloudProviders(nextImportedProviders);
+      await persistImportedCloudProviders(nextImportedProviders, isCurrent);
+      assertCurrent();
 
       options.setDisabledProviders(
         options.disabledProviders().filter((id) => id !== imported.providerId),
@@ -1868,6 +2119,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
       options.selectedWorkspaceRoot().trim(),
       options.runtimeWorkspaceId() ?? "",
       options.client() ? "connected" : "disconnected",
+      getDenSessionDeliveryKey(),
     ].join("::");
   };
 
@@ -1875,11 +2127,14 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     const settings = readDenSettings();
     const workspaceTarget =
       options.selectedWorkspaceRoot().trim() || options.runtimeWorkspaceId() || "";
+    // A server that materializes providers itself writes them into its
+    // managed engine, which runs before the first workspace exists. Only the
+    // legacy renderer import needs a workspace to patch.
     return Boolean(
       options.client() &&
         settings.authToken?.trim() &&
         settings.activeOrgId?.trim() &&
-        workspaceTarget,
+        (workspaceTarget || serverHandlesProviderSync()),
     );
   };
 
@@ -1907,19 +2162,22 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
         checkRestriction: options.checkDesktopAppRestriction,
       },
     );
-    if (replacement) writeStoredDefaultModel(replacement);
+    if (replacement && !hasPendingGatewayModelSelection()) writeStoredDefaultModel(replacement);
   };
 
   const refreshProvidersAfterCloudSync = async (optionsArg: {
     dispose?: boolean;
     force?: boolean;
-  }) => {
-    const providerList = await refreshProviders(optionsArg);
+  }, isCurrent = () => !disposed) => {
+    const providerList = await refreshProviders(optionsArg, isCurrent);
+    if (!isCurrent()) return null;
     preselectEntitledOrgDefaultModel(providerList);
     return providerList;
   };
 
   async function performCloudProviderSync(reason: CloudProviderSyncReason) {
+    const usageScope = readGatewayUsageScope();
+    const usageContext = getCloudProviderSyncContextKey();
     if (!hasCloudProviderSyncPrerequisites()) {
       return;
     }
@@ -2049,9 +2307,15 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
       }
     }
 
-    await refreshProvidersAfterCloudSync(
+    const refreshedCatalog = await refreshProvidersAfterCloudSync(
       configChanged ? { dispose: true } : { force: true },
     ).catch(() => null);
+    if (refreshedCatalog && failures.length === 0 && usageScope === readGatewayUsageScope()
+      && usageContext === getCloudProviderSyncContextKey()
+      && Object.values(state.importedCloudProviders).every((provider) => liveProviderMap.has(provider.cloudProviderId))) {
+      verifiedGatewayUsageContext = usageContext;
+      setStateField("gatewayUsageProviderScope", usageScope.generation);
+    }
 
     // Notify the UI about newly imported providers so the global toast
     // can be shown regardless of which route is active.
@@ -2067,45 +2331,120 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     }
   }
 
-  async function runCloudProviderSync(reason: CloudProviderSyncReason) {
+  function isGatewayModelAvailable(provider: GatewayConnectProvider, model: { providerID: string; modelID: string }) {
+    return isGatewayModelReady(provider, model, state)
+      && isProviderAllowedByDesktopPolicy({ providerId: model.providerID,
+        restrictToCloud: options.checkDesktopAppRestriction({ restriction: "allowCustomProviders" }),
+        checkRestriction: options.checkDesktopAppRestriction })
+      && options.providerConnectedIds().includes(model.providerID)
+      && !options.disabledProviders().includes(model.providerID)
+      && options.providers().some((entry) => entry.id === model.providerID && Boolean(entry.models[model.modelID]));
+  }
+
+  async function startGatewayProviderOAuth(providerId: string, credentialSetId?: string, signal?: AbortSignal) {
+    const orgId = readDenSettings().activeOrgId;
+    const client = options.openworkServer.getSnapshot().openworkServerClient;
+    if (!orgId || !client) throw new Error("Sign in to OpenWork before connecting this provider.");
+    if (getOpenworkGatewayOrigin()) throw new Error("Open My Model Connections in Den to connect your Google account, then refresh models here.");
+    const contextKey = getCloudProviderSyncContextKey();
+    const isCurrent = () => !disposed && !signal?.aborted && contextKey === getCloudProviderSyncContextKey();
+    if (!isCurrent() || !await pushDenSession() || !isCurrent()) {
+      throw new Error("The active account or organization changed, or its session could not be delivered. Retry sign-in.");
+    }
+    const delivery = syncDenSessionDelivery();
+    if (!delivery || !isCurrent()) throw new Error("The active account changed. Retry sign-in.");
+    const requestSignal = signal ? AbortSignal.any([signal, delivery.controller.signal]) : delivery.controller.signal;
+    const result = await client.startGatewayProviderOAuth(providerId, orgId, credentialSetId, requestSignal);
+    if (!isCurrent()) throw new Error("The active account or organization changed. Retry sign-in.");
+    return result;
+  }
+
+  async function runCloudProviderSync(reason: CloudProviderSyncReason): Promise<void | { outcome: "handled_server_side" }> {
+    if (disposed) return;
+    const delivery = syncDenSessionDelivery();
+    const contextKey = getCloudProviderSyncContextKey();
+    const usageScope = readGatewayUsageScope();
+    const isCurrent = () => !disposed && usageScope === readGatewayUsageScope()
+      && contextKey === getCloudProviderSyncContextKey();
+    const refreshUsageOnly = () => {
+      if (!usageScope.token || !usageScope.organizationId) return Promise.resolve();
+      return enqueueGlobalCloudProviderSync(
+        `usage:${contextKey}`,
+        async () => { void refreshGatewayUsageAfterCloudSync(usageScope); },
+        isCurrent,
+      ).catch(() => {});
+    };
     if (!hasCloudProviderSyncPrerequisites()) {
+      await refreshUsageOnly();
+      if (!isCurrent()) return;
       if (reason === "settings_cloud_opened") {
         setStateField("providerAuthError", null);
+      }
+      // The trusted local server needs the session before the engine or
+      // workspace is ready. Provider materialization still waits for both.
+      if (delivery && !getOpenworkGatewayOrigin()) {
+        try {
+          await pushDenSession("identity");
+        } catch (error) {
+          if (isCurrentDenSessionDelivery(delivery)) logCloudProviderSyncError(reason, error);
+        }
       }
       return;
     }
     if (getOpenworkGatewayOrigin()) {
+      await refreshUsageOnly();
+      if (!isCurrent()) return;
       if (!loggedGatewayCloudProviderSyncSkip) {
         loggedGatewayCloudProviderSyncSkip = true;
         console.info(
           `[cloud-provider-sync:${reason}] Provider materialization is handled server-side in gateway mode.`,
         );
       }
+      if (reason === "manual" || reason === "settings_cloud_opened") {
+        await refreshProvidersAfterCloudSync({ force: true }, isCurrent);
+      }
       return { outcome: "handled_server_side" };
     }
 
     if (serverHandlesProviderSync()) {
+      const isCurrent = () => isCurrentDenSessionDelivery(delivery) && usageScope === readGatewayUsageScope()
+        && contextKey === getCloudProviderSyncContextKey();
       try {
         const result = await enqueueGlobalCloudProviderSync(
-          `server:${getCloudProviderSyncContextKey()}`,
+          `server:${contextKey}`,
           async () => {
+            if (!isCurrent()) return;
             const openworkClient = options.openworkServer.getSnapshot().openworkServerClient;
             if (!openworkClient) throw new Error("OpenWork server unavailable.");
-            let result = await openworkClient.runCloudProviderSyncNow(reason);
+            // An old server session can still return noop after a failed token
+            // refresh. Delivery must succeed before every run, not just no_session.
+            if (!await pushDenSession() || !isCurrent()) return;
+            let result = await openworkClient.runCloudProviderSyncNow(reason, delivery?.controller.signal);
+            if (!isCurrent()) return;
             if (result.status === "no_session") {
-              await pushDenSession(true);
-              result = await openworkClient.runCloudProviderSyncNow(reason);
+              if (!await pushDenSession("sync", true) || !isCurrent()) return;
+              result = await openworkClient.runCloudProviderSyncNow(reason, delivery?.controller.signal);
             }
+            if (isCurrent()) void refreshGatewayUsageAfterCloudSync(usageScope);
             return result;
           },
+          isCurrent,
         );
+        if (!isCurrent()) return;
         if (!result) throw new Error("Cloud provider sync returned no result.");
         // Re-derive the imported records (and reloadPending/skips) from the
         // server's status after EVERY server-handled pass. Without this the
         // Cloud Providers rows kept whatever the one-shot start() read found
         // (usually nothing) and sat on "Syncing" forever even though the
         // server had long since applied the sync (#3671, UI layer).
-        await refreshImportedCloudProviders();
+        if (result.status === "failed" || result.status === "no_session") {
+          verifiedGatewayUsageContext = "";
+          setStateField("gatewayUsageProviderScope", null);
+        }
+        await refreshImportedCloudProviders({
+          verifiedScope: result.status === "applied" || result.status === "noop" ? usageScope.generation : undefined,
+        });
+        if (!isCurrent()) return;
         if (result.status === "failed" || result.status === "no_session") {
           const message = logCloudProviderSyncError(
             reason,
@@ -2118,19 +2457,29 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
         // a removed managed-model default. Always reread the live catalog and
         // reconcile that preference so Settings diagnostics recover in place,
         // including after a noop server sync.
-        await refreshProvidersAfterCloudSync({ force: true });
+        await refreshProvidersAfterCloudSync({ force: true }, isCurrent);
+        if (!isCurrent()) return;
         return { outcome: "handled_server_side" };
       } catch (error) {
+        if (!isCurrent()) return;
         const message = logCloudProviderSyncError(reason, error);
         publishSettingsCloudProviderSyncError(reason, message);
         return;
       }
     }
 
-    return enqueueGlobalCloudProviderSync(
-      `client:${getCloudProviderSyncContextKey()}`,
-      () => performCloudProviderSync(reason),
+    await enqueueGlobalCloudProviderSync(
+      `client:${contextKey}`,
+      async () => {
+        try {
+          await performCloudProviderSync(reason);
+        } finally {
+          if (isCurrent()) void refreshGatewayUsageAfterCloudSync(usageScope);
+        }
+      },
+      isCurrent,
     ).catch((error) => {
+      if (!isCurrent()) return;
       const message = logCloudProviderSyncError(reason, error);
       publishSettingsCloudProviderSyncError(reason, message);
     });
@@ -2155,6 +2504,19 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
       return await removeCloudProvider(trackedImport.cloudProviderId);
     }
 
+    const workspaceKey = currentWorkspaceKey();
+    const baseUrl = options.providerBaseUrl();
+    const isCurrentWorkspace = () => !disposed
+      && workspaceKey === currentWorkspaceKey()
+      && baseUrl === options.providerBaseUrl();
+    const requireDiscovery = (updated: ProviderListResponse | null, requireDisconnected = false) => {
+      if (!isCurrentWorkspace() || !updated || !Array.isArray(updated.all) || !Array.isArray(updated.connected)
+        || (requireDisconnected && updated.connected.includes(resolved))) {
+        throw new Error(t("providers.disconnect_unverified"));
+      }
+      return updated;
+    };
+
     try {
       // OpenCode Zen is built-in / env-backed. Credential removal alone leaves
       // it connected — disable it via runtime OPENCODE_CONFIG injection.
@@ -2164,23 +2526,65 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
         } catch {
           // Zen may have no stored credentials; disable still applies.
         }
-        await ensureProjectProviderDisabledState(resolved, true);
-        await refreshProviders({ dispose: true });
+        if (!isCurrentWorkspace()) throw new Error(t("providers.disconnect_unverified"));
+        const configChanged = await ensureProjectProviderDisabledState(resolved, true);
+        requireDiscovery(await refreshProviders({ dispose: true, configChanged }, isCurrentWorkspace), true);
         removeProviderFromState(resolved);
         return `${t("providers.disconnected_prefix")} ${resolved}`;
       }
 
       await removeProviderAuthCredentials(resolved);
-      const updated = await refreshProviders({ dispose: true });
-      if (Array.isArray(updated?.connected) && updated.connected.includes(resolved)) {
-        // Provider is still connected (e.g. via env var). Just remove
-        // stored credentials; do NOT add to disabled_providers.
+      const updated = requireDiscovery(await refreshProviders({ dispose: true }, isCurrentWorkspace));
+      if (updated.connected.includes(resolved)) {
+        const stillConnected = updated.all.find((provider) => provider.id === resolved);
+        if (stillConnected && stillConnected.source !== "env") {
+          // The provider definition lives in an opencode config file (for
+          // example ~/.config/opencode/opencode.json), so credential removal
+          // alone can never disconnect it. Disable it via disabled_providers,
+          // exactly like the built-in OpenCode Zen branch above, instead of
+          // leaving the Disconnect button a silent no-op.
+          const configChanged = await ensureProjectProviderDisabledState(resolved, true);
+          requireDiscovery(await refreshProviders({ dispose: true, configChanged }, isCurrentWorkspace), true);
+          removeProviderFromState(resolved);
+          return `${t("providers.disconnected_prefix")} ${resolved}`;
+        }
+        // Provider is still connected via env var. Just remove stored
+        // credentials; the environment stays operator-owned, so do NOT add
+        // it to disabled_providers.
         return `Removed stored credentials for ${resolved}${t("providers.still_connected_suffix")}`;
       }
       removeProviderFromState(resolved);
       return `${t("providers.disconnected_prefix")} ${resolved}`;
     } catch (error) {
       const message = describeProviderError(error, t("providers.disconnect_failed"));
+      setStateField("providerAuthError", message);
+      throw error instanceof Error ? error : new Error(message);
+    }
+  }
+
+  /**
+   * Undo a Disconnect that hid a provider through `disabled_providers` (for
+   * example OpenCode Zen, which has no credentials to remove). Once hidden the
+   * engine drops it from every list, so this is the only way back in the UI.
+   */
+  async function enableProvider(providerId: string) {
+    setStateField("providerAuthError", null);
+    const resolved = providerId.trim();
+    if (!resolved) {
+      throw new Error(t("providers.provider_id_required"));
+    }
+    assertProviderAllowedByDesktopPolicy(resolved);
+    const workspaceKey = currentWorkspaceKey();
+    const baseUrl = options.providerBaseUrl();
+    const isCurrentWorkspace = () => !disposed
+      && workspaceKey === currentWorkspaceKey()
+      && baseUrl === options.providerBaseUrl();
+    try {
+      const configChanged = await ensureProjectProviderDisabledState(resolved, false);
+      await refreshProviders({ dispose: true, configChanged }, isCurrentWorkspace);
+      return `${t("providers.enabled_prefix")} ${resolved}`;
+    } catch (error) {
+      const message = describeProviderError(error, t("providers.enable_failed"));
       setStateField("providerAuthError", message);
       throw error instanceof Error ? error : new Error(message);
     }
@@ -2265,6 +2669,8 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     `${options.selectedWorkspaceRoot().trim()}::${options.runtimeWorkspaceId() ?? ""}`;
 
   const syncFromOptions = () => {
+    if (disposed) return;
+    const delivery = syncDenSessionDelivery();
     const workspaceKey = currentWorkspaceKey();
     const workspaceChanged = workspaceKey !== lastWorkspaceKey;
     lastWorkspaceKey = workspaceKey;
@@ -2278,7 +2684,11 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
       const nextSyncContextKey = getCloudProviderSyncContextKey();
       if (nextSyncContextKey === cloudProviderSyncContextKey) return;
       cloudProviderSyncContextKey = nextSyncContextKey;
-      void pushDenSession().then(() => runCloudProviderSync("app_launch"));
+      void runCloudProviderSync("app_launch").then((result) => {
+        if (!result && isCurrentDenSessionDelivery(delivery) && cloudProviderSyncContextKey === nextSyncContextKey) {
+          cloudProviderSyncContextKey = "";
+        }
+      });
       return;
     }
     if (!hasCloudProviderSyncPrerequisites()) {
@@ -2303,13 +2713,15 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     lastWorkspaceKey = currentWorkspaceKey();
     if (typeof window !== "undefined") {
       const handleDenSessionUpdate = (event: Event) => {
+        const detail = (event as CustomEvent<DenSessionUpdatedDetail>).detail;
+        if (detail?.status !== "success" && detail?.status !== "signed_out") return;
+
         cloudOrgProvidersGeneration += 1;
         cloudOrgProvidersLoadKey = "";
         cloudOrgProvidersInFlightKey = "";
         cloudOrgProvidersInFlight = null;
-        const detail = (event as CustomEvent<DenSessionUpdatedDetail>).detail;
 
-        if (detail?.status === "success") {
+        if (detail.status === "success") {
           mutateState((current) => ({
             ...current,
             cloudOrgProviders: [],
@@ -2319,13 +2731,14 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
             lastSyncError: {},
           }));
           void refreshCloudOrgProviders({ force: true }).catch(() => undefined);
-          void pushDenSession().then(() => runCloudProviderSync("sign_in"));
+          void runCloudProviderSync("sign_in");
         } else {
-          const logoutProviderIds = detail?.status === "signed_out"
-            ? [...new Set(options.providerConnectedIds())].filter(
-              (providerId) => providerId.trim().toLowerCase() !== DESKTOP_RESTRICTION_OPENCODE_PROVIDER_ID,
-            )
-            : [];
+          invalidateDenSessionDelivery();
+          const connectedProviderIdsBeforeLogout = options.providerConnectedIds();
+          const logoutProviderIds = [...new Set([
+            ...Object.values(state.importedCloudProviders).map((provider) => provider.providerId),
+            ...state.cloudOrgProviders.map(getCloudManagedProviderId),
+          ])];
           // Account-scoped catalog state must disappear synchronously. Config
           // and credential cleanup continues below without leaving stale
           // models visible while those best-effort operations finish.
@@ -2349,19 +2762,35 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
             lastSyncError: {},
           }));
           if (serverHandlesProviderSync()) {
-            lastDenSessionPushKey = "";
+            const workspaceKey = currentWorkspaceKey();
+            const generation = cloudOrgProvidersGeneration;
+            const isCurrent = () => !disposed && generation === cloudOrgProvidersGeneration && workspaceKey === currentWorkspaceKey();
+            setStateField("importedCloudProviders", {});
             void (async () => {
-              await options.openworkServer.getSnapshot().openworkServerClient?.deleteDenSession().catch(() => undefined);
+              const cleared = await options.openworkServer.getSnapshot().openworkServerClient?.deleteDenSession().then(() => true, () => false);
+              if (!isCurrent()) return;
               // The server removes cloud-owned environment entries from disk,
               // but a running OpenCode child retains its spawn environment.
               // Explicit desktop sign-out must replace that process so an
               // account-scoped provider cannot remain connected in the UI.
-              if (detail?.status === "signed_out" && isDesktopRuntime()) {
+              if (isDesktopRuntime()) {
                 await engineRestart({}).catch(() => undefined);
               }
+              if (!cleared) return;
+              const providers = await refreshProviders({ force: true }, isCurrent);
+              const defaultProviderId = readStoredDefaultModel().providerID;
+              if (
+                providers &&
+                connectedProviderIdsBeforeLogout.includes(defaultProviderId) &&
+                isCloudManagedProviderKey(defaultProviderId) &&
+                !providers.connected.includes(defaultProviderId)
+              ) {
+                writeStoredDefaultModel(DEFAULT_MODEL);
+              }
             })();
+            return;
           }
-          // Sign-out or error: remove all cloud-imported providers from the workspace
+          // Sign-out: remove all cloud-imported providers from the workspace
           // Capture the full import records BEFORE clearing state
           const importedProviders = { ...state.importedCloudProviders };
           const importedIds = Object.keys(importedProviders);
@@ -2369,15 +2798,6 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
           // Best-effort cleanup: remove each cloud provider from opencode.jsonc
           // BEFORE clearing state so removeCloudProviderInternal can find the records
           void (async () => {
-            for (const providerId of logoutProviderIds) {
-              try {
-                await removeProviderAuthCredentials(providerId);
-              } catch {
-                // Providers backed exclusively by the environment have no
-                // stored credential to remove. Their environment remains
-                // operator-owned and is not mutated by account logout.
-              }
-            }
             for (const cloudId of importedIds) {
               try {
                 await removeCloudProviderInternal(cloudId, { silent: true });
@@ -2423,6 +2843,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
         handleDenSessionUpdate as EventListener,
       );
       const handleDenSettingsChange = () => {
+        syncFromOptions();
         void refreshCloudOrgProviders({ force: true }).catch(() => undefined);
       };
       window.addEventListener(
@@ -2445,7 +2866,20 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     // first launch before a workspace exists (workspace sync still handles
     // credential materialization once a workspace is selected).
     void refreshCloudOrgProviders().catch(() => undefined);
+    const importRefreshGeneration = cloudOrgProvidersGeneration;
+    const importRefreshContextKey = getCloudProviderSyncContextKey();
+    const importRefreshWorkspaceKey = cloudImportWorkspaceKey();
     void refreshImportedCloudProviders().then((imported) => {
+      if (
+        disposed || importRefreshGeneration !== cloudOrgProvidersGeneration ||
+        importRefreshContextKey !== getCloudProviderSyncContextKey() || importRefreshWorkspaceKey !== cloudImportWorkspaceKey()
+      ) return;
+      if (serverHandlesProviderSync()) {
+        if (!readDenSettings().authToken?.trim()) {
+          void options.openworkServer.getSnapshot().openworkServerClient?.deleteDenSession().catch(() => undefined);
+        }
+        return;
+      }
       // Startup cleanup: if no auth token, remove any cloud providers that
       // were left behind. Handles orphans from a previous sign-out that
       // didn't clean up (e.g. crash, force-quit, external edit).
@@ -2488,6 +2922,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
   const dispose = () => {
     if (disposed) return;
     disposed = true;
+    invalidateDenSessionDelivery();
     started = false;
     denSessionCleanup?.();
     denSessionCleanup = null;
@@ -2503,8 +2938,10 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     dispose,
     syncFromOptions,
     refreshCloudOrgProviders,
-    refreshImportedCloudProviders,
+    refreshImportedCloudProviders: (input?: { strict?: boolean }) => refreshImportedCloudProviders({ strict: input?.strict }),
     runCloudProviderSync,
+    startGatewayProviderOAuth,
+    isGatewayModelAvailable,
     startProviderAuth,
     refreshProviders,
     completeProviderAuthOAuth,
@@ -2512,6 +2949,7 @@ export function createProviderAuthStore(options: CreateProviderAuthStoreOptions)
     connectCloudProvider,
     removeCloudProvider,
     disconnectProvider,
+    enableProvider,
     ensureProjectProviderDisabledState,
     isProviderAddRestricted,
     openProviderAuthModal,

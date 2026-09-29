@@ -55,16 +55,18 @@ flag.
 
 ## Public origins
 
-Set `BETTER_AUTH_URL` to the externally reachable Den web origin, for example
-`https://openwork.example.com`. Set `DEN_API_PUBLIC_URL` to the externally
-reachable Den API base; in a single-origin setup, use the Den web proxy path,
-such as `https://openwork.example.com/api/den`, so desktops reach only the Den
-web origin. If you publish a separate Den API origin, the install-link exchange
-and external MCP clients must be able to reach it.
+Set `DEN_BASE_URL` to the externally reachable Den web origin, for example
+`https://openwork.example.com`. Den derives Better Auth, CORS/trusted origins,
+web-app hosts, API defaults, and MCP resource defaults from that one value. Set
+`DEN_API_PUBLIC_URL` only as a compatibility override when you publish a separate
+Den API origin or an externally reachable proxy path, such as
+`https://openwork.example.com/api/den`. If you publish a separate Den API origin,
+the install-link exchange and external MCP clients must be able to reach it.
 
-Invitation acceptance links use the first non-wildcard entry of
-`DEN_BETTER_AUTH_TRUSTED_ORIGINS`, falling back to `BETTER_AUTH_URL`. In a
-single-origin setup, use the Den web origin for both.
+Invitation acceptance links use the first non-wildcard trusted origin. In the
+single-origin setup this is derived from `DEN_BASE_URL`; set
+`DEN_BETTER_AUTH_TRUSTED_ORIGINS` only when you need extra web origins during a
+migration.
 
 ## Installer delivery
 
@@ -82,13 +84,15 @@ one of these paths:
 | Semi-air-gapped | Stream the matching standard installer from `OPENWORK_INSTALLER_ARTIFACTS_DIR`. There is no ZIP or in-memory whole-file buffer. | Den web/API only. |
 | Fully internal installer delivery | Same mounted-artifact path, with Den web/API and the installer artifact available entirely inside the isolated network. This describes installer bytes only, not full product isolation. | Internal Den web/API only. |
 
-The standard filenames use the release tag without a leading `v`:
+The filenames use the release tag without a leading `v` and a distribution prefix: `openwork-enterprise-` on a single-org (self-hosted) Den, `openwork-cloud-` on the multi-org hosted Den. The public `openwork-<platform>-<version>` names are never served by install links.
 
-- `openwork-mac-arm64-<version>.dmg`
-- `openwork-mac-x64-<version>.dmg`
-- `openwork-win-x64-<version>.exe`
-- `openwork-linux-x86_64-<version>.AppImage`
-- `openwork-linux-arm64-<version>.AppImage`
+- `openwork-enterprise-mac-arm64-<version>.dmg`
+- `openwork-enterprise-mac-x64-<version>.dmg`
+- `openwork-enterprise-win-x64-<version>.exe`
+- `openwork-enterprise-linux-x86_64-<version>.AppImage`
+- `openwork-enterprise-linux-arm64-<version>.AppImage`
+
+The version is `max(allowedDesktopVersions)` when the organization policy is set, else `OPENWORK_INSTALLER_RELEASE_TAG` when set, else the Den's own release version on a single-org Den (latest published stable release on the multi-org hosted Den).
 
 There is no first-request GitHub download inside Den, artifact lookup API call,
 ZIP creation, per-pod cold cache, or different repeated-download path. Every
@@ -151,8 +155,14 @@ the same standard installer through the same direct or mounted route.
 
 ## MDM alternative
 
-Managed deployments can skip the deep-link handoff by deploying the public
-installer and writing `desktop-bootstrap.json` directly:
+Customer-facing guidance for this path is published at
+[`packages/docs/start-here/enterprise-desktop-deployment.mdx`](../packages/docs/start-here/enterprise-desktop-deployment.mdx).
+
+Managed deployments can skip the deep-link handoff by deploying a standard
+binary — typically the enterprise distribution
+(`openwork-enterprise-<os>-<arch>-<version>.<ext>`, published on the
+`enterprise` release channel), or the public installer — and writing
+`desktop-bootstrap.json` directly:
 
 | OS | Canonical path |
 |---|---|

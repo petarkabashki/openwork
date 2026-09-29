@@ -15,8 +15,8 @@
  * than two long-lived ones: a config change arriving mid-drain coalesces into
  * a single pending rollover (latest wins) instead of stacking processes.
  *
- * Off unless ServerConfig.engineRollover is set; the caller keeps its existing
- * defer-while-busy behavior when disabled.
+ * Always on for managed engines. Attached engines have no pool, so their
+ * callers keep the defer-while-busy behavior instead.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -47,6 +47,14 @@ export type EngineSpawnTemplate = {
   spawnTimeoutMs?: number;
 };
 
+export type EnginePoolStandby = {
+  workspace: WorkspaceInfo;
+  generationId: string;
+  baseUrl: string;
+  username: string;
+  password: string;
+};
+
 export type EnginePoolHooks = {
   /** Today's in-place dispose. Used when the engine is idle. */
   reloadInPlace: (
@@ -58,24 +66,59 @@ export type EnginePoolHooks = {
   engineBusy: (config: ServerConfig, workspace: WorkspaceInfo) => Promise<boolean>;
   /** Re-register runtime MCPs and reconcile cloud MCP against a fresh engine. */
   postRefreshSync: (config: ServerConfig, workspace: WorkspaceInfo) => Promise<void>;
-  /** Rebuild the engine-visible runtime config file. */
-  writeRuntimeConfigFile: (config: ServerConfig, workspaceId: string) => Promise<{ path: string }>;
+  /**
+   * Prepare a healthy standby before it becomes primary (managed provider
+   * credentials). A spawned engine receives no provider keys in its
+   * environment; without this the first sync after the flip re-delivers them,
+   * reports a credential change, and forces yet another standby.
+   */
+  prepareStandby?: (config: ServerConfig, standby: EnginePoolStandby) => Promise<void>;
+  /** Rebuild the engine-visible runtime config file (workspace-independent). */
+  writeRuntimeConfigFile: (config: ServerConfig) => Promise<{ path: string }>;
   registerTrusted: (config: ServerConfig, generation: { baseUrl: string; identity: string; isAlive: () => boolean }) => void;
   clearTrusted: (config: ServerConfig, identity: string) => void;
   spawn?: (template: EngineSpawnTemplate) => Promise<ManagedOpencodeServer>;
   now?: () => number;
   schedule?: (operation: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
   waitForHealthy?: (handle: ManagedOpencodeServer) => Promise<void>;
+  /** Called once when the pool shuts down, before its engines are retired. */
+  onDisposed?: () => void;
   logger?: EnginePoolLogger;
 };
 
 export type RolloverReason = string;
 
+/**
+ * What a refresh request did. `updated_live`, `reloaded_in_place` and `rolled_over`
+ * mean the engine now serves the requested config; `skipped` and `coalesced`
+ * leave the caller's change owed, so a caller tracking a pending reload must
+ * keep it pending until one of the applied outcomes arrives.
+ */
 export type RolloverOutcome =
-  | { action: "skipped"; reason: "unchanged" }
+  | { action: "updated_live" }
+  | { action: "skipped"; reason: "unchanged" | "disposed" }
   | { action: "reloaded_in_place" }
   | { action: "coalesced" }
   | { action: "rolled_over"; generationId: string; drainingSessions: number };
+
+export type AppliedRolloverOutcome = Extract<RolloverOutcome, { action: "updated_live" | "reloaded_in_place" | "rolled_over" }>;
+
+export function rolloverOutcomeApplied(outcome: RolloverOutcome): outcome is AppliedRolloverOutcome {
+  return outcome.action === "updated_live" || outcome.action === "reloaded_in_place" || outcome.action === "rolled_over";
+}
+
+type RolloverRequest = {
+  reason: RolloverReason;
+  workspace: WorkspaceInfo;
+  manual: boolean;
+  awaitPostRefreshSync: boolean;
+  forceStandby: boolean;
+};
+
+type RolloverWaiter = {
+  resolve: (outcome: RolloverOutcome) => void;
+  reject: (error: unknown) => void;
+};
 
 type GenerationStatus = "starting" | "primary" | "draining" | "dead";
 
@@ -84,11 +127,19 @@ type Generation = {
   handle: ManagedOpencodeServer;
   status: GenerationStatus;
   spawnedAt: number;
+  /** Config fingerprint this process was spawned with. */
   fingerprint: string;
+  /**
+   * Config fingerprint each directory's instance was last rebuilt against by
+   * an in-place reload. An in-place reload disposes ONE directory instance;
+   * the other directories keep serving what they read at build time.
+   */
+  reloadedDirectories: Map<string, string>;
   registryId: string | null;
   trustedIdentity: string | null;
   drainTimer: ReturnType<typeof setInterval> | null;
   drainDeadline: number | null;
+  drainActivityWatch: AbortController | null;
 };
 
 export type EnginePoolSnapshot = {
@@ -137,9 +188,18 @@ function nonNegativeIntFromEnv(name: string, fallback: number): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
 }
 
-/** How long a draining engine may keep running before its sessions are aborted. */
+/**
+ * How long a draining engine may go without any owned-session activity before
+ * its sessions are aborted. Activity on the engine event stream pushes the
+ * deadline out, so this bounds inactivity, not total drain time.
+ */
 function drainTimeoutMs(): number {
   return positiveIntFromEnv("OPENWORK_ENGINE_DRAIN_TIMEOUT_MS", 15 * 60_000);
+}
+
+/** Delay before the drain activity watch reconnects to a lost engine event stream. */
+function drainActivityReconnectMs(): number {
+  return positiveIntFromEnv("OPENWORK_ENGINE_DRAIN_ACTIVITY_RECONNECT_MS", 1_000);
 }
 
 /** Floor between automatic spawns, so a burst of triggers cannot thrash. 0 disables it. */
@@ -154,6 +214,15 @@ function drainPollIntervalMs(): number {
 /** Grace given to aborted sessions to unwind before the engine is closed. */
 function abortSettleMs(): number {
   return nonNegativeIntFromEnv("OPENWORK_ENGINE_ABORT_SETTLE_MS", 5_000);
+}
+
+/**
+ * Budget for seeding a healthy standby (managed provider credentials) before
+ * it may become primary. A seed that hangs past this is a failed rollover,
+ * never a silent flip onto an engine without keys.
+ */
+function standbyPrepareTimeoutMs(): number {
+  return positiveIntFromEnv("OPENWORK_ENGINE_STANDBY_PREPARE_TIMEOUT_MS", 30_000);
 }
 
 function portOf(url: string): number {
@@ -280,6 +349,55 @@ function eventIdentifiers(payload: unknown): { sessionIds: Set<string>; requestI
 }
 
 /**
+ * Cap on the text one unterminated SSE frame may buffer before the stream is
+ * treated as malformed. Sized well above any legitimate single engine event
+ * (large tool outputs included) so real frames are never truncated; only a
+ * stream that stops terminating frames hits it.
+ */
+export const ENGINE_SSE_FRAME_MAX_CHARS = 4 * 1024 * 1024;
+
+/**
+ * Incremental SSE frame splitter shared by the client event fan-in and the
+ * drain activity watch. It bounds the memory a single unterminated frame can
+ * hold: completed frames are always returned, and `overflow` turns true once
+ * the pending remainder exceeds the cap so the caller can drop that
+ * connection instead of buffering it forever.
+ */
+export class BoundedSseFrameBuffer {
+  private readonly decoder = new TextDecoder();
+  private buffered = "";
+
+  constructor(private readonly maxFrameChars = ENGINE_SSE_FRAME_MAX_CHARS) {}
+
+  push(chunk: Uint8Array): { frames: string[]; overflow: boolean } {
+    this.buffered += this.decoder.decode(chunk, { stream: true });
+    const frames: string[] = [];
+    while (true) {
+      const delimiter = this.buffered.match(/\r?\n\r?\n/);
+      if (!delimiter || delimiter.index === undefined) break;
+      frames.push(this.buffered.slice(0, delimiter.index));
+      this.buffered = this.buffered.slice(delimiter.index + delimiter[0].length);
+    }
+    return { frames, overflow: this.buffered.length > this.maxFrameChars };
+  }
+}
+
+/** Decode one SSE frame's `data:` payload; null when the frame carries none. */
+function sseFramePayload(frame: string): unknown {
+  const data = frame
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trim())
+    .join("\n");
+  if (!data) return null;
+  try {
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Everything a spawned engine reads at build time. Comparing this is what
  * lets a repeated no-op reload skip spawning a replacement.
  */
@@ -294,19 +412,20 @@ export async function computeEngineConfigFingerprint(template: EngineSpawnTempla
     .digest("hex");
 }
 
+/** The engine directory an in-place reload disposes for this workspace. */
+function directoryKey(workspace: WorkspaceInfo): string {
+  return workspace.directory?.trim() || workspace.path;
+}
+
 export class EnginePool {
   private readonly config: ServerConfig;
   private readonly template: EngineSpawnTemplate;
   private readonly hooks: EnginePoolHooks;
   private generations: Generation[] = [];
   private inFlight: Promise<RolloverOutcome> | null = null;
-  private pendingRollover: {
-    reason: RolloverReason;
-    workspace: WorkspaceInfo;
-    manual: boolean;
-    awaitPostRefreshSync: boolean;
-    forceStandby: boolean;
-  } | null = null;
+  private pendingRollover: RolloverRequest | null = null;
+  /** Callers coalesced into `pendingRollover`; settled when that rollover runs. */
+  private pendingWaiters: RolloverWaiter[] = [];
   private lastSpawnAt = 0;
   private consecutiveConnectionFailures = 0;
   private lastRecoveryAt = Number.NEGATIVE_INFINITY;
@@ -327,6 +446,11 @@ export class EnginePool {
     this.hooks = input.hooks;
   }
 
+  /** Directory every generation of this engine starts in. */
+  cwd(): string {
+    return this.template.cwd;
+  }
+
   /**
    * Register the engine spawned during startup as the first generation, so a
    * later rollover knows what it is replacing.
@@ -343,10 +467,12 @@ export class EnginePool {
       status: "primary",
       spawnedAt: Date.now(),
       fingerprint: input.fingerprint,
+      reloadedDirectories: new Map(),
       registryId: input.registryId,
       trustedIdentity: input.trustedIdentity,
       drainTimer: null,
       drainDeadline: null,
+      drainActivityWatch: null,
     });
     this.lastSpawnAt = Date.now();
   }
@@ -405,7 +531,15 @@ export class EnginePool {
     const requestId = requestIdFromPath(proxyPath);
     if (requestId) {
       const owner = this.generationForId(this.pinnedRequests.get(requestId));
-      if (owner) return { target: this.connectionFor(owner), fallback: null };
+      if (owner) {
+        const alternate = isLegacyPromptReply(proxyPath)
+          ? this.generations.find((entry) => isRoutableGeneration(entry) && entry.id !== owner.id) ?? null
+          : null;
+        return {
+          target: this.connectionFor(owner),
+          fallback: alternate && isRoutableGeneration(alternate) ? this.connectionFor(alternate) : null,
+        };
+      }
     }
 
     const draining = this.generations.find(
@@ -413,6 +547,11 @@ export class EnginePool {
     ) ?? null;
     const fallback = draining && isLegacyPromptReply(proxyPath) ? this.connectionFor(draining) : null;
     return { target: primaryConnection, fallback };
+  }
+
+  /** Live proxied event streams, i.e. clients currently listening to this engine. */
+  eventProxyCount(): number {
+    return this.eventProxyControllers.size;
   }
 
   openEventProxy(clientSignal?: AbortSignal): EngineEventProxyLease {
@@ -430,6 +569,21 @@ export class EnginePool {
         this.eventProxyControllers.delete(controller);
       },
     };
+  }
+
+  /**
+   * How the event fan-in should treat frames from a generation. With one
+   * primary generation and no ownership pinned elsewhere, every frame is
+   * forwarded verbatim and never parsed; `filter` requires the payload-level
+   * check in `shouldForwardEvent`, which is what a rollover needs.
+   */
+  eventForwardMode(generationId: string): "forward" | "filter" | "drop" {
+    const generation = this.generationForId(generationId);
+    if (!generation) return "drop";
+    if (generation.status !== "primary" || this.generations.filter(isRoutableGeneration).length !== 1) return "filter";
+    for (const owner of this.sessionOwnership.values()) if (owner !== generation.id) return "filter";
+    for (const owner of this.pinnedRequests.values()) if (owner !== generation.id) return "filter";
+    return "forward";
   }
 
   shouldForwardEvent(generationId: string, payload: unknown): boolean {
@@ -452,6 +606,23 @@ export class EnginePool {
     });
   }
 
+  observePendingRequests(generationId: string, payload: unknown): string[] {
+    const generation = this.generationForId(generationId);
+    if (!generation) return [];
+    const requestIds: string[] = [];
+    for (const record of requestRecords(payload)) {
+      const sessionId = firstString(record, ["sessionID", "sessionId", "session_id"]);
+      const owner = this.generationForId(sessionId ? this.sessionOwnership.get(sessionId) : undefined) ?? generation;
+      const requestId = firstString(record, ["id", "requestID", "requestId", "permissionID", "questionID"]);
+      if (requestId) {
+        this.pinnedRequests.set(requestId, owner.id);
+        requestIds.push(requestId);
+      }
+      if (sessionId && !this.sessionOwnership.has(sessionId)) this.sessionOwnership.set(sessionId, generation.id);
+    }
+    return requestIds;
+  }
+
   snapshot(): EnginePoolSnapshot {
     const now = Date.now();
     return {
@@ -467,6 +638,11 @@ export class EnginePool {
     };
   }
 
+  /** Provider sync treats an active drain as busy so it defers instead of parking on waitForDrain(). */
+  hasDrainingGeneration(): boolean {
+    return this.generations.some((entry) => entry.status === "draining");
+  }
+
   /**
    * Bring the engine onto current config. Idle engines reload in place; busy
    * ones roll over to a standby. Serialized: concurrent requests collapse into
@@ -480,8 +656,8 @@ export class EnginePool {
     /** Apply a config change through a healthy standby even when the primary is idle. */
     forceStandby?: boolean;
   }): Promise<RolloverOutcome> {
-    if (this.disposed) return { action: "skipped", reason: "unchanged" };
-    const request = {
+    if (this.disposed) return { action: "skipped", reason: "disposed" };
+    const request: RolloverRequest = {
       reason: input.reason,
       workspace: input.workspace,
       manual: input.manual === true,
@@ -500,48 +676,74 @@ export class EnginePool {
       this.hooks.logger?.log("info", "Engine rollover coalesced into the in-flight request.", {
         "engine.rollover.reason": request.reason,
       });
-      return { action: "coalesced" };
+      // The in-flight spawn may have read config and credentials from before
+      // this request. Settle only when the queued rollover itself lands, so a
+      // caller never records a change as applied that the engine has not read.
+      return new Promise<RolloverOutcome>((resolve, reject) => {
+        this.pendingWaiters.push({ resolve, reject });
+      });
     }
+    const waiters = this.pendingWaiters;
+    this.pendingWaiters = [];
     const run = this.runRollover(request);
     this.inFlight = run;
     try {
-      return await run;
+      const outcome = await run;
+      for (const waiter of waiters) waiter.resolve(outcome);
+      return outcome;
+    } catch (error) {
+      for (const waiter of waiters) waiter.reject(error);
+      throw error;
     } finally {
       this.inFlight = null;
       const next = this.pendingRollover;
       this.pendingRollover = null;
       if (next && !this.disposed) {
         void this.requestRollover(next).catch(() => undefined);
+      } else if (this.disposed) {
+        this.settleWaitersOnDispose();
       }
     }
   }
 
-  private async runRollover(request: {
-    reason: RolloverReason;
-    workspace: WorkspaceInfo;
-    manual: boolean;
-    awaitPostRefreshSync: boolean;
-    forceStandby: boolean;
-  }): Promise<RolloverOutcome> {
+  private settleWaitersOnDispose(): void {
+    const waiters = this.pendingWaiters;
+    this.pendingWaiters = [];
+    for (const waiter of waiters) waiter.resolve({ action: "skipped", reason: "disposed" });
+  }
+
+  private async runRollover(request: RolloverRequest): Promise<RolloverOutcome> {
     const { workspace, reason, manual, awaitPostRefreshSync, forceStandby } = request;
     // The standby reads config from disk at spawn, so make sure the file is
     // current before deciding anything.
-    await this.hooks.writeRuntimeConfigFile(this.config, workspace.id).catch(() => undefined);
+    await this.hooks.writeRuntimeConfigFile(this.config).catch(() => undefined);
     const fingerprint = await this.currentFingerprint();
     const primary = this.generations.find((entry) => entry.status === "primary") ?? null;
 
-    if (!manual && primary && primary.fingerprint === fingerprint) {
-      // Nothing the engine reads at build time changed. Skipping here is what
-      // keeps a repeating no-op sync from spawning an engine every pass.
+    // Nothing this workspace's instance reads at build time changed: either
+    // the process was spawned on this config or this directory was already
+    // reloaded onto it. Skipping here is what keeps a repeating no-op sync
+    // from spawning an engine every pass. Other directories reloaded in place
+    // do not count: their dispose left this one serving the previous config.
+    // A forced request is exempt: its caller knows an input the fingerprint
+    // cannot see changed (a rotated credential, a persisted policy), and
+    // skipping it left the engine serving with the old key.
+    const directory = directoryKey(workspace);
+    if (
+      !manual
+      && !forceStandby
+      && primary
+      && (primary.fingerprint === fingerprint || primary.reloadedDirectories.get(directory) === fingerprint)
+    ) {
       return { action: "skipped", reason: "unchanged" };
     }
 
     const busy = forceStandby
       ? true
-      : await this.hooks.engineBusy(this.config, workspace).catch(() => false);
+      : await this.hooks.engineBusy(this.config, workspace).catch(() => true);
     if (!busy) {
       await this.hooks.reloadInPlace(this.config, workspace, { awaitPostRefreshSync });
-      if (primary) primary.fingerprint = fingerprint;
+      if (primary) primary.reloadedDirectories.set(directory, fingerprint);
       this.hooks.logger?.log("info", "Engine reloaded in place (idle).", {
         "engine.rollover.reason": reason,
       });
@@ -555,7 +757,7 @@ export class EnginePool {
           "engine.rollover.reason": reason,
         });
         await this.waitForDrain();
-        if (this.disposed) return { action: "skipped", reason: "unchanged" };
+        if (this.disposed) return { action: "skipped", reason: "disposed" };
         return this.runRollover(request);
       }
       // Cap: one primary plus one draining. Park this change; it lands when
@@ -607,10 +809,12 @@ export class EnginePool {
       status: "starting",
       spawnedAt: Date.now(),
       fingerprint,
+      reloadedDirectories: new Map(),
       registryId: null,
       trustedIdentity: null,
       drainTimer: null,
       drainDeadline: null,
+      drainActivityWatch: null,
     };
     this.generations.push(generation);
 
@@ -626,6 +830,24 @@ export class EnginePool {
         "engine.rollover.failure": error instanceof Error ? error.message : String(error),
       });
       throw error;
+    }
+
+    if (this.hooks.prepareStandby) {
+      try {
+        await this.prepareStandbyBounded(generation, workspace);
+      } catch (error) {
+        // A standby without its credentials would answer every run with
+        // "API key is missing" while status called the reload landed. Keep
+        // the primary serving, close the standby, and let the caller's retry
+        // path bring the change back once seeding works.
+        this.generations = this.generations.filter((entry) => entry.id !== generation.id);
+        await handle.close().catch(() => undefined);
+        this.hooks.logger?.log("error", "Engine standby preparation failed; the live engine is untouched.", {
+          "engine.rollover.reason": reason,
+          "engine.rollover.failure": error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
     }
 
     if (handle.pid) {
@@ -644,8 +866,14 @@ export class EnginePool {
       }).catch(() => undefined);
     }
 
-    const drainingSessions = await this.nonIdleSessionIds(primary);
+    const activity = await this.nonIdleSessionIds(primary);
     const pinnedRequestIds = await this.pendingRequestIds(primary);
+    const drainingSessions = activity.sessionIds;
+    if (primary && !activity.complete) {
+      for (const [sessionId, owner] of this.sessionOwnership) {
+        if (owner === primary.id && !drainingSessions.includes(sessionId)) drainingSessions.push(sessionId);
+      }
+    }
     this.flip(generation, primary, drainingSessions, pinnedRequestIds);
 
     this.hooks.logger?.log("info", "Engine rollover flipped to the new generation.", {
@@ -661,6 +889,34 @@ export class EnginePool {
     if (primary) this.startDrainMonitor(primary, workspace);
 
     return { action: "rolled_over", generationId: generation.id, drainingSessions: drainingSessions.length };
+  }
+
+  /** Seed the standby within a bounded budget; a hung seed is a failed rollover. */
+  private async prepareStandbyBounded(generation: Generation, workspace: WorkspaceInfo): Promise<void> {
+    const prepare = this.hooks.prepareStandby;
+    if (!prepare) return;
+    const standby: EnginePoolStandby = {
+      workspace,
+      generationId: generation.id,
+      baseUrl: generation.handle.url,
+      username: generation.handle.username,
+      password: generation.handle.password,
+    };
+    const budgetMs = standbyPrepareTimeoutMs();
+    let expire: (error: Error) => void = () => undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      expire = reject;
+    });
+    const timer = setTimeout(
+      () => expire(new Error(`Engine standby preparation did not complete within ${budgetMs}ms`)),
+      budgetMs,
+    );
+    timer.unref?.();
+    try {
+      await Promise.race([prepare(this.config, standby), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -721,29 +977,46 @@ export class EnginePool {
   }
 
   /**
-   * Watch a draining engine and close it once its runs finish. Past the grace
-   * window the remaining sessions are aborted rather than kept alive forever.
+   * Watch a draining engine and close it once its runs finish. The grace
+   * window bounds inactivity, not total drain time: engine events for an
+   * owned session push the deadline out, so a run that is actively making
+   * progress is never aborted mid-flight, while a non-idle session that stops
+   * reporting anything for the whole window is aborted rather than kept alive
+   * forever.
    */
   private startDrainMonitor(generation: Generation, workspace: WorkspaceInfo): void {
     generation.drainDeadline = Date.now() + drainTimeoutMs();
+    this.watchDrainActivity(generation);
+    let ticking = false;
     const tick = async (): Promise<void> => {
-      if (generation.status !== "draining") return;
-      const remaining = await this.nonIdleSessionIds(generation);
-      this.updateActiveSessions(generation, remaining);
-      if (remaining.length === 0) {
-        await this.retire(generation, "idle");
-        return;
-      }
-      if (generation.drainDeadline !== null && Date.now() >= generation.drainDeadline) {
-        this.hooks.logger?.log("warn", "Engine drain exceeded its grace period; aborting the remaining sessions.", {
-          "engine.drain.sessions": remaining.join(","),
-          "engine.drain.session_count": remaining.length,
-        });
-        for (const sessionId of remaining) {
-          await this.abortSession(generation, sessionId).catch(() => undefined);
+      if (ticking || generation.status !== "draining") return;
+      ticking = true;
+      try {
+        const activity = await this.nonIdleSessionIds(generation);
+        if (generation.status !== "draining") return;
+        const remaining = activity.complete
+          ? activity.sessionIds
+          : [...new Set([...(this.activeSessionsByGeneration.get(generation.id) ?? []), ...activity.sessionIds])];
+        this.updateActiveSessions(generation, remaining);
+        if (activity.complete && remaining.length === 0) {
+          await this.retire(generation, "idle");
+          return;
         }
-        await new Promise((resolve) => setTimeout(resolve, abortSettleMs()));
-        await this.retire(generation, "forced");
+        if (generation.drainDeadline !== null && Date.now() >= generation.drainDeadline) {
+          this.hooks.logger?.log("warn", "Engine drain saw no session activity for the grace period; aborting the remaining sessions.", {
+            "engine.drain.sessions": remaining.join(","),
+            "engine.drain.session_count": remaining.length,
+            "engine.drain.activity_complete": activity.complete,
+          });
+          for (const sessionId of remaining) {
+            if (generation.status !== "draining") return;
+            await this.abortSession(generation, sessionId).catch(() => undefined);
+          }
+          await new Promise((resolve) => setTimeout(resolve, abortSettleMs()));
+          await this.retire(generation, "forced");
+        }
+      } finally {
+        ticking = false;
       }
     };
     const timer = setInterval(() => void tick().catch(() => undefined), drainPollIntervalMs());
@@ -753,6 +1026,84 @@ export class EnginePool {
     void tick().catch(() => undefined);
   }
 
+  /**
+   * Hold one global event-stream subscription on the draining engine so
+   * owned-session activity keeps extending the drain deadline. The client
+   * event fan-in only exists while a client is attached; the pool owns this
+   * watch so a background run with no observer still counts as active.
+   */
+  private watchDrainActivity(generation: Generation): void {
+    const controller = new AbortController();
+    generation.drainActivityWatch = controller;
+    void this.runDrainActivityWatch(generation, controller.signal).catch(() => undefined);
+  }
+
+  private async runDrainActivityWatch(
+    generation: Generation,
+    signal: AbortSignal,
+  ): Promise<void> {
+    while (!signal.aborted && generation.status === "draining") {
+      try {
+        const url = new URL("/global/event", generation.handle.url);
+        const response = await loopbackFetch(url.toString(), {
+          headers: { Authorization: buildEngineAuthProbeHeader(generation.handle.username, generation.handle.password) },
+          signal,
+        });
+        if (response.ok && response.body) {
+          await this.consumeDrainActivityEvents(generation, response.body, signal);
+        }
+      } catch {}
+      if (signal.aborted || generation.status !== "draining") return;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, drainActivityReconnectMs());
+        timer.unref?.();
+      });
+    }
+  }
+
+  private async consumeDrainActivityEvents(
+    generation: Generation,
+    body: ReadableStream<Uint8Array>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const reader = body.getReader();
+    const frameBuffer = new BoundedSseFrameBuffer();
+    try {
+      while (!signal.aborted && generation.status === "draining") {
+        const chunk = await reader.read();
+        if (chunk.done) return;
+        const parsed = frameBuffer.push(chunk.value);
+        for (const frame of parsed.frames) {
+          this.noteDrainActivity(generation, sseFramePayload(frame));
+        }
+        // A frame that never terminates would buffer without bound; drop the
+        // stream and let the watch loop reconnect.
+        if (parsed.overflow) return;
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
+  }
+
+  /** An engine event naming an owned session is proof of progress: push the deadline out. */
+  private noteDrainActivity(generation: Generation, payload: unknown): void {
+    if (payload === null || generation.status !== "draining" || generation.drainDeadline === null) return;
+    const owned = this.activeSessionsByGeneration.get(generation.id);
+    if (!owned || owned.size === 0) return;
+    const { sessionIds } = eventIdentifiers(payload);
+    let hasOwnedSession = false;
+    for (const sessionId of sessionIds) {
+      if (owned.has(sessionId)) {
+        hasOwnedSession = true;
+        break;
+      }
+    }
+    if (!hasOwnedSession) return;
+    const extended = Date.now() + drainTimeoutMs();
+    if (extended > generation.drainDeadline) generation.drainDeadline = extended;
+  }
+
   private async retire(generation: Generation, cause: "idle" | "forced" | "shutdown"): Promise<void> {
     if (generation.status === "dead") return;
     generation.status = "dead";
@@ -760,6 +1111,8 @@ export class EnginePool {
       clearInterval(generation.drainTimer);
       generation.drainTimer = null;
     }
+    generation.drainActivityWatch?.abort();
+    generation.drainActivityWatch = null;
     generation.drainDeadline = null;
     this.activeSessionsByGeneration.delete(generation.id);
     for (const [sessionId, generationId] of this.sessionOwnership) {
@@ -802,7 +1155,9 @@ export class EnginePool {
   /** Close every engine this pool owns. Draining generations go first. */
   async disposeAll(): Promise<void> {
     this.disposed = true;
+    this.hooks.onDisposed?.();
     this.pendingRollover = null;
+    this.settleWaitersOnDispose();
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.recoveryTimer = null;
     this.abortEventProxies();
@@ -888,10 +1243,12 @@ export class EnginePool {
         status: "starting",
         spawnedAt: this.now(),
         fingerprint: await this.currentFingerprint(),
+        reloadedDirectories: new Map(),
         registryId: null,
         trustedIdentity: null,
         drainTimer: null,
         drainDeadline: null,
+        drainActivityWatch: null,
       };
       this.generations.push(generation);
       if (handle.pid) {
@@ -1002,48 +1359,74 @@ export class EnginePool {
     throw new Error("Standby OpenCode engine did not report healthy");
   }
 
-  private async nonIdleSessionIds(generation: Generation | null): Promise<string[]> {
-    if (!generation || generation.status === "dead" || !generation.handle.isAlive()) return [];
-    try {
-      const response = await loopbackFetch(new URL("/session/status", generation.handle.url).toString(), {
-        headers: { Authorization: buildEngineAuthProbeHeader(generation.handle.username, generation.handle.password) },
-        signal: AbortSignal.timeout(5_000),
+  private async nonIdleSessionIds(generation: Generation | null): Promise<{ sessionIds: string[]; complete: boolean }> {
+    if (!generation || generation.status === "dead" || !generation.handle.isAlive()) return { sessionIds: [], complete: true };
+    const sessionIds = new Set<string>();
+    let complete = true;
+    await Promise.all(this.engineProbeDirectories().map(async (directory) => {
+      try {
+        const url = new URL("/session/status", generation.handle.url);
+        if (directory !== null) url.searchParams.set("directory", directory);
+        const response = await loopbackFetch(url.toString(), {
+          headers: { Authorization: buildEngineAuthProbeHeader(generation.handle.username, generation.handle.password) },
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (!response.ok) throw new Error(`Session status probe returned HTTP ${response.status}`);
+        const payload: unknown = await response.json();
+        if (!isRecord(payload)) throw new Error("Session status probe returned a malformed payload");
+        for (const [sessionId, status] of Object.entries(payload)) {
+          if (!isRecord(status) || (status.type !== "idle" && status.type !== "busy" && status.type !== "retry")) {
+            complete = false;
+          } else if (status.type !== "idle") {
+            sessionIds.add(sessionId);
+          }
+        }
+      } catch {
+        complete = false;
+      }
+    }));
+    if (!generation.handle.isAlive()) return { sessionIds: [], complete: true };
+    if (!complete) {
+      this.hooks.logger?.log("warn", "Engine session activity probe incomplete; preserving known active sessions until confirmed idle or the inactivity deadline.", {
+        "engine.generation_id": generation.id,
+        "engine.drain.activity_complete": false,
       });
-      if (!response.ok) return [];
-      const payload: unknown = await response.json();
-      if (!isRecord(payload)) return [];
-      return Object.entries(payload)
-        .filter(([, status]) => isRecord(status) && status.type !== "idle")
-        .map(([sessionId]) => sessionId);
-    } catch {
-      // Unknown activity never keeps a drain open forever; the grace timeout
-      // still bounds it, and an unreachable engine has nothing left to drain.
-      return [];
     }
+    return { sessionIds: [...sessionIds], complete };
+  }
+
+  private engineProbeDirectories(): Array<string | null> {
+    const directories = new Set(
+      this.config.workspaces
+        .filter((workspace) => workspace.workspaceType !== "remote")
+        .map((workspace) => workspace.path),
+    );
+    return directories.size > 0 ? [...directories] : [null];
   }
 
   private async pendingRequestIds(generation: Generation | null): Promise<string[]> {
     if (!generation || generation.status === "dead" || !generation.handle.isAlive()) return [];
     const requestIds = new Set<string>();
-    for (const path of ["/permission", "/question", "/api/permission/request", "/api/question/request"]) {
-      try {
-        const response = await loopbackFetch(new URL(path, generation.handle.url).toString(), {
-          headers: { Authorization: buildEngineAuthProbeHeader(generation.handle.username, generation.handle.password) },
-          signal: AbortSignal.timeout(2_000),
-        });
-        if (!response.ok) continue;
-        const payload: unknown = await response.json();
-        for (const record of requestRecords(payload)) {
-          const requestId = firstString(record, ["id", "requestID", "requestId", "permissionID", "questionID"]);
-          if (requestId) requestIds.add(requestId);
-          const sessionId = firstString(record, ["sessionID", "sessionId", "session_id"]);
-          if (sessionId) this.sessionOwnership.set(sessionId, generation.id);
+    await Promise.all(this.engineProbeDirectories().flatMap((directory) =>
+      ["/permission", "/question", "/api/permission/request", "/api/question/request"].map(async (path) => {
+        try {
+          const url = new URL(path, generation.handle.url);
+          if (directory !== null) url.searchParams.set("directory", directory);
+          const response = await loopbackFetch(url.toString(), {
+            headers: { Authorization: buildEngineAuthProbeHeader(generation.handle.username, generation.handle.password) },
+            signal: AbortSignal.timeout(2_000),
+          });
+          if (!response.ok) return;
+          const payload: unknown = await response.json();
+          for (const requestId of this.observePendingRequests(generation.id, payload)) {
+            requestIds.add(requestId);
+          }
+        } catch {
+          // The legacy and v2 surfaces vary by bundled engine version. A missing
+          // list never blocks the rollover; path routing still handles scoped ids.
         }
-      } catch {
-        // The legacy and v2 surfaces vary by bundled engine version. A missing
-        // list never blocks the rollover; path routing still handles scoped ids.
-      }
-    }
+      }),
+    ));
     return [...requestIds];
   }
 
@@ -1082,7 +1465,7 @@ export class EnginePool {
     this.hooks.logger?.log("info", "Aborting OpenCode session from engine pool.", {
       "abort.source": "engine_pool.drain_timeout",
       "abort.initiator": "system",
-      "abort.reason": "draining engine exceeded grace period",
+      "abort.reason": "draining engine saw no session activity for the grace period",
       "session.id": sessionId,
       "engine.generation_id": generation.id,
     });
@@ -1118,11 +1501,6 @@ export function setEnginePoolForConfig(config: ServerConfig, pool: EnginePool): 
 }
 
 export function enginePoolForConfig(config: ServerConfig): EnginePool | null {
-  if (!config.engineRollover) return null;
-  return poolByConfig.get(config) ?? null;
-}
-
-export function managedEnginePoolForConfig(config: ServerConfig): EnginePool | null {
   return poolByConfig.get(config) ?? null;
 }
 

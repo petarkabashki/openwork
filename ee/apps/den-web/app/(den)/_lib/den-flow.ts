@@ -1,5 +1,9 @@
+import { workflowRunPreviewSchema, type WorkflowRunPreview } from "@openwork/types/workflows";
 import { DEN_WORKER_POLL_INTERVAL_MS } from "./CONSTS";
+import { denApiCredentials, denBrowserEndpoint } from "./den-api-origin";
+import { getAuthResumeUrl } from "./auth-resume";
 import { ORG_SCOPE_HEADER, getRequestOrgScope, shouldPinOrgScopePath } from "./org-scope";
+import { getRuntimeConfig } from "./runtime-config";
 
 export type AuthMode = "sign-in" | "sign-up";
 export type SocialAuthProvider = "github" | "google";
@@ -123,8 +127,12 @@ export type WorkerLaunch = {
   workerName: string;
   status: string;
   provider: string | null;
+  /** The instance endpoint expires or is proxied, so only Den's lifecycle route is durable. */
+  expiringEndpoint?: boolean;
   instanceUrl: string | null;
   openworkUrl: string | null;
+  previewOpenworkUrl?: string | null;
+  previewExpiresAt?: string | null;
   workspaceId: string | null;
   clientToken: string | null;
   ownerToken: string | null;
@@ -145,6 +153,8 @@ export type WorkerTokens = {
   ownerToken: string | null;
   hostToken: string | null;
   openworkUrl: string | null;
+  previewOpenworkUrl: string | null;
+  previewExpiresAt: string | null;
   workspaceId: string | null;
 };
 
@@ -158,8 +168,9 @@ export type WorkerListItem = {
   createdAt: string | null;
 };
 
-export type CodemodeRun = {
+export type WorkflowRun = {
   id: string;
+  workflow: WorkflowRunPreview | null;
   source: string;
   status: "succeeded" | "failed";
   errorKind: string | null;
@@ -210,7 +221,7 @@ export type OnboardingIntent = {
 
 type PosthogClient = {
   capture?: (eventName: string, properties?: Record<string, unknown>) => void;
-  identify?: (distinctId?: string, properties?: Record<string, unknown>) => void;
+  identify?: (distinctId: string, properties?: Record<string, unknown>) => void;
   reset?: () => void;
 };
 
@@ -226,6 +237,10 @@ export const AUTH_TOKEN_STORAGE_KEY = "openwork:web:auth-token";
 export const ONBOARDING_INTENT_STORAGE_KEY = "openwork:web:onboarding-intent";
 export const PENDING_AUTH_INTENT_STORAGE_KEY = "openwork:web:pending-auth-intent";
 export const WORKER_STATUS_POLL_MS = DEN_WORKER_POLL_INTERVAL_MS;
+
+export function getWorkerConnectionPollDelay(attempt: number): number {
+  return Math.min(WORKER_STATUS_POLL_MS * 2 ** Math.min(Math.max(0, attempt - 1), 2), 5_000);
+}
 export const DEFAULT_AUTH_NAME = "OpenWork User";
 export const DEFAULT_WORKER_NAME = "My Worker";
 export const WORKSPACE_REAUTH_SECURITY_MESSAGE = "For security, confirm it's you before changing workspace settings.";
@@ -324,6 +339,12 @@ export function getSocialCallbackUrl(authCallbackBaseUrl = ""): string {
     const origin = authCallbackBaseUrl || (typeof window !== "undefined" ? window.location.origin : "");
     if (!origin) {
       return "/";
+    }
+    if (typeof window !== "undefined") {
+      const resumeUrl = getAuthResumeUrl(window.location, origin);
+      if (resumeUrl) {
+        return resumeUrl;
+      }
     }
     const callbackUrl = new URL("/", origin);
     if (typeof window !== "undefined") {
@@ -550,6 +571,23 @@ export function getToken(payload: unknown): string | null {
   return typeof payload.token === "string" ? payload.token : null;
 }
 
+function instanceUsesExpiringEndpoint(instance: Record<string, unknown> | null) {
+  if (!instance) return false;
+  if (typeof instance.endpointKind === "string") return instance.endpointKind !== "stable";
+  // Dens that predate endpointKind only ever hosted expiring Daytona previews.
+  return instance.provider === "daytona";
+}
+
+function workerUsesExpiringEndpoint(worker: Pick<WorkerLaunch, "provider" | "expiringEndpoint"> | null) {
+  if (!worker) return false;
+  return worker.expiringEndpoint ?? worker.provider === "daytona";
+}
+
+function getDurableWorkerInstanceUrl(instance: Record<string, unknown> | null) {
+  if (!instance || instanceUsesExpiringEndpoint(instance)) return null;
+  return typeof instance.url === "string" ? instance.url : null;
+}
+
 export function getWorker(payload: unknown): WorkerLaunch | null {
   if (!isRecord(payload) || !isRecord(payload.worker)) {
     return null;
@@ -568,8 +606,11 @@ export function getWorker(payload: unknown): WorkerLaunch | null {
     workerName: worker.name,
     status: getEffectiveWorkerStatus(worker.status, instance),
     provider: instance && typeof instance.provider === "string" ? instance.provider : null,
-    instanceUrl: instance && typeof instance.url === "string" ? instance.url : null,
-    openworkUrl: instance && typeof instance.url === "string" ? instance.url : null,
+    expiringEndpoint: instanceUsesExpiringEndpoint(instance),
+    instanceUrl: getDurableWorkerInstanceUrl(instance),
+    openworkUrl: getDurableWorkerInstanceUrl(instance),
+    previewOpenworkUrl: null,
+    previewExpiresAt: null,
     workspaceId: null,
     clientToken: tokens && typeof tokens.client === "string" ? tokens.client : null,
     ownerToken: tokens && typeof tokens.owner === "string"
@@ -597,7 +638,7 @@ export function getWorkerSummary(payload: unknown): WorkerSummary | null {
     workerId: worker.id,
     workerName: worker.name,
     status: getEffectiveWorkerStatus(worker.status, instance),
-    instanceUrl: instance && typeof instance.url === "string" ? instance.url : null,
+    instanceUrl: getDurableWorkerInstanceUrl(instance),
     provider: instance && typeof instance.provider === "string" ? instance.provider : null,
     isMine: worker.isMine === true
   };
@@ -610,6 +651,9 @@ export function getWorkerTokens(payload: unknown): WorkerTokens | null {
 
   const tokens = payload.tokens;
   const connect = isRecord(payload.connect) ? payload.connect : null;
+  const directPreview = isRecord(payload.directPreview) && payload.directPreview.version === 1
+    ? payload.directPreview
+    : null;
   const clientToken = typeof tokens.client === "string" ? tokens.client : null;
   const ownerToken = typeof tokens.owner === "string"
     ? tokens.owner
@@ -618,13 +662,74 @@ export function getWorkerTokens(payload: unknown): WorkerTokens | null {
       : null;
   const hostToken = typeof tokens.host === "string" ? tokens.host : null;
   const openworkUrl = connect && typeof connect.openworkUrl === "string" ? connect.openworkUrl : null;
+  const previewOpenworkUrl = directPreview && typeof directPreview.openworkUrl === "string" ? directPreview.openworkUrl : null;
+  const previewExpiresAt = directPreview && typeof directPreview.expiresAt === "string" ? directPreview.expiresAt : null;
   const workspaceId = connect && typeof connect.workspaceId === "string" ? connect.workspaceId : null;
 
   if (!clientToken && !ownerToken && !hostToken) {
     return null;
   }
 
-  return { clientToken, ownerToken, hostToken, openworkUrl, workspaceId };
+  return { clientToken, ownerToken, hostToken, openworkUrl, previewOpenworkUrl, previewExpiresAt, workspaceId };
+}
+
+export function withWorkerConnection(worker: WorkerLaunch, tokens: WorkerTokens): WorkerLaunch {
+  return {
+    ...worker,
+    openworkUrl: tokens.openworkUrl,
+    previewOpenworkUrl: tokens.previewOpenworkUrl,
+    previewExpiresAt: tokens.previewExpiresAt,
+    workspaceId: tokens.workspaceId,
+    clientToken: tokens.clientToken,
+    ownerToken: tokens.ownerToken,
+    hostToken: tokens.hostToken,
+  };
+}
+
+export function getWorkerConnectionTargets(worker: WorkerLaunch | null) {
+  const desktopUrl = worker?.openworkUrl ?? worker?.instanceUrl ?? null;
+  const webUrl = worker?.previewOpenworkUrl
+    ?? (workerUsesExpiringEndpoint(worker) || worker?.instanceUrl === null ? null : desktopUrl);
+  return { desktopUrl, webUrl };
+}
+
+export function getWorkerConnectionTokens(worker: WorkerLaunch | null) {
+  return {
+    desktopToken: worker?.hostToken ?? worker?.ownerToken ?? null,
+    webToken: worker?.clientToken ?? null,
+  };
+}
+
+export function workerConnectionEquals(current: WorkerLaunch, next: WorkerLaunch) {
+  return current.openworkUrl === next.openworkUrl
+    && current.previewOpenworkUrl === next.previewOpenworkUrl
+    && current.previewExpiresAt === next.previewExpiresAt
+    && current.workspaceId === next.workspaceId
+    && current.clientToken === next.clientToken
+    && current.ownerToken === next.ownerToken
+    && current.hostToken === next.hostToken;
+}
+
+const WORKER_PREVIEW_REFRESH_LEAD_MS = 30_000;
+
+export function workerNeedsConnectionResolution(worker: WorkerLaunch, now = Date.now()): boolean {
+  if (worker.status.trim().toLowerCase() === "failed") return false;
+  const hasRequiredTokens = Boolean(worker.clientToken?.trim() && (worker.hostToken?.trim() || worker.ownerToken?.trim()));
+  if (!hasRequiredTokens || !worker.openworkUrl?.trim()) return true;
+
+  const usesExpiringPreview = workerUsesExpiringEndpoint(worker) || worker.instanceUrl === null || Boolean(worker.previewOpenworkUrl);
+  if (!usesExpiringPreview) return false;
+  if (!worker.workspaceId?.trim() || !worker.previewOpenworkUrl?.trim() || !worker.previewExpiresAt) return true;
+
+  const expiresAt = Date.parse(worker.previewExpiresAt);
+  return !Number.isFinite(expiresAt) || expiresAt <= now + WORKER_PREVIEW_REFRESH_LEAD_MS;
+}
+
+export function getWorkerConnectionRefreshDelay(worker: WorkerLaunch, now = Date.now()): number | null {
+  if (worker.status.trim().toLowerCase() === "failed") return null;
+  if (workerNeedsConnectionResolution(worker, now)) return 0;
+  if (!worker.previewExpiresAt) return null;
+  return Math.max(0, Date.parse(worker.previewExpiresAt) - now - WORKER_PREVIEW_REFRESH_LEAD_MS);
 }
 
 export function getWorkerRuntimeSnapshot(payload: unknown): WorkerRuntimeSnapshot | null {
@@ -776,7 +881,7 @@ function parseWorkerListItem(value: unknown): WorkerListItem | null {
     workerId,
     workerName,
     status: getEffectiveWorkerStatus(value.status, instance),
-    instanceUrl: instance && typeof instance.url === "string" ? instance.url : null,
+    instanceUrl: getDurableWorkerInstanceUrl(instance),
     provider: instance && typeof instance.provider === "string" ? instance.provider : null,
     isMine: value.isMine === true,
     createdAt
@@ -799,7 +904,7 @@ export function getWorkersList(payload: unknown): WorkerListItem[] {
   return rows;
 }
 
-function parseCodemodeRun(value: unknown): CodemodeRun | null {
+function parseWorkflowRun(value: unknown): WorkflowRun | null {
   if (
     !isRecord(value)
     || typeof value.id !== "string"
@@ -819,9 +924,11 @@ function parseCodemodeRun(value: unknown): CodemodeRun | null {
         isRecord(call) && typeof call.name === "string" ? [{ name: call.name }] : [],
       )
     : [];
+  const workflow = workflowRunPreviewSchema.safeParse(value.workflow);
 
   return {
     id: value.id,
+    workflow: workflow.success ? workflow.data : null,
     source: value.source,
     status: value.status,
     errorKind: typeof value.errorKind === "string" ? value.errorKind : null,
@@ -836,12 +943,12 @@ function parseCodemodeRun(value: unknown): CodemodeRun | null {
   };
 }
 
-export function getCodemodeRuns(payload: unknown): CodemodeRun[] {
+export function getWorkflowRuns(payload: unknown): WorkflowRun[] {
   if (!isRecord(payload) || !Array.isArray(payload.runs)) {
     return [];
   }
   return payload.runs.flatMap((run) => {
-    const parsed = parseCodemodeRun(run);
+    const parsed = parseWorkflowRun(run);
     return parsed ? [parsed] : [];
   });
 }
@@ -911,6 +1018,8 @@ export function isWorkerLaunch(value: unknown): value is WorkerLaunch {
     (typeof value.provider === "string" || value.provider === null) &&
     (typeof value.instanceUrl === "string" || value.instanceUrl === null) &&
     (typeof value.openworkUrl === "string" || value.openworkUrl === null || typeof value.openworkUrl === "undefined") &&
+    (typeof value.previewOpenworkUrl === "string" || value.previewOpenworkUrl === null || typeof value.previewOpenworkUrl === "undefined") &&
+    (typeof value.previewExpiresAt === "string" || value.previewExpiresAt === null || typeof value.previewExpiresAt === "undefined") &&
     (typeof value.workspaceId === "string" || value.workspaceId === null || typeof value.workspaceId === "undefined") &&
     (typeof value.clientToken === "string" || value.clientToken === null) &&
     (typeof value.ownerToken === "string" || value.ownerToken === null || typeof value.ownerToken === "undefined") &&
@@ -926,6 +1035,8 @@ export function listItemToWorker(item: WorkerListItem, current: WorkerLaunch | n
     provider: item.provider,
     instanceUrl: item.instanceUrl,
     openworkUrl: current?.workerId === item.workerId ? current.openworkUrl ?? item.instanceUrl : item.instanceUrl,
+    previewOpenworkUrl: current?.workerId === item.workerId ? current.previewOpenworkUrl ?? null : null,
+    previewExpiresAt: current?.workerId === item.workerId ? current.previewExpiresAt ?? null : null,
     workspaceId: current?.workerId === item.workerId ? current.workspaceId : null,
     clientToken: current?.workerId === item.workerId ? current.clientToken : null,
     ownerToken: current?.workerId === item.workerId ? current.ownerToken : null,
@@ -1167,13 +1278,22 @@ export async function requestJson(path: string, init: RequestInit = {}, timeoutM
 
   let response: Response;
   try {
-    const endpoint = path.startsWith("/api/") ? path : `/api/den${path}`;
+    if (typeof window !== "undefined") {
+      await getRuntimeConfig();
+    }
+    const endpoint = path.startsWith("/api/auth/") ? path : denBrowserEndpoint(path);
     response = await fetch(endpoint, {
       ...init,
       headers,
-      credentials: "include",
+      credentials: init.credentials ?? denApiCredentials(endpoint, path),
       signal: init.signal ?? timeoutController?.signal
     });
+    if (path === "/v1/me" && response.status === 401 && typeof window !== "undefined") {
+      await fetch("/api/auth/clear-session-cookie", {
+        method: "POST",
+        credentials: "include"
+      }).catch(() => null);
+    }
   } catch (error) {
     // Only the deadline created by this helper becomes a timeout. An abort
     // supplied by a caller becomes a distinct cancellation error.

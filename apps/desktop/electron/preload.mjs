@@ -1,4 +1,5 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webFrame, webUtils } from "electron";
+import { installBrowserShortcutFocusTracking } from "./browser-shortcut-focus.mjs";
 
 const NATIVE_DEEP_LINK_EVENT = "openwork:deep-link-native";
 const NATIVE_MENU_OPEN_SETTINGS_EVENT = "openwork:native-menu:open-settings";
@@ -6,6 +7,28 @@ const NATIVE_MENU_TOGGLE_SIDEBAR_EVENT = "openwork:native-menu:toggle-sidebar";
 const NATIVE_MENU_CHECK_UPDATES_EVENT = "openwork:native-menu:check-updates";
 const NATIVE_MENU_ZOOM_EVENT = "openwork:native-menu:zoom";
 const AUTOMATION_RUNNER_CREDENTIAL_REJECTED_EVENT = "openwork:automation-runner:credential-rejected";
+const BROWSER_BOUNDS_INVALIDATED_EVENT = "openwork:browser:bounds-invalidated";
+
+let lastBrowserGeometry = null;
+let windowFullscreen = ipcRenderer.sendSync("openwork:window-fullscreen-sync") === true;
+
+async function sendBrowserGeometry(channel, bounds, ...args) {
+  // Capture zoom in the same renderer turn as the CSS measurement, not after IPC.
+  const geometry = { ...bounds, zoomFactor: webFrame.getZoomFactor() };
+  if (channel === "openwork:browser:bounds" && lastBrowserGeometry
+    && ["x", "y", "width", "height", "zoomFactor"].every((key) => geometry[key] === lastBrowserGeometry[key])) {
+    return true;
+  }
+  lastBrowserGeometry = geometry;
+  try {
+    const accepted = await ipcRenderer.invoke(channel, geometry, ...args);
+    if (accepted === false && lastBrowserGeometry === geometry) lastBrowserGeometry = null;
+    return accepted;
+  } catch (error) {
+    if (lastBrowserGeometry === geometry) lastBrowserGeometry = null;
+    throw error;
+  }
+}
 
 function normalizePlatform(value) {
   if (value === "darwin" || value === "linux") return value;
@@ -19,6 +42,7 @@ function applyShellDocumentMarkers() {
     if (!root) return false;
 
     root.dataset.openworkShell = "electron";
+    root.dataset.windowFullscreen = String(windowFullscreen);
     root.classList.add("openwork-electron");
     if (process.platform === "darwin") {
       root.classList.add("openwork-platform-mac");
@@ -49,6 +73,78 @@ function installMenuOverlayDismissListeners() {
   }
 }
 
+function linkOpenPreferences() {
+  // Read at activation so Settings changes and reloads use the same saved
+  // preference as the renderer, without a second main-process preference store.
+  try {
+    const prefs = JSON.parse(window.localStorage.getItem("openwork.preferences"));
+    return { external: prefs?.linkOpenDestination === "external", ask: prefs?.askBeforeOpeningLinks !== false };
+  } catch {
+    return { external: false, ask: true };
+  }
+}
+
+function openLink(url, sessionId) {
+  ipcRenderer.send("openwork:browser:linkClick", { url, sessionId, ...linkOpenPreferences() });
+}
+
+if (process.isMainFrame) {
+  installBrowserShortcutFocusTracking(window, (tabId) => {
+    ipcRenderer.send("openwork:browser:shortcut-focus", tabId);
+  });
+  window.addEventListener("click", (event) => {
+    if (!event.isTrusted || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const anchor = event.composedPath().find((node) => node instanceof HTMLAnchorElement);
+    if (!anchor || anchor.isContentEditable || anchor.hasAttribute("download")) return;
+    if (!/^(https?:)?\/\//i.test(anchor.getAttribute("href") ?? "")) return;
+    let url;
+    try { url = new URL(anchor.href); } catch { return; }
+    if (!["http:", "https:"].includes(url.protocol)) return;
+    if (url.origin === location.origin && url.pathname === location.pathname && url.search === location.search) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    openLink(url.href, anchor.closest("[data-session-surface-id]")?.getAttribute("data-session-surface-id") ?? null);
+  }, { capture: true });
+}
+
+// Selected text and ordinary editors use Chromium's native context-menu event.
+// Explicit editor action menus compose their own editing + formatting menu.
+window.addEventListener("contextmenu", (event) => {
+  const eventPath = event.composedPath();
+  const composedEditor = eventPath.some((node) => node instanceof HTMLElement && node.hasAttribute("data-native-context-menu-editable"));
+  const editable = eventPath.some((node) => node instanceof HTMLElement && (
+    node.isContentEditable || node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement
+  ));
+  const selection = window.getSelection();
+  const selectedTarget = event.target instanceof Node && selection?.toString() && selection.containsNode(event.target, true);
+  if (!composedEditor && (editable || selectedTarget)) {
+    event.stopImmediatePropagation();
+    return;
+  }
+  if (composedEditor) return;
+  // Preserve Chromium's image hit-test and pixel clipboard operation, including
+  // linked images. Do not let surrounding message/link menus swallow it.
+  if (eventPath.some((node) => node instanceof HTMLImageElement)) {
+    event.stopImmediatePropagation();
+    return;
+  }
+  const anchor = event.composedPath().find((node) => node instanceof HTMLAnchorElement);
+  if (!anchor || anchor.isContentEditable || anchor.hasAttribute("download")) return;
+  const href = anchor.getAttribute("href") ?? "";
+  if (!/^(https?:)?\/\//i.test(href)) return;
+  let url;
+  try { url = new URL(anchor.href); } catch { return; }
+  if (!["http:", "https:"].includes(url.protocol)) return;
+  if (url.origin === location.origin && url.pathname === location.pathname && url.search === location.search) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  ipcRenderer.send("openwork:browser:linkContextMenu", {
+    url: url.href,
+    point: { x: event.clientX, y: event.clientY },
+    sessionId: anchor.closest("[data-session-surface-id]")?.getAttribute("data-session-surface-id") ?? null,
+  });
+}, { capture: true });
+
 let desktopBootstrap = null;
 let desktopDistribution = null;
 try {
@@ -68,6 +164,11 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
       const handler = () => callback();
       ipcRenderer.on(AUTOMATION_RUNNER_CREDENTIAL_REJECTED_EVENT, handler);
       return () => ipcRenderer.removeListener(AUTOMATION_RUNNER_CREDENTIAL_REJECTED_EVENT, handler);
+    },
+  },
+  fileSystem: {
+    getPathForFile(file) {
+      return webUtils.getPathForFile(file);
     },
   },
   shell: {
@@ -125,8 +226,8 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
     setChannel(channel) {
       return ipcRenderer.invoke("openwork:updater:setChannel", channel);
     },
-    check(channel, targetVersion) {
-      return ipcRenderer.invoke("openwork:updater:check", channel, targetVersion);
+    check(channel, targetVersion, options) {
+      return ipcRenderer.invoke("openwork:updater:check", channel, targetVersion, options);
     },
     download() {
       return ipcRenderer.invoke("openwork:updater:download");
@@ -158,41 +259,91 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
     },
   },
   browser: {
-    show(bounds) { return ipcRenderer.invoke("openwork:browser:show", bounds); },
-    hide() { return ipcRenderer.invoke("openwork:browser:hide"); },
-    openUrl(url, provider) { return ipcRenderer.invoke("openwork:browser:openUrl", url, provider); },
+    openLink,
+    chooseLinkDestination(id, destination) { return ipcRenderer.invoke("openwork:browser:chooseLinkDestination", id, destination); },
+    onLinkOpenRequest(callback) {
+      const handler = (_event, request) => callback(request);
+      ipcRenderer.on("openwork:browser:link-open-request", handler);
+      return () => ipcRenderer.removeListener("openwork:browser:link-open-request", handler);
+    },
+    show(bounds, sessionId) { return sendBrowserGeometry("openwork:browser:show", bounds, sessionId); },
+    hide(options) {
+      lastBrowserGeometry = null;
+      return ipcRenderer.invoke("openwork:browser:hide", options);
+    },
+    openUrl(url, provider, options) { return ipcRenderer.invoke("openwork:browser:openUrl", url, provider, options); },
+    setVisibleSession(sessionId) { return ipcRenderer.invoke("openwork:browser:setVisibleSession", sessionId); },
     navigate(url) { return ipcRenderer.invoke("openwork:browser:navigate", url); },
     back() { return ipcRenderer.invoke("openwork:browser:back"); },
     forward() { return ipcRenderer.invoke("openwork:browser:forward"); },
     reload() { return ipcRenderer.invoke("openwork:browser:reload"); },
-    setBounds(bounds) { return ipcRenderer.invoke("openwork:browser:bounds", bounds); },
+    setBounds(bounds) { return sendBrowserGeometry("openwork:browser:bounds", bounds); },
     getState() { return ipcRenderer.invoke("openwork:browser:state"); },
-    createTab(url) { return ipcRenderer.invoke("openwork:browser:createTab", url); },
+    createTab(url, sessionId) { return ipcRenderer.invoke("openwork:browser:createTab", url, sessionId); },
     closeTab(tabId) { return ipcRenderer.invoke("openwork:browser:closeTab", tabId); },
+    suspendTab(tabId) { return ipcRenderer.invoke("openwork:browser:suspendTab", tabId); },
+    restoreTab(tabId, sessionId) { return ipcRenderer.invoke("openwork:browser:restoreTab", tabId, sessionId); },
+    releaseTab(tabId, sessionId) { return ipcRenderer.invoke("openwork:browser:releaseTab", tabId, sessionId); },
     closeAllTabs() { return ipcRenderer.invoke("openwork:browser:closeAllTabs"); },
+    closeSessionTabs(sessionId) { return ipcRenderer.invoke("openwork:browser:closeSessionTabs", sessionId); },
     selectTab(tabId) { return ipcRenderer.invoke("openwork:browser:selectTab", tabId); },
     reorderTabs(tabIds) { return ipcRenderer.invoke("openwork:browser:reorderTabs", tabIds); },
+    approve(tabId, approvalId, allowed) { return ipcRenderer.invoke("openwork:browser:approve", tabId, approvalId, allowed); },
+    taskControl(tabId, action) { return ipcRenderer.invoke("openwork:browser:taskControl", tabId, action); },
     listTabs() { return ipcRenderer.invoke("openwork:browser:listTabs"); },
+    listWebMcpTools(args) { return ipcRenderer.invoke("openwork:browser:webmcpListTools", args); },
+    executeWebMcpTool(args) { return ipcRenderer.invoke("openwork:browser:webmcpExecuteTool", args); },
     setProxy(proxy) { return ipcRenderer.invoke("openwork:browser:setProxy", proxy); },
     getProxy() { return ipcRenderer.invoke("openwork:browser:getProxy"); },
+    setControlEnabled(enabled) { return ipcRenderer.invoke("openwork:browser:setControlEnabled", enabled); },
     showTabContextMenu(tabId, point) { return ipcRenderer.invoke("openwork:browser:tabContextMenu", tabId, point); },
-    destroy() { return ipcRenderer.invoke("openwork:browser:destroy"); },
+    destroy() {
+      lastBrowserGeometry = null;
+      return ipcRenderer.invoke("openwork:browser:destroy");
+    },
     onStateChange(callback) {
       const handler = (_event, state) => callback(state);
       ipcRenderer.on("openwork:browser:state", handler);
       return () => ipcRenderer.removeListener("openwork:browser:state", handler);
     },
     onPanelOpened(callback) {
-      const handler = () => callback();
+      const handler = (_event, payload) => callback(payload);
       ipcRenderer.on("openwork:browser:panel-opened", handler);
       return () => ipcRenderer.removeListener("openwork:browser:panel-opened", handler);
     },
     onPanelClosed(callback) {
-      const handler = () => callback();
+      const handler = (_event, payload) => callback(payload);
       ipcRenderer.on("openwork:browser:panel-closed", handler);
       return () => ipcRenderer.removeListener("openwork:browser:panel-closed", handler);
     },
   },
+  browserLogins: {
+    disableForManagedContext() { return ipcRenderer.invoke("openwork:browser-logins:disableForManagedContext"); },
+    sources() { return ipcRenderer.invoke("openwork:browser-logins:sources"); },
+    preview(request) { return ipcRenderer.invoke("openwork:browser-logins:preview", request); },
+    configure(request) { return ipcRenderer.invoke("openwork:browser-logins:configure", request); },
+    state() { return ipcRenderer.invoke("openwork:browser-logins:state"); },
+    syncNow() { return ipcRenderer.invoke("openwork:browser-logins:syncNow"); },
+    pause() { return ipcRenderer.invoke("openwork:browser-logins:pause"); },
+    resume() { return ipcRenderer.invoke("openwork:browser-logins:resume"); },
+    stopSite(site) { return ipcRenderer.invoke("openwork:browser-logins:stopSite", site); },
+    disconnect(request) { return ipcRenderer.invoke("openwork:browser-logins:disconnect", request); },
+    signedInSites() { return ipcRenderer.invoke("openwork:browser-logins:signedIn"); },
+    forgetSite(site) { return ipcRenderer.invoke("openwork:browser-logins:forgetSite", site); },
+    forgetAll() { return ipcRenderer.invoke("openwork:browser-logins:forgetAll"); },
+    ...(process.env.OPENWORK_EVAL_BROWSER_LOGIN_SYNC === "1" ? {
+      writeTestStore(request) { return ipcRenderer.invoke("openwork:browser-logins:writeTestStore", request); },
+      testWitnessUrl() { return ipcRenderer.invoke("openwork:browser-logins:testWitnessUrl"); },
+    } : {}),
+  },
+  // Development-only observation of native popup menus; main registers no handler otherwise.
+  ...(process.env.OPENWORK_DEV_MODE === "1" ? {
+    contextMenu: {
+      inspect() { return ipcRenderer.invoke("openwork:context-menu:inspect"); },
+      choose(id) { return ipcRenderer.invoke("openwork:context-menu:choose", id); },
+      dismiss() { return ipcRenderer.invoke("openwork:context-menu:dismiss"); },
+    },
+  } : {}),
   terminal: {
     create(options) { return ipcRenderer.invoke("openwork:terminal:create", options); },
     write(terminalId, data) { return ipcRenderer.invoke("openwork:terminal:write", terminalId, data); },
@@ -256,6 +407,16 @@ ipcRenderer.on(NATIVE_MENU_CHECK_UPDATES_EVENT, () => {
 ipcRenderer.on(NATIVE_MENU_ZOOM_EVENT, (_event, action) => {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(NATIVE_MENU_ZOOM_EVENT, { detail: action }));
+});
+
+ipcRenderer.on(BROWSER_BOUNDS_INVALIDATED_EVENT, () => {
+  lastBrowserGeometry = null;
+  window.dispatchEvent(new Event(BROWSER_BOUNDS_INVALIDATED_EVENT));
+});
+
+ipcRenderer.on("openwork:window-fullscreen", (_event, fullscreen) => {
+  windowFullscreen = fullscreen === true;
+  applyShellDocumentMarkers();
 });
 
 if (!applyShellDocumentMarkers() && typeof document !== "undefined") {

@@ -1,16 +1,20 @@
-import { desc, eq } from "@openwork-ee/den-db/drizzle"
+import { eq } from "@openwork-ee/den-db/drizzle"
 import { WorkerTable, WorkerTokenTable } from "@openwork-ee/den-db/schema"
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { db } from "../../db.js"
+import { nextCursorSchema } from "../../list-pagination.js"
 import { jsonValidator, orgMemberRoute, paramValidator, queryValidator } from "../../middleware/index.js"
 import { denTypeIdSchema, emptyResponse, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
+import { getOpenWorkWebRuntimeAccess, openWorkWebAccessRequiredPayload } from "../../openwork-web-runtime-access.js"
 import { getOrganizationLimitStatus } from "../../organization-limits.js"
 import { getRequiredUserEmail } from "../../user.js"
+import { listWorkersPage } from "../../workers/list.js"
 import type { WorkerRouteVariables } from "./shared.js"
 import {
+  canControlWorker,
   continueCloudProvisioning,
   createWorkerSchema,
   deleteWorkerCascade,
@@ -24,13 +28,18 @@ import {
   toWorkerResponse,
   token,
   updateWorkerSchema,
+  workerControlForbiddenPayload,
   workerIdParamSchema,
+  workerSandboxBackend,
 } from "./shared.js"
 
 const workerInstanceSchema = z.object({
   provider: z.string(),
   region: z.string().nullable(),
   url: z.string().nullable(),
+  endpointKind: z.enum(["signed-expiring", "stable", "den-tunnel"]).describe(
+    "How the instance endpoint behaves. Anything other than stable means only Den's lifecycle route is durable.",
+  ),
   status: z.string(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
@@ -58,6 +67,7 @@ const workerListResponseSchema = z.object({
   workers: z.array(z.object({
     instance: workerInstanceSchema,
   }).merge(workerSchema)),
+  nextCursor: nextCursorSchema,
 }).meta({ ref: "WorkerListResponse" })
 
 const workerResponseSchema = z.object({
@@ -89,7 +99,19 @@ const workerTokensResponseSchema = z.object({
     openworkUrl: z.string().nullable(),
     workspaceId: z.string().nullable(),
   }).nullable(),
+  directPreview: z.object({
+    version: z.literal(1),
+    openworkUrl: z.string(),
+    workspaceId: z.string().nullable(),
+    expiresAt: z.string().datetime(),
+  }).nullable().optional(),
 }).meta({ ref: "WorkerTokensResponse" })
+
+const workerTokensRequestSchema = z.object({
+  // Legacy/published clients do not understand signed-preview expiry. They
+  // receive only stable tokens. New Web flows opt in and own refresh/polling.
+  includeExpiringOpenworkUrl: z.boolean().optional(),
+}).meta({ ref: "WorkerTokensRequest" })
 
 const organizationUnavailableSchema = z.object({
   error: z.literal("organization_unavailable"),
@@ -112,6 +134,11 @@ const paymentRequiredSchema = z.object({
   message: z.string(),
 }).meta({ ref: "WorkerPaymentRequiredError" })
 
+const openWorkWebAccessRequiredSchema = z.object({
+  error: z.literal("openwork_web_access_required"),
+  message: z.string(),
+}).meta({ ref: "WorkerOpenWorkWebAccessRequiredError" })
+
 const userEmailRequiredSchema = z.object({
   error: z.literal("user_email_required"),
 }).meta({ ref: "WorkerUserEmailRequiredError" })
@@ -130,7 +157,8 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
     describeRoute({
       tags: ["Workers"],
       summary: "List workers",
-      description: "Lists the workers that belong to the caller's active organization, including each worker's latest known instance state.",
+      description: "Lists the workers that belong to the caller's active organization, newest first, including each worker's latest known instance state. "
+        + "Pass nextCursor from the previous page as cursor to continue; nextCursor is null on the last page.",
       responses: {
         200: jsonResponse("Workers returned successfully.", workerListResponseSchema),
         400: jsonResponse("The worker list query parameters were invalid.", invalidRequestSchema),
@@ -145,15 +173,10 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
     const query = c.req.valid("query")
 
     if (!orgId) {
-      return c.json({ workers: [] })
+      return c.json({ workers: [], nextCursor: null })
     }
 
-    const rows = await db
-      .select()
-      .from(WorkerTable)
-      .where(eq(WorkerTable.org_id, orgId))
-      .orderBy(desc(WorkerTable.created_at))
-      .limit(query.limit)
+    const { items: rows, nextCursor } = await listWorkersPage({ orgId, limit: query.limit, cursor: query.cursor })
 
     const workers = await Promise.all(
       rows.map(async (row) => {
@@ -165,7 +188,7 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
       }),
     )
 
-    return c.json({ workers })
+    return c.json({ workers, nextCursor })
     },
   )
 
@@ -181,6 +204,7 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
         400: jsonResponse("The worker creation payload was invalid.", z.union([invalidRequestSchema, organizationUnavailableSchema, workspacePathRequiredSchema, userEmailRequiredSchema])),
         401: jsonResponse("The caller must be signed in to create workers.", unauthorizedSchema),
         402: jsonResponse("The caller needs an active cloud plan before launching a cloud worker.", paymentRequiredSchema),
+        403: jsonResponse("OpenWork Web access is required to launch a cloud worker.", openWorkWebAccessRequiredSchema),
         409: jsonResponse("The organization has reached its worker limit.", orgLimitReachedSchema),
       },
     }),
@@ -200,6 +224,10 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
     }
 
     if (input.destination === "cloud") {
+      const webAccess = await getOpenWorkWebRuntimeAccess(orgId)
+      if (!webAccess.hasAccess) {
+        return c.json(openWorkWebAccessRequiredPayload(), 403)
+      }
       const email = getRequiredUserEmail(user)
       if (!email) {
         return c.json({ error: "user_email_required" }, 400)
@@ -232,6 +260,7 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
 
     const workerId = createDenTypeId("worker")
     const workerStatus = input.destination === "cloud" ? "provisioning" : "healthy"
+    const sandboxBackend = workerSandboxBackend(input)
 
     await db.insert(WorkerTable).values({
       id: workerId,
@@ -243,7 +272,7 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
       status: workerStatus,
       image_version: input.imageVersion,
       workspace_path: input.workspacePath,
-      sandbox_backend: input.sandboxBackend,
+      sandbox_backend: sandboxBackend,
     })
 
     const hostToken = token()
@@ -293,7 +322,11 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
           status: workerStatus,
           image_version: input.imageVersion ?? null,
           workspace_path: input.workspacePath ?? null,
-          sandbox_backend: input.sandboxBackend ?? null,
+          sandbox_backend: sandboxBackend,
+          cloud_failure_code: null,
+          cloud_failure_stage: null,
+          cloud_failure_reference: null,
+          cloud_failure_at: null,
           last_heartbeat_at: null,
           last_active_at: null,
           created_at: new Date(),
@@ -423,11 +456,12 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
     describeRoute({
       tags: ["Workers"],
       summary: "Get worker connection tokens",
-      description: "Returns connection tokens and the resolved OpenWork connect URL for an existing worker.",
+      description: "Returns connection tokens and the resolved OpenWork connect URL for an existing worker. Cloud workers require the caller to be their creator, including API-key callers.",
       responses: {
         200: jsonResponse("Worker connection tokens returned successfully.", workerTokensResponseSchema),
         400: jsonResponse("The worker token path parameters were invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to request worker tokens.", unauthorizedSchema),
+        403: jsonResponse("Cloud worker tokens require the worker owner and OpenWork Web access.", z.union([forbiddenSchema, openWorkWebAccessRequiredSchema])),
         404: jsonResponse("The worker could not be found.", notFoundSchema),
         409: jsonResponse("The worker is not ready to return connection tokens yet.", workerRuntimeUnavailableSchema),
       },
@@ -454,7 +488,14 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
       return c.json({ error: "worker_not_found" }, 404)
     }
 
-    const resolved = await getWorkerTokensAndConnect(worker)
+    if (!canControlWorker(worker, c.get("user")?.id)) {
+      return c.json(workerControlForbiddenPayload(), 403)
+    }
+
+    const requestBody = workerTokensRequestSchema.safeParse(await c.req.json().catch(() => ({})))
+    const resolved = await getWorkerTokensAndConnect(worker, {
+      includeExpiringOpenworkUrl: requestBody.success && requestBody.data.includeExpiringOpenworkUrl === true,
+    })
     if ("error" in resolved && resolved.error) {
       return new Response(JSON.stringify(resolved.error.body), {
         status: resolved.error.status,
@@ -473,11 +514,12 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
     describeRoute({
       tags: ["Workers"],
       summary: "Delete worker",
-      description: "Deletes a worker and cascades cleanup for its tokens, runtime records, and provider-specific resources.",
+      description: "Deletes a worker and cascades cleanup for its tokens, runtime records, and provider-specific resources. Only the creator can delete a cloud worker.",
       responses: {
         204: emptyResponse("Worker deleted successfully."),
         400: jsonResponse("The worker deletion path parameters were invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to delete workers.", unauthorizedSchema),
+        403: jsonResponse("Only the worker owner can delete this cloud worker.", forbiddenSchema),
         404: jsonResponse("The worker could not be found.", notFoundSchema),
       },
     }),
@@ -501,6 +543,10 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
     const worker = await getWorkerByIdForOrg(workerId, orgId)
     if (!worker) {
       return c.json({ error: "worker_not_found" }, 404)
+    }
+
+    if (!canControlWorker(worker, c.get("user")?.id)) {
+      return c.json(workerControlForbiddenPayload(), 403)
     }
 
     await deleteWorkerCascade(worker)

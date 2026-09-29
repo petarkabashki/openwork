@@ -2,20 +2,25 @@ import type { Hono } from "hono"
 import type { RequestIdVariables } from "hono/request-id"
 import { delegatedRoute } from "../../middleware/index.js"
 import { registerOrgApiKeyRoutes } from "./api-keys.js"
+import { registerOrgAuditRoutes } from "./audit.js"
 import { registerOrgBillingRoutes } from "./billing.js"
 import { registerOrgBrandAssetRoutes } from "./brand-assets.js"
-import { registerOrgCodemodeRunRoutes } from "./codemode-runs.js"
-import { registerOrgCodemodeScriptRoutes } from "./codemode-scripts.js"
+import { registerOrgWorkflowRunRoutes } from "./codemode-runs.js"
+import { registerOrgWorkflowRoutes } from "./codemode-scripts.js"
 import { LEGACY_ORG_PROXY_HEADER } from "../../middleware/user-organizations.js"
 import type { OrgRouteVariables } from "./shared.js"
 import { registerOrgCoreRoutes } from "./core.js"
+import { registerOrgDashboardRoutes } from "./dashboards.js"
 import { registerDeleteOrganizationRoutes } from "./delete-organization.js"
 import { registerOrgDesktopPolicyRoutes } from "./desktop-policies.js"
 import { registerOrgEgressDiagnosticRoutes } from "./egress-diagnostics.js"
 import { registerOrgInvitationRoutes } from "./invitations.js"
 import { registerGoogleWorkspaceRoutes } from "./google-workspace.js"
 import { registerOrgInstallLinkRoutes } from "./install-links.js"
+import { registerOrgInferenceProviderRoutes } from "./inference-providers.js"
 import { registerOrgInferenceRoutes } from "./inference.js"
+import { registerModelsAnalyticsRoutes } from "./models-analytics.js"
+import { registerModelsAnalyticsExportRoutes } from "../../models-analytics-export.js"
 import { registerOrgLlmProviderRoutes } from "./llm-providers.js"
 import { registerOrgMemberRoutes } from "./members.js"
 import { registerMcpConnectionRoutes } from "./mcp-connections.js"
@@ -27,6 +32,7 @@ import { registerOrgScimRoutes } from "./scim.js"
 import { registerOrgSsoRoutes } from "./sso.js"
 import { registerOrgResourceRoutes } from "./resources.js"
 import { registerOrgTeamRoutes } from "./teams.js"
+import { registerOrgWebOriginRoutes } from "./web-origins.js"
 
 const LEGACY_ORG_PATH_PREFIX = "/v1/orgs/"
 
@@ -58,18 +64,23 @@ export function registerOrgRoutes<T extends { Variables: OrgRouteVariables & Req
   registerOrgCoreRoutes(app)
   registerDeleteOrganizationRoutes(app)
   registerOrgApiKeyRoutes(app)
+  registerOrgAuditRoutes(app)
   registerOrgBillingRoutes(app)
   registerOrgBrandAssetRoutes(app)
-  registerOrgCodemodeRunRoutes(app)
-  registerOrgCodemodeScriptRoutes(app)
+  registerOrgWorkflowRunRoutes(app)
+  registerOrgWorkflowRoutes(app)
+  registerOrgDashboardRoutes(app)
   registerOrgDesktopPolicyRoutes(app)
   registerOrgEgressDiagnosticRoutes(app)
   registerOrgInferenceRoutes(app)
+  registerModelsAnalyticsRoutes(app)
+  registerModelsAnalyticsExportRoutes(app)
   registerOrgScimRoutes(app)
   registerOrgSsoRoutes(app)
   registerOrgInvitationRoutes(app)
   registerOrgInstallLinkRoutes(app)
   registerOrgLlmProviderRoutes(app)
+  registerOrgInferenceProviderRoutes(app)
   registerOrgMemberRoutes(app)
   registerOAuthProviderRoutes(app)
   registerGoogleWorkspaceRoutes(app)
@@ -79,6 +90,7 @@ export function registerOrgRoutes<T extends { Variables: OrgRouteVariables & Req
   registerOrgRoleRoutes(app)
   registerOrgResourceRoutes(app)
   registerOrgTeamRoutes(app)
+  registerOrgWebOriginRoutes(app)
 
   app.all("/v1/orgs/:orgId/*", delegatedRoute, async (c) => {
     const url = new URL(c.req.raw.url)

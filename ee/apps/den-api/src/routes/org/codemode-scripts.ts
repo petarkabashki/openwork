@@ -1,24 +1,30 @@
+import { liveArtifactConnectionFailure } from "../../mcp/capability-registry.js"
+import { artifactRunInputSchema } from "../../artifact-runtime.js"
 import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import {
-  savedScriptArtifactSnapshotSchema,
-  savedScriptCapabilitySchema,
-  savedScriptDetailSchema,
-  savedScriptTestResultSchema,
-  savedScriptVersionSchema,
+  workflowArtifactSnapshotSchema,
+  workflowCapabilitySchema,
+  workflowDetailSchema,
+  workflowGraphSchema,
+  workflowTestResultSchema,
+  workflowVersionSchema,
   generatedArtifactViewSchema,
-} from "@openwork/types/dynamic-artifacts"
+  savedAppSummarySchema,
+  savedAppDetailSchema,
+  saveAppSchema,
+} from "@openwork/types/workflows"
 import {
-  createCodemodeScriptVersion,
-  deleteCodemodeScriptSnapshotContent,
-  getCodemodeScriptDetail,
-  getCodemodeScriptSnapshot,
-  listCodemodeScriptSnapshots,
-  listCodemodeScriptVersions,
-  saveCodemodeScript,
-  testCodemodeScriptDraft,
-} from "../../codemode-scripts.js"
+  createWorkflowVersion,
+  deleteWorkflowSnapshotContent,
+  getWorkflowSnapshot,
+  listWorkflowSnapshots,
+  listWorkflowVersions,
+  saveWorkflow,
+  testWorkflowDraft,
+} from "../../workflows.js"
+import { keysetCursorQuerySchema, nextCursorSchema } from "../../list-pagination.js"
 import { orgMemberRoute, jsonValidator, queryValidator } from "../../middleware/index.js"
 import { forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
 import { listTeamsForMember } from "../../orgs.js"
@@ -27,24 +33,21 @@ import { getCatalog } from "../../mcp/index.js"
 import { buildCapabilityToolTree, createCapabilityRegistryContext } from "../../mcp/capability-registry.js"
 import {
   executeMarketplaceCapability,
-  listAccessibleSavedCodemodeScripts,
+  listAccessibleWorkflows,
 } from "../../mcp/marketplace-capabilities.js"
 import { DEN_MCP_REQUESTED_SCOPES } from "../../mcp/scopes.js"
-import { codemodeScriptsEnabled } from "../../capability-sources/codemode-rollout.js"
 import { PluginArchAuthorizationError } from "./plugin-system/access.js"
 import type { OrgRouteVariables } from "./shared.js"
-import { codemodeCodeDigest } from "../../codemode-runs.js"
-import { getProgramDetail } from "../../program-library.js"
+import { codemodeCodeDigest } from "../../workflow-runs.js"
+import { getWorkflowLibraryDetail } from "../../workflow-library.js"
+import { normalizeToolBody } from "../../mcp/invoke.js"
 import {
   activateArtifactViewRevision,
   listArtifactViewsForScript,
   retireArtifactView,
 } from "../../artifact-views.js"
-import {
-  clearProgramAgentSelection,
-  getProgramAgentSelection,
-  selectProgramForAgent,
-} from "../../program-agent-selection.js"
+
+import { getSavedApp, listSavedApps, setAppOnDashboard, shareSavedApp } from "../../saved-apps.js"
 
 const capabilitySchema = z.object({ capabilityName: z.string(), scriptPath: z.string() })
 const scriptSchema = z.object({
@@ -59,23 +62,45 @@ const scriptSchema = z.object({
 })
 const listSchema = z.object({ items: z.array(scriptSchema) })
 const saveSchema = z.object({
-  pluginId: z.string().trim().min(1).max(160).optional().describe("Existing OpenWork Connect Plugin that will contain and share this Program. Omit to use the member's private My Programs Plugin."),
+  pluginId: z.string().trim().min(1).max(160).optional().describe("Existing OpenWork Connect Plugin that will contain and share this Workflow. Omit to use the member's private My Workflows Plugin."),
   name: z.string().trim().min(1).max(255),
   description: z.string().trim().max(4_000).optional(),
-  code: z.string().min(1).max(200_000),
-  currentInput: z.unknown().optional(),
+  code: z.string().min(1).max(200_000).optional().describe("Exact tested source. Required without receiptId; if both are supplied it must byte-match the retained source."),
+  receiptId: z.string().min(1).max(160).optional().describe("Successful authoring receipt from this caller within 15 minutes. Encrypted source retention is shared across replicas when Redis is configured, otherwise process-local. If unavailable, retest or omit receiptId and supply the exact source."),
+  currentInput: z.unknown().optional().describe("Must match the tested input when receiptId is supplied. Forbidden for live authoring receipts."),
   inputSchema: z.unknown().optional(),
-  outputSchema: z.unknown().optional().describe("Optional JSON Schema for the value returned by this Program."),
+  outputSchema: z.unknown().optional().describe("Optional JSON Schema for the value returned by this Workflow."),
+}).refine((value) => value.code !== undefined || value.receiptId !== undefined, {
+  message: "Provide code or receiptId.",
 })
-const savedSchema = z.object({ pluginId: z.string(), configObjectId: z.string(), configObjectVersionId: z.string() })
+const savedSchema = z.object({
+  pluginId: z.string(),
+  configObjectId: z.string(),
+  configObjectVersionId: z.string(),
+  graph: workflowGraphSchema,
+  mermaid: z.string(),
+})
 const runParamsSchema = z.object({ configObjectId: z.string().min(1).max(160) })
 const runSchema = z.object({
   pluginId: z.string().min(1).max(160),
   configObjectVersionId: z.string().min(1).max(160),
   input: z.unknown().optional(),
+  mode: z.enum(["adhoc", "live"]).default("adhoc"),
+  timeZone: artifactRunInputSchema.shape.timeZone,
+}).superRefine((value, context) => {
+  if (value.mode === "live" && Object.hasOwn(value, "input")) {
+    context.addIssue({ code: "custom", path: ["input"], message: "Live runs generate input.runtime; omit caller input." })
+  }
+  if (value.mode !== "live" && value.timeZone !== undefined) {
+    context.addIssue({ code: "custom", path: ["timeZone"], message: "timeZone is only supported in live mode." })
+  }
 })
 const runResultSchema = z.object({
   status: z.literal("succeeded"),
+  executionType: z.literal("saved-workflow"),
+  mode: z.enum(["adhoc", "live"]),
+  fetchedAt: z.string().datetime(),
+  timeZone: z.string().optional(),
   value: z.unknown(),
   markdown: z.string(),
   receiptId: z.string().nullable(),
@@ -91,25 +116,28 @@ const detailParamsSchema = z.object({
 const detailQuerySchema = z.object({
   maxAgeMs: z.coerce.number().int().min(60_000).max(30 * 24 * 60 * 60_000).optional(),
 })
-const snapshotsQuerySchema = z.object({ limit: z.coerce.number().int().min(1).max(200).optional() })
+const snapshotsQuerySchema = z.object({
+  cursor: keysetCursorQuerySchema.optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+})
 const draftSchema = z.object({
   name: z.string().trim().min(1).max(255),
   description: z.string().trim().max(4_000).optional(),
   code: z.string().min(1).max(200_000),
   exampleInput: z.unknown().optional(),
   inputSchema: z.unknown().optional(),
-  outputSchema: z.unknown().optional().describe("Optional JSON Schema for the value returned by this Program."),
-  requiredCapabilities: z.array(savedScriptCapabilitySchema).max(100),
+  outputSchema: z.unknown().optional().describe("Optional JSON Schema for the value returned by this Workflow."),
+  requiredCapabilities: z.array(workflowCapabilitySchema).max(100),
 })
 const testSchema = draftSchema.extend({ configObjectId: z.string().min(1).max(160) })
 const versionSchema = draftSchema.extend({
   receiptId: z.string().min(1).max(160).describe("Copy receiptId from the immediately preceding successful draft test. Submit the exact same name, description, code, exampleInput, inputSchema, outputSchema, and requiredCapabilities used by that test."),
 })
-const versionsResponseSchema = z.object({ items: z.array(savedScriptVersionSchema) })
-const snapshotsResponseSchema = z.object({ items: z.array(savedScriptArtifactSnapshotSchema) })
-const programDetailSchema = z.object({
-  program: z.object({
-    type: z.literal("program"), id: z.string(), plugin: z.object({ id: z.string(), name: z.string() }).nullable(), name: z.string(), description: z.string().nullable(),
+const versionsResponseSchema = z.object({ items: z.array(workflowVersionSchema) })
+const snapshotsResponseSchema = z.object({ items: z.array(workflowArtifactSnapshotSchema), nextCursor: nextCursorSchema })
+const workflowLibraryDetailSchema = z.object({
+  workflow: z.object({
+    type: z.literal("workflow"), id: z.string(), plugin: z.object({ id: z.string(), name: z.string() }).nullable(), name: z.string(), description: z.string().nullable(),
     role: z.enum(["viewer", "editor", "manager"]), edges: z.array(z.unknown()),
     state: z.enum(["ready", "needs_signin", "needs_admin_setup"]),
     resultState: z.enum(["never_run", "fresh", "stale", "needs_attention"]),
@@ -118,15 +146,10 @@ const programDetailSchema = z.object({
     activeViewTitle: z.string().nullable(), automationCount: z.number().int().nonnegative(),
     source: z.object({ kind: z.enum(["created", "installed_template"]), templateName: z.string().optional(), templateVersion: z.string().optional() }),
   }),
-  script: savedScriptDetailSchema,
+  script: workflowDetailSchema,
   views: z.array(generatedArtifactViewSchema),
 })
 const artifactViewsResponseSchema = z.object({ items: z.array(generatedArtifactViewSchema) })
-const programSelectionSchema = z.object({
-  organizationId: z.string(), orgMembershipId: z.string(), programId: z.string(), selectedAt: z.string().datetime(),
-})
-const programSelectionResponseSchema = z.object({ selection: programSelectionSchema.nullable() })
-const programSelectionWriteSchema = z.object({ programId: z.string().trim().min(1).max(160) })
 const artifactViewParamsSchema = z.object({
   artifactViewId: z.string().trim().min(1).max(160),
   revisionId: z.string().trim().min(1).max(160).optional(),
@@ -136,9 +159,10 @@ function routeFailure(error: unknown) {
   if (error instanceof PluginArchAuthorizationError) {
     return { status: error.status, body: { error: error.error, message: error.message } } as const
   }
-  const message = error instanceof Error ? error.message : "Saved Script request failed."
-  if (message.includes("not_found")) return { status: 404, body: { error: "saved_script_not_found", message } } as const
-  if (message === "saved_script_matching_test_receipt_required") {
+  const message = error instanceof Error ? error.message : "Workflow request failed."
+  if (message === "app_changed_since_preview") return { status: 409, body: { error: message, message: "This app was saved elsewhere. Reopen it before saving your changes." } } as const
+  if (message.includes("not_found")) return { status: 404, body: { error: "workflow_not_found", message } } as const
+  if (message === "workflow_matching_test_receipt_required") {
     return {
       status: 400,
       body: {
@@ -147,21 +171,65 @@ function routeFailure(error: unknown) {
       },
     } as const
   }
-  if (message === "saved_script_recent_receipt_required") {
+  if (message === "workflow_source_contains_secret") {
+    return { status: 400, body: { error: message, message: "Source cannot be retained or saved because it may contain a literal credential. Remove credentials and retest." } } as const
+  }
+  if (message === "workflow_authoring_receipt_required") {
     return {
       status: 400,
       body: {
         error: message,
-        message: "Run the exact Script code successfully with execute_capability_script, then retry saving the Script without changing the code. The successful run must be less than 15 minutes old.",
+        message: "A matching successful authoring receipt and its retained source are required. Source retention lasts at most 15 minutes and is shared across replicas when Redis is configured, otherwise process-local. Configured storage failures do not fall back locally. Retest and use the new receiptId with unchanged source, input, and schemas, or omit receiptId and supply the exact tested source.",
       },
     } as const
   }
-  return { status: 400, body: { error: "saved_script_rejected", message } } as const
+  if (message === "workflow_live_current_input_forbidden") {
+    return { status: 400, body: { error: message, message: "Omit currentInput for a live authoring receipt. Validation uses the retained server-generated runtime, which is not saved as example input." } } as const
+  }
+  if (message === "workflow_recent_receipt_required") {
+    return {
+      status: 400,
+      body: {
+        error: message,
+        message: "Run the exact procedure successfully with execute_capability_script, then retry saving the Workflow without changing the code. The successful run must be less than 15 minutes old. The match is byte-exact on the code string, so re-send the identical source (same whitespace) that succeeded.",
+      },
+    } as const
+  }
+  const unavailablePrefix = "workflow_capability_unavailable:"
+  if (message.startsWith(unavailablePrefix)) {
+    const capability = message.slice(unavailablePrefix.length)
+    const isSearch = capability === "$codemode.search" || capability === "tools.$codemode.search"
+    return {
+      status: 400,
+      body: {
+        error: "workflow_capability_unavailable",
+        capability,
+        message: isSearch
+          ? "Workflows cannot include tools.$codemode.search. Use search_capabilities (or tools.$codemode.search in an ad-hoc run) to find the exact tool paths, then write the Workflow with direct tool calls only and run it again before saving."
+          : `The Workflow calls ${capability}, which is not available to this member as a saved capability. Remove it or connect the required service, then run the exact code again before saving.`,
+      },
+    } as const
+  }
+  return { status: 400, body: { error: "workflow_rejected", message } } as const
 }
 
-export const saveProgramOperationId = "saveProgram"
+function appRouteFailure(error: unknown) {
+  const failure = routeFailure(error)
+  const code = error instanceof Error ? error.message : ""
+  if (code === "teammate_not_found") return { ...failure, body: { error: code, message: "No teammate with that email belongs to this organization. Ask an admin to invite them first." } }
+  const message = code.includes("not_found")
+    ? "This app is unavailable or you no longer have access."
+    : code === "artifact_view_schema_incompatible"
+      ? "The workflow’s results have changed. Ask OpenWork to update this app before saving."
+      : code === "artifact_view_revision_not_ready"
+        ? "This app is still being prepared. Wait for its preview before saving."
+        : null
+  return message ? { ...failure, body: { ...failure.body, message } } : failure
+}
 
-export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteVariables }>(app: Hono<T>) {
+export const saveWorkflowOperationId = "saveWorkflow"
+
+export function registerOrgWorkflowRoutes<T extends { Variables: OrgRouteVariables }>(app: Hono<T>) {
   const contextFor = async (c: {
     get(name: "organizationContext"): OrgRouteVariables["organizationContext"]
     get(name: "session"): OrgRouteVariables["session"]
@@ -178,7 +246,6 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
       scopes: new Set(DEN_MCP_REQUESTED_SCOPES),
       payload: {},
     }
-    const codemodeEnabled = codemodeScriptsEnabled(context.organization.metadata)
     const capabilityContext = createCapabilityRegistryContext({
       app: app as unknown as Hono,
       env: c.env,
@@ -187,51 +254,54 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
       organizationId: context.organization.id,
       member,
       redirectUriBase: env.apiPublicUrl ?? "http://127.0.0.1",
-      codemodeEnabled,
       generatedArtifactViewsEnabled: env.generatedArtifactViewsEnabled,
       organizationMetadata: context.organization.metadata,
       mcpConnectionsGatingEnabled: env.mcpConnectionsGatingEnabled,
     })
     const buildTools = () => buildCapabilityToolTree(capabilityContext)
     const actorContext = { organizationContext: context, memberTeams: teams, session: c.get("session") }
-    return { context, member, actorContext, buildTools, codemodeEnabled }
+    return { context, member, actorContext, buildTools, describeUnavailable: (missing: readonly { capabilityName: string }[]) => liveArtifactConnectionFailure(capabilityContext, missing) }
   }
 
   app.get(
-    "/v1/codemode-scripts",
+    "/v1/workflows",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "List accessible saved Code Mode scripts",
-      responses: { 200: jsonResponse("Saved scripts returned.", listSchema), 401: jsonResponse("Sign-in required.", unauthorizedSchema) },
+      tags: ["Workflows"], summary: "List accessible Workflows",
+      description: "Lists every Workflow the calling member can reach through Plugin or direct grants, each with the Plugin it executes under, its latest immutable version id, declared inputSchema and outputSchema, and the capabilities it calls. Workflows whose latest version cannot be parsed are omitted. Use the returned configObjectVersionId to run an exact version.",
+      responses: { 200: jsonResponse("Workflows returned.", listSchema), 401: jsonResponse("Sign-in required.", unauthorizedSchema) },
     }),
     orgMemberRoute(),
     async (c) => {
-      const { context, member, codemodeEnabled } = await contextFor(c)
-      if (!codemodeEnabled) return c.json({ items: [] })
-      return c.json({ items: await listAccessibleSavedCodemodeScripts({ organizationId: context.organization.id, member }) })
+      const { context, member } = await contextFor(c)
+      return c.json({ items: await listAccessibleWorkflows({ organizationId: context.organization.id, member }) })
     },
   )
 
   app.post(
-    "/v1/codemode-scripts",
+    "/v1/workflows",
     describeRoute({
-      operationId: saveProgramOperationId,
-      tags: ["Codemode Runs"], summary: "Save a successful Code Mode run as a Program inside an OpenWork Connect Plugin",
+      operationId: saveWorkflowOperationId,
+      tags: ["Workflows"], summary: "Save a successful Code Mode run as a Workflow inside an OpenWork Connect Plugin",
+      description: "Saves a successful authoring run as a reusable Workflow. Supply code or receiptId, or both with byte-identical source. Explicit receiptId requires a successful run from this caller in this organization within 15 minutes, retained source (encrypted shared storage when Redis is configured; process-local otherwise), and exactly matching tested input and schema digests; missing retention fails closed (400 workflow_authoring_receipt_required). Live receipts forbid currentInput, validate with their server-generated runtime, and never save runtime day bounds as example input. Without receiptId, the existing byte-exact recent successful code lookup applies (400 workflow_recent_receipt_required). Literal credentials in source are rejected, not sanitized. The run's tool calls become requiredCapabilities and must still be available. Saving creates no artifact snapshot linkage. Omit pluginId for the private My Workflows Plugin; a chosen Plugin requires editor access. Replacing a same-name Workflow requires manager access.",
       responses: {
-        201: jsonResponse("Program saved.", savedSchema),
+        201: jsonResponse("Workflow saved.", savedSchema),
         400: jsonResponse("Invalid request.", invalidRequestSchema),
-        403: jsonResponse("The caller cannot add Programs to this Plugin.", forbiddenSchema),
+        403: jsonResponse("The caller cannot add Workflows to this Plugin.", forbiddenSchema),
         404: jsonResponse("Plugin not found.", notFoundSchema),
       },
     }),
     orgMemberRoute(), jsonValidator(saveSchema),
     async (c) => {
       try {
-        const { context, actorContext, buildTools, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) throw new Error("codemode_scripts_disabled")
-        const saved = await saveCodemodeScript({
+        const { context, actorContext, buildTools } = await contextFor(c)
+        const body = c.req.valid("json")
+        const saved = await saveWorkflow({
           organizationId: context.organization.id,
           ownerMemberId: context.currentMember.id,
-          script: c.req.valid("json"),
+          workflow: {
+            ...body,
+            ...(body.receiptId !== undefined || body.currentInput === undefined ? {} : { currentInput: normalizeToolBody(body.currentInput) }),
+          },
           buildTools,
           context: actorContext,
         })
@@ -244,52 +314,24 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
   )
 
   app.get(
-    "/v1/codemode-scripts/:configObjectId",
+    "/v1/workflows/:configObjectId",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "Inspect a saved Script and its artifact lifecycle",
-      responses: {
-        200: jsonResponse("Saved Script returned.", savedScriptDetailSchema),
-        404: jsonResponse("Saved Script not found.", notFoundSchema),
-      },
+      tags: ["Workflows"], summary: "Inspect a Workflow",
+      description: "Returns the Workflow's library entry (caller role, connection readiness, result freshness, view state, Automation count), its detail (current and past versions, latest snapshot, latest successful snapshot), and the generated Artifact views bound to it. maxAgeMs (60 seconds to 30 days, default 24 hours) is the threshold that classifies the latest result as fresh or stale. Version code and example input are redacted for members without manager access; when generated Artifact views are disabled for the deployment, views is empty and viewState is default.",
+      responses: { 200: jsonResponse("Workflow returned.", workflowLibraryDetailSchema), 404: jsonResponse("Workflow not found.", notFoundSchema) },
     }),
     orgMemberRoute(), queryValidator(detailQuerySchema),
     async (c) => {
       const params = detailParamsSchema.safeParse(c.req.param())
-      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Script id." }, 400)
+      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Workflow id." }, 400)
       try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) return c.json({ error: "saved_script_not_found" }, 404)
-        return c.json(await getCodemodeScriptDetail({
-          context: actorContext,
-          configObjectId: params.data.configObjectId,
-          maxAgeMs: c.req.valid("query").maxAgeMs,
-        }))
-      } catch (error) {
-        const failure = routeFailure(error)
-        return c.json(failure.body, failure.status)
-      }
-    },
-  )
-
-  app.get(
-    "/v1/programs/:configObjectId",
-    describeRoute({
-      tags: ["Codemode Runs"], summary: "Inspect a Program",
-      responses: { 200: jsonResponse("Program returned.", programDetailSchema), 404: jsonResponse("Program not found.", notFoundSchema) },
-    }),
-    orgMemberRoute(),
-    async (c) => {
-      const params = detailParamsSchema.safeParse(c.req.param())
-      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Program id." }, 400)
-      try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) return c.json({ error: "program_not_found" }, 404)
-        const detail = await getProgramDetail({ context: actorContext, configObjectId: params.data.configObjectId })
+        const { actorContext } = await contextFor(c)
+        const detail = await getWorkflowLibraryDetail({ context: actorContext, configObjectId: params.data.configObjectId, maxAgeMs: c.req.valid("query").maxAgeMs })
         return c.json(env.generatedArtifactViewsEnabled
           ? detail
           : {
               ...detail,
-              program: { ...detail.program, viewState: "default" as const, activeViewTitle: null },
+              workflow: { ...detail.workflow, viewState: "default" as const, activeViewTitle: null },
               views: [],
             })
       } catch (error) {
@@ -300,18 +342,143 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
   )
 
   app.get(
-    "/v1/programs/:configObjectId/views",
+    "/v1/apps",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "List generated Artifact views for a Program",
-      responses: { 200: jsonResponse("Artifact views returned.", artifactViewsResponseSchema) },
+      tags: ["Apps"], summary: "List saved reusable apps",
+      description: "Lists active Artifact views that have a saved revision and whose Workflow the caller can read, newest first, each with the Workflow title, whether the caller can manage it, and whether it is on the caller's personal dashboard. When generated Artifact views are disabled for the deployment, returns enabled: false and an empty list.",
+      responses: {
+        200: jsonResponse("Saved apps returned.", z.object({ enabled: z.boolean(), sharingEnabled: z.boolean(), items: z.array(savedAppSummarySchema) })),
+      },
+    }),
+    orgMemberRoute(),
+    async (c) => {
+      if (!env.generatedArtifactViewsEnabled) return c.json({ enabled: false, sharingEnabled: false, items: [] })
+      try {
+        const { actorContext } = await contextFor(c)
+        return c.json({ enabled: true, sharingEnabled: true, items: await listSavedApps(actorContext) })
+      } catch (error) {
+        const failure = appRouteFailure(error)
+        return c.json(failure.body, failure.status)
+      }
+    },
+  )
+
+  app.post(
+    "/v1/apps/:appId/share",
+    describeRoute({
+      tags: ["Apps"], summary: "Share a saved app with a teammate",
+      description: "Grants the teammate identified by email viewer access to the app's underlying Workflow and places the app on their personal dashboard; result data is never copied. An existing editor or manager grant for that teammate is kept, so repeated shares never downgrade access. Requires manager access to the Workflow and an app with an active saved revision; fails with teammate_not_found when no active member of the organization has that email.",
+      responses: {
+        200: jsonResponse("App shared to the teammate's dashboard.", z.object({ ok: z.literal(true) })),
+        403: jsonResponse("Only app managers can share.", forbiddenSchema),
+        404: jsonResponse("App or teammate not found.", notFoundSchema),
+      },
+    }),
+    orgMemberRoute(),
+    jsonValidator(z.object({ email: z.string().trim().email().max(320) })),
+    async (c) => {
+      if (!env.generatedArtifactViewsEnabled) return c.json({ error: "artifact_view_not_found" }, 404)
+      try {
+        const { actorContext } = await contextFor(c)
+        await shareSavedApp(actorContext, c.req.param("appId"), c.req.valid("json").email)
+        return c.json({ ok: true })
+      } catch (error) {
+        const failure = appRouteFailure(error)
+        return c.json(failure.body, failure.status)
+      }
+    },
+  )
+
+  app.get(
+    "/v1/apps/:appId",
+    describeRoute({
+      tags: ["Apps"], summary: "Open an app or an exact draft preview",
+      description: "Returns the app with the compiled HTML of one revision and the artifact payload it should render. Without revisionId the active saved revision is used; pass revisionId to preview an exact draft revision instead. Live apps execute the current saved Workflow as the caller with optional IANA timeZone (UTC by default); receiptId is forbidden for live apps. Legacy snapshots use only the caller's receipts. When the revision has not finished building, no readable successful result exists, or the result's output schema no longer matches the revision, html and payload are null and previewNotice explains why.",
+      responses: {
+        200: jsonResponse("App preview returned.", savedAppDetailSchema),
+      },
+    }),
+    orgMemberRoute(),
+    queryValidator(artifactRunInputSchema.extend({ revisionId: z.string().trim().min(1).max(160).optional(), receiptId: z.string().trim().min(1).max(160).optional() })),
+    async (c) => {
+      if (!env.generatedArtifactViewsEnabled) return c.json({ error: "artifact_view_not_found" }, 404)
+      try {
+        const { actorContext, buildTools, describeUnavailable } = await contextFor(c)
+        c.header("Cache-Control", "private, no-store")
+        return c.json(await getSavedApp({ context: actorContext, buildTools, describeUnavailable, appId: c.req.param("appId"), ...c.req.valid("query") }))
+      } catch (error) {
+        const failure = appRouteFailure(error)
+        return c.json(failure.body, failure.status)
+      }
+    },
+  )
+
+  app.post(
+    "/v1/apps/:appId/dashboard",
+    describeRoute({
+      tags: ["Apps"], summary: "Add or remove an app on your personal dashboard",
+      description: "Adds (added: true) or removes (added: false) the app on the calling member's personal dashboard. Adding requires an app with an active saved revision that the caller can read; removal also works after access to the app has been revoked. Both directions are idempotent.",
+      responses: {
+        200: jsonResponse("Dashboard updated.", z.object({ ok: z.literal(true) })),
+      },
+    }),
+    orgMemberRoute(), jsonValidator(z.object({ added: z.boolean() })),
+    async (c) => {
+      if (!env.generatedArtifactViewsEnabled) return c.json({ error: "artifact_view_not_found" }, 404)
+      try {
+        const { actorContext } = await contextFor(c)
+        await setAppOnDashboard(actorContext, c.req.param("appId"), c.req.valid("json").added)
+        return c.json({ ok: true })
+      } catch (error) {
+        const failure = appRouteFailure(error)
+        return c.json(failure.body, failure.status)
+      }
+    },
+  )
+
+  app.post(
+    "/v1/apps/:appId/save",
+    describeRoute({
+      tags: ["Apps"], summary: "Save an exact app revision for reuse",
+      description: "Activates the exact revisionId as the app's saved revision, sets its title and useInWorkflow flag, and places the app on the caller's dashboard in one transaction. Requires manager access to the Workflow; the revision must have finished building (artifact_view_revision_not_ready) and its output schema must match the Workflow's current version (artifact_view_schema_incompatible). expectedActiveRevisionId must equal the revision that is active right now (null when none); otherwise the save is refused with 409 app_changed_since_preview so a stale preview cannot overwrite a newer save.",
+      responses: {
+        200: jsonResponse("App saved.", generatedArtifactViewSchema),
+      },
+    }),
+    orgMemberRoute(),
+    jsonValidator(saveAppSchema),
+    async (c) => {
+      if (!env.generatedArtifactViewsEnabled) return c.json({ error: "artifact_view_not_found" }, 404)
+      try {
+        const { actorContext } = await contextFor(c)
+        const { revisionId, ...save } = c.req.valid("json")
+        return c.json(await activateArtifactViewRevision({ context: actorContext, artifactViewId: c.req.param("appId"), revisionId, save }))
+      } catch (error) {
+        const failure = appRouteFailure(error)
+        return c.json(failure.body, failure.status)
+      }
+    },
+  )
+
+  app.get(
+    "/v1/workflows/:configObjectId/views",
+    describeRoute({
+      tags: ["Workflows"], summary: "List generated Artifact views for a Workflow",
+      description: "Lists the generated Artifact views bound to this Workflow, newest first, each with its recent revisions and their build status. Requires read access to the Workflow. Returns an empty list when generated Artifact views are disabled for the deployment.",
+      responses: {
+        200: jsonResponse("Artifact views returned.", artifactViewsResponseSchema),
+        400: jsonResponse("Invalid Workflow id.", invalidRequestSchema),
+        401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        404: jsonResponse("Workflow not found.", notFoundSchema),
+      },
     }),
     orgMemberRoute(),
     async (c) => {
       const params = detailParamsSchema.safeParse(c.req.param())
-      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Program id." }, 400)
+      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Workflow id." }, 400)
       try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled || !env.generatedArtifactViewsEnabled) return c.json({ items: [] })
+        const { actorContext } = await contextFor(c)
+        if (!env.generatedArtifactViewsEnabled) return c.json({ items: [] })
         return c.json({ items: await listArtifactViewsForScript({ context: actorContext, configObjectId: params.data.configObjectId }) })
       } catch (error) {
         const failure = routeFailure(error)
@@ -324,7 +491,13 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
     "/v1/artifact-views/:artifactViewId/revisions/:revisionId/activate",
     describeRoute({
       tags: ["Codemode Runs"], summary: "Activate or roll back an immutable Artifact view revision",
-      responses: { 200: jsonResponse("Artifact view activated.", generatedArtifactViewSchema) },
+      description: "Makes revisionId the active revision of the Artifact view and marks the view active; selecting an older revision performs a rollback without changing its bytes. The revision must have built successfully and not be retired (artifact_view_revision_not_ready), and its output schema digest must match the Workflow's current version (artifact_view_schema_incompatible). Requires manager access to the Workflow.",
+      responses: {
+        200: jsonResponse("Artifact view activated.", generatedArtifactViewSchema),
+        400: jsonResponse("Invalid view revision.", invalidRequestSchema),
+        401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        404: jsonResponse("Artifact view or revision not found, or generated Artifact views are disabled.", notFoundSchema),
+      },
     }),
     orgMemberRoute(),
     async (c) => {
@@ -332,8 +505,7 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
       const params = artifactViewParamsSchema.safeParse(c.req.param())
       if (!params.success || !params.data.revisionId) return c.json({ error: "invalid_request", message: "Invalid view revision." }, 400)
       try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) throw new Error("codemode_scripts_disabled")
+        const { actorContext } = await contextFor(c)
         return c.json(await activateArtifactViewRevision({ context: actorContext, artifactViewId: params.data.artifactViewId, revisionId: params.data.revisionId }))
       } catch (error) {
         const failure = routeFailure(error)
@@ -346,7 +518,13 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
     "/v1/artifact-views/:artifactViewId/retire",
     describeRoute({
       tags: ["Codemode Runs"], summary: "Retire a generated Artifact view",
-      responses: { 200: jsonResponse("Artifact view retired.", generatedArtifactViewSchema) },
+      description: "Retires the Artifact view: its status becomes retired, it loses its active revision and useInWorkflow flag, and it is removed from every member's dashboard. Immutable revisions are kept, so activating one later restores the view. Requires manager access to the Workflow.",
+      responses: {
+        200: jsonResponse("Artifact view retired.", generatedArtifactViewSchema),
+        400: jsonResponse("Invalid view.", invalidRequestSchema),
+        401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        404: jsonResponse("Artifact view not found, or generated Artifact views are disabled.", notFoundSchema),
+      },
     }),
     orgMemberRoute(),
     async (c) => {
@@ -354,8 +532,7 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
       const params = artifactViewParamsSchema.safeParse(c.req.param())
       if (!params.success) return c.json({ error: "invalid_request", message: "Invalid view." }, 400)
       try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) throw new Error("codemode_scripts_disabled")
+        const { actorContext } = await contextFor(c)
         return c.json(await retireArtifactView({ context: actorContext, artifactViewId: params.data.artifactViewId }))
       } catch (error) {
         const failure = routeFailure(error)
@@ -365,56 +542,24 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
   )
 
   app.get(
-    "/v1/me/program-selection",
-    describeRoute({ tags: ["Codemode Runs"], summary: "Get my selected Program", responses: { 200: jsonResponse("Program selection returned.", programSelectionResponseSchema) } }),
-    orgMemberRoute(),
-    async (c) => {
-      const { actorContext, codemodeEnabled } = await contextFor(c)
-      return c.json({ selection: codemodeEnabled ? await getProgramAgentSelection(actorContext) : null })
-    },
-  )
-
-  app.put(
-    "/v1/me/program-selection",
-    describeRoute({ tags: ["Codemode Runs"], summary: "Select a Program for MCP", responses: { 200: jsonResponse("Program selected.", programSelectionResponseSchema) } }),
-    orgMemberRoute(), jsonValidator(programSelectionWriteSchema),
-    async (c) => {
-      try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) throw new Error("codemode_scripts_disabled")
-        return c.json({ selection: await selectProgramForAgent({ context: actorContext, programId: c.req.valid("json").programId }) })
-      } catch (error) {
-        const failure = routeFailure(error)
-        return c.json(failure.body, failure.status)
-      }
-    },
-  )
-
-  app.delete(
-    "/v1/me/program-selection",
-    describeRoute({ tags: ["Codemode Runs"], summary: "Clear my selected Program", responses: { 200: jsonResponse("Program selection cleared.", programSelectionResponseSchema) } }),
-    orgMemberRoute(),
-    async (c) => {
-      const { actorContext } = await contextFor(c)
-      await clearProgramAgentSelection(actorContext)
-      return c.json({ selection: null })
-    },
-  )
-
-  app.get(
-    "/v1/codemode-scripts/:configObjectId/versions",
+    "/v1/workflows/:configObjectId/versions",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "List immutable saved Script versions",
-      responses: { 200: jsonResponse("Script versions returned.", versionsResponseSchema) },
+      tags: ["Workflows"], summary: "List immutable Workflow versions",
+      description: "Lists the Workflow's immutable versions, newest first, each with its code, call graph, schemas, requiredCapabilities, digests, and the caller's own Automations that pin it. Code, example input, and source-derived graph labels are redacted for members without manager access. Requires read access to the Workflow.",
+      responses: {
+        200: jsonResponse("Workflow versions returned.", versionsResponseSchema),
+        400: jsonResponse("Invalid Workflow id.", invalidRequestSchema),
+        401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        404: jsonResponse("Workflow not found.", notFoundSchema),
+      },
     }),
     orgMemberRoute(),
     async (c) => {
       const params = detailParamsSchema.safeParse(c.req.param())
-      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Script id." }, 400)
+      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Workflow id." }, 400)
       try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) return c.json({ items: [] })
-        return c.json({ items: await listCodemodeScriptVersions({ context: actorContext, configObjectId: params.data.configObjectId }) })
+        const { actorContext } = await contextFor(c)
+        return c.json({ items: await listWorkflowVersions({ context: actorContext, configObjectId: params.data.configObjectId }) })
       } catch (error) {
         const failure = routeFailure(error)
         return c.json(failure.body, failure.status)
@@ -423,23 +568,31 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
   )
 
   app.get(
-    "/v1/codemode-scripts/:configObjectId/snapshots",
+    "/v1/workflows/:configObjectId/snapshots",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "List saved Script artifact snapshots",
-      responses: { 200: jsonResponse("Artifact snapshots returned.", snapshotsResponseSchema) },
+      tags: ["Workflows"], summary: "List Workflow artifact snapshots",
+      description: "Lists run receipts of saved versions of this Workflow, most recently finished first, including failed runs and runs whose content was deleted (value and markdown are null and contentDeletedAt is set). Draft test runs are not snapshots and never appear here. limit caps the result at 1 to 200 rows (default 100). "
+        + "Pass nextCursor from the previous page as cursor to continue; nextCursor is null on the last page. Requires read access to the Workflow.",
+      responses: {
+        200: jsonResponse("Artifact snapshots returned.", snapshotsResponseSchema),
+        400: jsonResponse("Invalid Workflow id or query.", invalidRequestSchema),
+        401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        404: jsonResponse("Workflow not found.", notFoundSchema),
+      },
     }),
     orgMemberRoute(), queryValidator(snapshotsQuerySchema),
     async (c) => {
       const params = detailParamsSchema.safeParse(c.req.param())
-      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Script id." }, 400)
+      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Workflow id." }, 400)
       try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) return c.json({ items: [] })
-        return c.json({ items: await listCodemodeScriptSnapshots({
+        const { actorContext } = await contextFor(c)
+        const query = c.req.valid("query")
+        return c.json(await listWorkflowSnapshots({
           context: actorContext,
           configObjectId: params.data.configObjectId,
-          limit: c.req.valid("query").limit,
-        }) })
+          limit: query.limit,
+          cursor: query.cursor,
+        }))
       } catch (error) {
         const failure = routeFailure(error)
         return c.json(failure.body, failure.status)
@@ -448,11 +601,12 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
   )
 
   app.get(
-    "/v1/codemode-scripts/:configObjectId/snapshots/:receiptId",
+    "/v1/workflows/:configObjectId/snapshots/:receiptId",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "Inspect one saved Script artifact snapshot",
+      tags: ["Workflows"], summary: "Inspect one Workflow artifact snapshot",
+      description: "Returns one run receipt of a saved version of this Workflow: the validated result value, its Markdown rendering, code and schema digests, tool calls, status, error details, and whether it was produced by an Automation. value and markdown are null once the content has been deleted. Requires read access to the Workflow; receiptId must belong to this Workflow.",
       responses: {
-        200: jsonResponse("Artifact snapshot returned.", savedScriptArtifactSnapshotSchema),
+        200: jsonResponse("Artifact snapshot returned.", workflowArtifactSnapshotSchema),
         404: jsonResponse("Artifact snapshot not found.", notFoundSchema),
       },
     }),
@@ -461,14 +615,13 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
       const params = detailParamsSchema.safeParse(c.req.param())
       if (!params.success || !params.data.receiptId) return c.json({ error: "invalid_request", message: "Invalid snapshot id." }, 400)
       try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) return c.json({ error: "saved_script_snapshot_not_found" }, 404)
-        const snapshot = await getCodemodeScriptSnapshot({
+        const { actorContext } = await contextFor(c)
+        const snapshot = await getWorkflowSnapshot({
           context: actorContext,
           configObjectId: params.data.configObjectId,
           receiptId: params.data.receiptId,
         })
-        return snapshot ? c.json(snapshot) : c.json({ error: "saved_script_snapshot_not_found" }, 404)
+        return snapshot ? c.json(snapshot) : c.json({ error: "workflow_snapshot_not_found" }, 404)
       } catch (error) {
         const failure = routeFailure(error)
         return c.json(failure.body, failure.status)
@@ -477,19 +630,19 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
   )
 
   app.post(
-    "/v1/codemode-scripts/test",
+    "/v1/workflows/test",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "Test the exact saved Script draft and return the receiptId required to create that unchanged version",
-      responses: { 200: jsonResponse("Script draft tested.", savedScriptTestResultSchema), 400: jsonResponse("Test rejected.", invalidRequestSchema) },
+      tags: ["Workflows"], summary: "Test the exact Workflow draft and return the receiptId required to create that unchanged version",
+      description: "Executes the draft code once with exampleInput against the caller's live tools, validating the input against inputSchema and the result against outputSchema, and records a durable test receipt. The returned receiptId is the proof required by POST /v1/workflows/{configObjectId}/versions and is only accepted when every draft field is resubmitted unchanged within 15 minutes. Requires manager access to the Workflow; a script failure, argument mismatch, or result mismatch is returned as a 400 with the error code and message.",
+      responses: { 200: jsonResponse("Workflow draft tested.", workflowTestResultSchema), 400: jsonResponse("Test rejected.", invalidRequestSchema) },
     }),
     orgMemberRoute(), jsonValidator(testSchema),
     async (c) => {
       try {
-        const { actorContext, buildTools, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) throw new Error("codemode_scripts_disabled")
+        const { actorContext, buildTools } = await contextFor(c)
         const body = c.req.valid("json")
         const { configObjectId, ...draft } = body
-        const result = await testCodemodeScriptDraft({ context: actorContext, configObjectId, draft, buildTools })
+        const result = await testWorkflowDraft({ context: actorContext, configObjectId, draft, buildTools })
         if (!result.ok) return c.json({ error: result.error, message: result.message }, 400)
         return c.json({
           receiptId: result.receiptId,
@@ -511,21 +664,21 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
   )
 
   app.post(
-    "/v1/codemode-scripts/:configObjectId/versions",
+    "/v1/workflows/:configObjectId/versions",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "Create an immutable saved Script version using the immediately preceding matching test receipt and unchanged draft",
-      responses: { 201: jsonResponse("Script version created.", savedScriptDetailSchema), 400: jsonResponse("Version rejected.", invalidRequestSchema) },
+      tags: ["Workflows"], summary: "Create an immutable Workflow version using the immediately preceding matching test receipt and unchanged draft",
+      description: "Appends a new immutable version to the Workflow and updates its name and description. receiptId must reference a successful draft test by the caller that is less than 15 minutes old, has not already produced a version, and whose code, exampleInput, inputSchema, outputSchema, name, description, and requiredCapabilities all match this body byte-for-byte (400 workflow_matching_test_receipt_required). Every capability the test actually called must be listed in requiredCapabilities and still be available to the caller (400 workflow_capability_unavailable). Requires manager access to the Workflow.",
+      responses: { 201: jsonResponse("Workflow version created.", workflowDetailSchema), 400: jsonResponse("Version rejected.", invalidRequestSchema) },
     }),
     orgMemberRoute(), jsonValidator(versionSchema),
     async (c) => {
       const params = detailParamsSchema.safeParse(c.req.param())
-      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Script id." }, 400)
+      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Workflow id." }, 400)
       try {
-        const { actorContext, buildTools, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) throw new Error("codemode_scripts_disabled")
+        const { actorContext, buildTools } = await contextFor(c)
         const body = c.req.valid("json")
         const { receiptId, ...draft } = body
-        return c.json(await createCodemodeScriptVersion({
+        return c.json(await createWorkflowVersion({
           context: actorContext,
           configObjectId: params.data.configObjectId,
           receiptId,
@@ -540,19 +693,20 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
   )
 
   app.post(
-    "/v1/codemode-scripts/:configObjectId/run",
+    "/v1/workflows/:configObjectId/run",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "Run an exact saved Code Mode script version",
+      tags: ["Workflows"], summary: "Run an exact Workflow version",
+      description: "Executes the version identified by configObjectVersionId of this Workflow, under the Plugin named by pluginId, with input as the script's input, using the caller's live tools, and records a snapshot receipt. For a live app, pass mode: live and optional IANA timeZone (UTC default), omitting input: the server generates input.runtime (now, today, timeZone, dayStart, dayEnd) and enforces read-only capabilities, exactly like live authoring tests and renders. After receipt-backed saveWorkflow, run this saved version in live mode before save_artifact_view; authoring test receipts alone are not saved snapshots. The input is validated against the version's inputSchema and the result against its outputSchema; a mismatch is rejected with 400 invalid_capability_arguments, a required capability that is unavailable with capability_unavailable, and a thrown script error with script_failed. The caller needs a Workflow, Plugin, or Marketplace grant that covers this Workflow; an unknown Workflow or Plugin returns unknown_capability and a missing grant returns forbidden, both as 400.",
       responses: {
-        200: jsonResponse("Script executed.", runResultSchema),
+        200: jsonResponse("Workflow executed.", runResultSchema),
         400: jsonResponse("Execution rejected.", invalidRequestSchema),
       },
     }),
     orgMemberRoute(), jsonValidator(runSchema),
     async (c) => {
       const params = runParamsSchema.safeParse(c.req.param())
-      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid script id." }, 400)
-      const { context, member, buildTools, codemodeEnabled } = await contextFor(c)
+      if (!params.success) return c.json({ error: "invalid_request", message: "Invalid Workflow id." }, 400)
+      const { context, member, buildTools } = await contextFor(c)
       const body = c.req.valid("json")
       const result = await executeMarketplaceCapability({
         organizationId: context.organization.id,
@@ -561,7 +715,7 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
         configObjectId: params.data.configObjectId,
         configObjectVersionId: body.configObjectVersionId,
         body: body.input,
-        codemodeEnabled,
+        ...(body.mode === "live" ? { liveRuntime: { timeZone: body.timeZone } } : {}),
         validateScriptOutput: true,
         buildTools,
       })
@@ -572,6 +726,10 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
       const canonical = result.result.canonicalResult ?? JSON.stringify(result.result.value)
       return c.json({
         status: "succeeded" as const,
+        executionType: "saved-workflow" as const,
+        mode: body.mode,
+        fetchedAt: new Date().toISOString(),
+        ...(body.mode === "live" ? { timeZone: body.timeZone ?? "UTC" } : {}),
         value: result.result.value,
         markdown: result.result.markdown ?? `\`\`\`json\n${canonical}\n\`\`\``,
         receiptId: result.result.receiptId,
@@ -584,28 +742,44 @@ export function registerOrgCodemodeScriptRoutes<T extends { Variables: OrgRouteV
   )
 
   app.delete(
-    "/v1/codemode-scripts/:configObjectId/snapshots/:receiptId/content",
+    "/v1/workflows/:configObjectId/snapshots/:receiptId/content",
     describeRoute({
-      tags: ["Codemode Runs"], summary: "Delete artifact content while retaining its audit receipt",
-      responses: { 200: jsonResponse("Artifact content deleted.", savedScriptArtifactSnapshotSchema) },
+      tags: ["Workflows"], summary: "Delete artifact content while retaining its audit receipt",
+      description: "Clears the stored input, result value, and Markdown of one snapshot and stamps contentDeletedAt, while the receipt itself (digests, tool calls, status, timings) stays in history. When the snapshot came from an Automation, that Automation's latest successful result is re-pointed to its newest remaining readable snapshot. Idempotent: deleting already-deleted content returns the snapshot unchanged. Requires manager access to the Workflow.",
+      responses: {
+        200: jsonResponse("Artifact content deleted.", workflowArtifactSnapshotSchema),
+        400: jsonResponse("Invalid snapshot id.", invalidRequestSchema),
+        401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        404: jsonResponse("Workflow or snapshot not found.", notFoundSchema),
+      },
     }),
     orgMemberRoute(),
     async (c) => {
       const params = detailParamsSchema.safeParse(c.req.param())
       if (!params.success || !params.data.receiptId) return c.json({ error: "invalid_request", message: "Invalid snapshot id." }, 400)
       try {
-        const { actorContext, codemodeEnabled } = await contextFor(c)
-        if (!codemodeEnabled) throw new Error("codemode_scripts_disabled")
-        const snapshot = await deleteCodemodeScriptSnapshotContent({
+        const { actorContext } = await contextFor(c)
+        const snapshot = await deleteWorkflowSnapshotContent({
           context: actorContext,
           configObjectId: params.data.configObjectId,
           receiptId: params.data.receiptId,
         })
-        return snapshot ? c.json(snapshot) : c.json({ error: "saved_script_snapshot_not_found" }, 404)
+        return snapshot ? c.json(snapshot) : c.json({ error: "workflow_snapshot_not_found" }, 404)
       } catch (error) {
         const failure = routeFailure(error)
         return c.json(failure.body, failure.status)
       }
     },
   )
+
+  const proxyWorkflowAlias = (request: Request, legacyPrefix: string) => {
+    const url = new URL(request.url)
+    url.pathname = `/v1/workflows${url.pathname.slice(legacyPrefix.length)}`
+    return app.fetch(new Request(url, request))
+  }
+
+  // TODO(workflows): remove these one-release compatibility aliases.
+  app.all("/v1/codemode-scripts", (c) => proxyWorkflowAlias(c.req.raw, "/v1/codemode-scripts"))
+  app.all("/v1/codemode-scripts/*", (c) => proxyWorkflowAlias(c.req.raw, "/v1/codemode-scripts"))
+  app.all("/v1/programs/*", (c) => proxyWorkflowAlias(c.req.raw, "/v1/programs"))
 }

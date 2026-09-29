@@ -1233,6 +1233,7 @@ describe("marketplace capabilities source", () => {
 
     for (const connectionId of [directConnectionId, validConnectionId]) {
       const result = await externalCapabilities.executeExternalCapability({
+        scopes: new Set(["mcp:read"]),
         organizationId: owner.organizationId,
         member: owner.member,
         connectionId,
@@ -1247,6 +1248,7 @@ describe("marketplace capabilities source", () => {
 
     for (const connectionId of [staleConnectionId, orphanConnectionId]) {
       const result = await externalCapabilities.executeExternalCapability({
+        scopes: new Set(["mcp:read"]),
         organizationId: owner.organizationId,
         member: owner.member,
         connectionId,
@@ -1259,6 +1261,34 @@ describe("marketplace capabilities source", () => {
       expect(result.error).toBe("forbidden")
     }
 
+  })
+
+  test("a plugin-created connection is not usable once its plugin is archived, even with a direct grant", async () => {
+    const owner = await seedMember()
+    // Org-wide direct grant, as the access editor writes it.
+    const connectionId = await seedExternalConnection({ owner, name: "Plugin Paper", url: "https://plugin-paper.example.test/mcp", authType: "none" })
+    const adminConnectionId = await seedExternalConnection({ owner, name: "Admin Paper", url: "https://admin-paper.example.test/mcp", authType: "none" })
+    const skill = await seedCapability({ owner, objectType: "skill", title: "Paper Playbook", rawSourceText: "# Paper Playbook" })
+    const mcpConfigObjectId = await addMcpRequirement({ owner, pluginId: skill.pluginId, title: "Paper MCP", servers: { paper: { url: "https://plugin-paper.example.test/mcp" } } })
+    const bindingId = await bindPluginMcpRequirement({ owner, pluginId: skill.pluginId, configObjectId: mcpConfigObjectId, serverName: "paper", connectionId })
+    await db.update(PluginMcpRequirementBindingTable).set({ connectionOwnedByPlugin: true }).where(eq(PluginMcpRequirementBindingTable.id, bindingId))
+    // An admin-created connection bound to the same plugin is never retired.
+    await bindPluginMcpRequirement({ owner, pluginId: skill.pluginId, configObjectId: mcpConfigObjectId, serverName: "paper-admin", connectionId: adminConnectionId })
+    const { listUsableExternalMcpConnections, listVisibleExternalMcpConnections, memberCanUseExternalMcpConnection } =
+      await import("../src/capability-sources/external-mcp-connections.js")
+    const scope = { organizationId: owner.organizationId, orgMembershipId: owner.memberId, teamIds: [] }
+    const usableIds = async () => (await listUsableExternalMcpConnections(scope)).map((connection) => connection.id)
+
+    expect(await usableIds()).toEqual(expect.arrayContaining([connectionId, adminConnectionId]))
+
+    await db.update(PluginTable).set({ status: "archived" }).where(eq(PluginTable.id, skill.pluginId))
+    expect(await usableIds()).not.toContain(connectionId)
+    expect(await usableIds()).toContain(adminConnectionId)
+    expect((await listVisibleExternalMcpConnections(scope)).map((connection) => connection.id)).not.toContain(connectionId)
+    expect(await memberCanUseExternalMcpConnection({ connectionId, orgMembershipId: owner.memberId, teamIds: [] })).toBe(false)
+
+    await db.update(PluginTable).set({ status: "active" }).where(eq(PluginTable.id, skill.pluginId))
+    expect(await usableIds()).toContain(connectionId)
   })
 
   test("sourced MCP grants must target their binding connection even when URLs match", async () => {
@@ -1313,6 +1343,7 @@ describe("marketplace capabilities source", () => {
       return (await listUsableExternalMcpConnections({ organizationId: owner.organizationId, orgMembershipId: owner.memberId, teamIds: [] })).map((connection) => connection.id)
     }
     const execute = (connectionId: DenTypeId<"externalMcpConnection">) => externalCapabilities.executeExternalCapability({
+      scopes: new Set(["mcp:read"]),
       organizationId: owner.organizationId,
       member: owner.member,
       connectionId,
@@ -1383,6 +1414,7 @@ describe("marketplace capabilities source", () => {
     expectYourConnectionsUrl(matches[0]?.connectionStatus?.action.url, connectionId)
 
     const executeResult = await externalCapabilities.executeExternalCapability({
+      scopes: new Set(["mcp:read"]),
       organizationId: owner.organizationId,
       member: owner.member,
       connectionId,

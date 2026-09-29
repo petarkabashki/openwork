@@ -1,21 +1,24 @@
 import { relations, sql } from "drizzle-orm"
-import { index, int, mysqlTable, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core"
+import { boolean, index, int, mysqlTable, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core"
 import { denTypeIdColumn } from "../columns"
 import { MemberTable, OrganizationTable } from "./org"
 
 export const TeamTable = mysqlTable(
   "team",
   {
+    externalKey: varchar("external_key", { length: 128 }),
     id: denTypeIdColumn("team", "id").notNull().primaryKey(),
     name: varchar("name", { length: 255 }).notNull(),
     organizationId: denTypeIdColumn("organization", "organization_id").notNull(),
     memberCount: int("member_count").notNull().default(0),
+    grantsOrganizationAdmin: boolean("grants_organization_admin").notNull().default(false),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { fsp: 3 })
       .notNull()
       .default(sql`CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)`),
   },
   (table) => [
+    uniqueIndex("team_org_external_key").on(table.organizationId, table.externalKey),
     uniqueIndex("team_organization_name").on(table.organizationId, table.name),
   ],
 )

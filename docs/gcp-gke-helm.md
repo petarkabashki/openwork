@@ -22,7 +22,7 @@ balancing, host routing, managed certificates, and backend health checks.
 
 - Den API on port `8788`
 - Den Web on port `3005`
-- optional inference service, disabled by default
+- optional OpenWork Gateway service, disabled by default (`inference.enabled`)
 - one Cloud SQL for MySQL database
 - one single-org OpenWork deployment
 - one external GKE Ingress backed by a Google Cloud Application Load Balancer
@@ -323,7 +323,7 @@ helm template openwork-ee oci://ghcr.io/different-ai/charts/openwork-ee \
   --namespace openwork-ee \
   -f values.gcp.yaml > /tmp/openwork-rendered.yaml
 
-grep -E 'DATABASE_URL|BETTER_AUTH_URL|DEN_API_PUBLIC_URL|DEN_WEB_PUBLIC_ORIGIN|EMAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_SECURE' /tmp/openwork-rendered.yaml
+grep -E 'DATABASE_URL|DEN_BASE_URL|DEN_WEB_PUBLIC_ORIGIN|EMAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_SECURE' /tmp/openwork-rendered.yaml
 ```
 
 Redact secrets before sharing rendered manifests or terminal output.
@@ -439,7 +439,7 @@ update the corresponding `config.public.*` origins in `values.gcp.yaml`, then
 run `helm upgrade` again. Do not leave production deployments on raw IPs or
 placeholder hostnames.
 
-The current chart rolls the Den API, Den Web, and inference pods automatically
+The current chart rolls the Den API, Den Web, and Gateway pods automatically
 when ConfigMap or Secret content changes. On older chart versions, manually
 restart the deployments after changing public origin values:
 

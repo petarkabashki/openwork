@@ -1,16 +1,20 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, ExternalLink, KeyRound, Trash2, Users } from "lucide-react";
+import { ArrowLeft, ArrowRightLeft, ExternalLink, KeyRound, Trash2, Users } from "lucide-react";
 import { DenButton } from "../../_components/ui/button";
+import { DenNotice } from "../../_components/ui/notice";
 import { getRequestError, requestJson } from "../../_lib/den-flow";
 import {
     getEditLlmProviderRoute,
+    getAiGatewayProviderRoute,
     getLlmProvidersRoute,
 } from "../../_lib/den-org";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
+import { migrateLlmProviderToGateway } from "./inference-provider-data";
+import { useGatewayDashboardAccess } from "./gateway-dashboard-capability-guard";
 import {
     formatProviderTimestamp,
     getProviderApiBase,
@@ -19,6 +23,7 @@ import {
     getProviderNpmPackage,
     useOrgLlmProviders,
 } from "./llm-provider-data";
+import { RuntimeEnvKeyChip, resolveRuntimeEnvKeys } from "./runtime-env-key";
 
 function formatCountLabel(count: number, singular: string, plural: string) {
     return `${count} ${count === 1 ? singular : plural}`;
@@ -39,11 +44,20 @@ export function LlmProviderDetailScreen({
     llmProviderId: string;
 }) {
     const router = useRouter();
+    const gatewayEnabled = useGatewayDashboardAccess() === "enabled";
     const { orgId, orgSlug, runReauthableAction } = useOrgDashboard();
     const { llmProviders, busy, error, reloadProviders } =
         useOrgLlmProviders(orgId);
     const [deleteBusy, setDeleteBusy] = useState(false);
     const [deleteError, setDeleteError] = useState<string | null>(null);
+    const [confirmingMigrate, setConfirmingMigrate] = useState(false);
+    const [migrateBusy, setMigrateBusy] = useState(false);
+    const [migrateError, setMigrateError] = useState<string | null>(null);
+
+    useEffect(() => {
+        setConfirmingMigrate(false);
+        setMigrateError(null);
+    }, [orgId, gatewayEnabled]);
 
     const provider = useMemo(
         () => llmProviders.find((entry) => entry.id === llmProviderId) ?? null,
@@ -92,6 +106,29 @@ export function LlmProviderDetailScreen({
         }
     }
 
+    async function moveToGateway() {
+        if (!gatewayEnabled || !provider || !provider.canManage || provider.credentialMode === "per_member") {
+            return;
+        }
+        setMigrateError(null);
+        setMigrateBusy(true);
+        try {
+            await runReauthableAction("migrate-llm-provider", async () => {
+                const gatewayProvider = await migrateLlmProviderToGateway(provider.id);
+                router.push(getAiGatewayProviderRoute(orgSlug, gatewayProvider.id));
+                router.refresh();
+            });
+        } catch (nextError) {
+            setMigrateError(
+                nextError instanceof Error
+                    ? nextError.message
+                    : "Could not move the provider to the gateway.",
+            );
+        } finally {
+            setMigrateBusy(false);
+        }
+    }
+
     if (busy && !provider) {
         return (
             <div className="mx-auto max-w-[1180px] px-6 py-8 md:px-8">
@@ -112,7 +149,12 @@ export function LlmProviderDetailScreen({
         );
     }
 
-    const envNames = getProviderEnvNames(provider.providerConfig);
+    const envKeys = resolveRuntimeEnvKeys({
+        declaredEnvNames: getProviderEnvNames(provider.providerConfig),
+        scoped: provider.source === "models_dev",
+        saved: true,
+        runtimeEnvKeys: provider.runtimeEnvKeys,
+    });
     const npmPackage = getProviderNpmPackage(provider.providerConfig);
     const apiBase = getProviderApiBase(provider.providerConfig);
     const docUrl = getProviderDocUrl(provider.providerConfig);
@@ -142,6 +184,19 @@ export function LlmProviderDetailScreen({
                 </Link>
 
                 <div className="flex flex-wrap gap-3">
+                    {gatewayEnabled && provider.canManage && provider.source === "models_dev" && provider.credentialMode !== "per_member" ? (
+                        <DenButton
+                            variant="secondary"
+                            data-testid="llm-provider-move-to-gateway"
+                            onClick={() => {
+                                setMigrateError(null);
+                                setConfirmingMigrate(true);
+                            }}
+                        >
+                            <ArrowRightLeft className="h-4 w-4" />
+                            Move to gateway
+                        </DenButton>
+                    ) : null}
                     {provider.canManage && provider.source !== "openwork" ? (
                         <>
                             <Link
@@ -167,9 +222,56 @@ export function LlmProviderDetailScreen({
                 </div>
             </div>
 
+            {gatewayEnabled && provider.source === "models_dev" && provider.credentialMode === "per_member" ? (
+                <DenNotice className="mb-6" tone="info" message="Per-member BYOK providers cannot be moved to the gateway. Their individual credentials stay unchanged. Create a separate gateway provider instead; member sign-in is supported only for Google Vertex." />
+            ) : null}
             {deleteError ? (
                 <div className="mb-6 rounded-[28px] border border-red-200 bg-red-50 px-6 py-4 text-[14px] text-red-700">
                     {deleteError}
+                </div>
+            ) : null}
+            {gatewayEnabled && migrateError ? (
+                <div className="mb-6 rounded-[28px] border border-red-200 bg-red-50 px-6 py-4 text-[14px] text-red-700">
+                    {migrateError}
+                </div>
+            ) : null}
+
+            {gatewayEnabled && confirmingMigrate ? (
+                <div
+                    className="fixed inset-0 z-50 flex items-center justify-center bg-gray-950/30 px-4"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="move-to-gateway-title"
+                >
+                    <div className="w-full max-w-md rounded-2xl border border-gray-200 bg-white p-6 shadow-xl">
+                        <h2 id="move-to-gateway-title" className="text-[18px] font-semibold text-gray-950">
+                            Move “{provider.name}” to the OpenWork gateway?
+                        </h2>
+                        <p className="mt-2 text-[13px] leading-5 text-gray-500">
+                            The saved credential moves to the OpenWork server and is no longer sent to devices.
+                            Members keep the same models and access, and call them via OpenWork Gateway with their
+                            own OpenWork key. Desktop apps re-sync automatically. This provider disappears from
+                            Bring your Own Keys.
+                            If its settings or credential cannot be converted safely, the move is refused and the original provider stays unchanged.
+                        </p>
+                        {migrateError ? (
+                            <p className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[13px] text-red-700">
+                                {migrateError}
+                            </p>
+                        ) : null}
+                        <div className="mt-6 flex justify-end gap-2">
+                            <DenButton variant="secondary" onClick={() => setConfirmingMigrate(false)}>
+                                Cancel
+                            </DenButton>
+                            <DenButton
+                                data-testid="llm-provider-move-to-gateway-confirm"
+                                loading={migrateBusy}
+                                onClick={() => void moveToGateway()}
+                            >
+                                Move to gateway
+                            </DenButton>
+                        </div>
+                    </div>
                 </div>
             ) : null}
 
@@ -227,13 +329,12 @@ export function LlmProviderDetailScreen({
                 </div>
 
                 <div className="mt-6 flex flex-wrap gap-2">
-                    {envNames.map((envName) => (
-                        <span
-                            key={envName}
-                            className="rounded-full bg-gray-100 px-3 py-1 text-[12px] font-medium text-gray-600"
-                        >
-                            {envName}
-                        </span>
+                    {envKeys.map((envKey) => (
+                        <RuntimeEnvKeyChip
+                            key={envKey.declared}
+                            envKey={envKey}
+                            className="rounded-full bg-gray-100 px-3 py-1 font-mono text-[12px] font-medium text-gray-600"
+                        />
                     ))}
                     {docUrl ? (
                         <a

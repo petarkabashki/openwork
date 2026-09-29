@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { clearEnginePoolForConfig, setEnginePoolForConfig, type EnginePool } from "./engine-pool.js";
 import { startServer } from "./server.js";
 import type { ServerConfig } from "./types.js";
 
@@ -158,6 +159,7 @@ function startFakeDen(options?: { providers?: Record<string, unknown>[] }): { ur
     fetch(request) {
       const url = new URL(request.url);
       requests.push(`${request.method} ${url.pathname}`);
+      if (request.method === "GET" && url.pathname === "/v1/me/desktop-config") return Response.json({});
       if (request.method === "GET" && url.pathname === "/v1/llm-providers") {
         return new Response(JSON.stringify({ llmProviders: providers }), { headers: { "content-type": "application/json" } });
       }
@@ -215,6 +217,127 @@ async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<b
 }
 
 describe("engine reload guard", () => {
+  test("provider sync defers pool rollover while a generation is draining", async () => {
+    previousReloadRetry = process.env.OPENWORK_ENGINE_RELOAD_RETRY_MS;
+    process.env.OPENWORK_ENGINE_RELOAD_RETRY_MS = "50";
+    const root = await createTempRoot();
+    const engine = startFakeEngine();
+    const baseUrl = `http://127.0.0.1:${engine.port}`;
+    const config = serverConfig(root, baseUrl);
+    let draining = true;
+    let rollovers = 0;
+    const fakePool = {
+      hasDrainingGeneration: () => draining,
+      requestRollover: async () => {
+        rollovers += 1;
+        return { action: "rolled_over", drainingSessions: 0 };
+      },
+      connections: () => [],
+      primaryUrl: () => baseUrl,
+      routeRequest: () => null,
+      reportRequestSuccess: () => undefined,
+      reportRequestFailure: () => undefined,
+      snapshot: () => ({ generations: [] }),
+    } as unknown as EnginePool;
+    setEnginePoolForConfig(config, fakePool);
+    stops.push(() => clearEnginePoolForConfig(config));
+    const server = await startServer(config);
+    stops.push(() => server.stop());
+    const base = `http://127.0.0.1:${server.port}`;
+    const den = startFakeDen({ providers: [guardProvider()] });
+    const put = await fetch(`${base}/den-session`, {
+      method: "PUT",
+      headers: hostHeaders(),
+      body: JSON.stringify({ baseUrl: den.url, token: "den_token", orgId: "org_test" }),
+    });
+    expect(put.status).toBe(204);
+
+    const run = await Promise.race([
+      fetch(`${base}/cloud-provider-sync/run`, {
+        method: "POST",
+        headers: hostHeaders(),
+        body: JSON.stringify({ reason: "draining" }),
+      }).then(readJsonObject),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("sync run timed out")), 5_000)),
+    ]);
+    expect(run.status === "applied" || run.status === "noop").toBe(true);
+    expect(rollovers).toBe(0);
+    const status = await readJsonObject(await fetch(`${base}/cloud-provider-sync/status`, { headers: clientHeaders() }));
+    expect(status.reloadPending).toBe(true);
+
+    draining = false;
+    expect(await waitUntil(() => rollovers === 1, 3_000)).toBe(true);
+  });
+
+  test("a forced rollover the pool did not apply keeps the reload pending and the status loud until it lands", async () => {
+    previousReloadRetry = process.env.OPENWORK_ENGINE_RELOAD_RETRY_MS;
+    process.env.OPENWORK_ENGINE_RELOAD_RETRY_MS = "50";
+    const root = await createTempRoot();
+    const engine = startFakeEngine();
+    const baseUrl = `http://127.0.0.1:${engine.port}`;
+    const config = serverConfig(root, baseUrl);
+    const rollovers: Array<{ forceStandby: boolean | undefined; reason: string }> = [];
+    let outcome: Awaited<ReturnType<EnginePool["requestRollover"]>> = { action: "skipped", reason: "unchanged" };
+    const fakePool = {
+      hasDrainingGeneration: () => false,
+      requestRollover: async (input: Parameters<EnginePool["requestRollover"]>[0]) => {
+        rollovers.push({ forceStandby: input.forceStandby, reason: input.reason });
+        return outcome;
+      },
+      connections: () => [{ generationId: "gen_fake", role: "primary", baseUrl, username: "", password: "" }],
+      primaryUrl: () => baseUrl,
+      routeRequest: () => null,
+      reportRequestSuccess: () => undefined,
+      reportRequestFailure: () => undefined,
+      snapshot: () => ({ generations: [] }),
+    } as unknown as EnginePool;
+    setEnginePoolForConfig(config, fakePool);
+    stops.push(() => clearEnginePoolForConfig(config));
+    const server = await startServer(config);
+    stops.push(() => server.stop());
+    const base = `http://127.0.0.1:${server.port}`;
+    const den = startFakeDen({ providers: [guardProvider()] });
+    const put = await fetch(`${base}/den-session`, {
+      method: "PUT",
+      headers: hostHeaders(),
+      body: JSON.stringify({ baseUrl: den.url, token: "den_token", orgId: "org_test" }),
+    });
+    expect(put.status).toBe(204);
+
+    // The pool answered "skipped" to a forced request: nothing was applied, so
+    // the sync must neither clear the owed reload nor report the pass as applied.
+    const run = await readJsonObject(await fetch(`${base}/cloud-provider-sync/run`, {
+      method: "POST",
+      headers: hostHeaders(),
+      body: JSON.stringify({ reason: "skipped_by_pool" }),
+    }));
+    expect(rollovers.length).toBeGreaterThanOrEqual(1);
+    expect(rollovers.every((entry) => entry.forceStandby === true)).toBe(true);
+    expect(run.status).toBe("failed");
+    const stuck = await readJsonObject(await fetch(`${base}/cloud-provider-sync/status`, { headers: clientHeaders() }));
+    expect(stuck.reloadPending).toBe(true);
+    const stuckLastRun = isRecord(stuck.lastRun) ? stuck.lastRun : {};
+    expect(stuckLastRun.status).toBe("failed");
+    expect(String(stuckLastRun.message ?? "")).toContain("skipped");
+
+    // The retry poll keeps asking; once a generation actually lands the owed
+    // reload clears and the status settles to a truthful applied.
+    outcome = { action: "rolled_over", generationId: "gen_next", drainingSessions: 0 };
+    const rolloversBefore = rollovers.length;
+    const settled = await (async () => {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const status = await readJsonObject(await fetch(`${base}/cloud-provider-sync/status`, { headers: clientHeaders() }));
+        const lastRun = isRecord(status.lastRun) ? status.lastRun : {};
+        if (lastRun.status === "applied" && status.reloadPending === false) return status;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return null;
+    })();
+    expect(settled).not.toBeNull();
+    expect(rollovers.length).toBeGreaterThan(rolloversBefore);
+  });
+
   test("global provider patch defers the reload while sessions are busy and applies it once idle", async () => {
     const root = await createTempRoot();
     const engine = startFakeEngine();
@@ -308,7 +431,8 @@ describe("engine reload guard", () => {
     const server = await startServer(config);
     stops.push(() => server.stop());
     const base = `http://127.0.0.1:${server.port}`;
-    const den = startFakeDen({ providers: [stableDenProvider()] });
+    const provider = stableDenProvider();
+    const den = startFakeDen({ providers: [provider] });
 
     const put = await fetch(`${base}/den-session`, {
       method: "PUT",
@@ -327,6 +451,9 @@ describe("engine reload guard", () => {
     }));
     const settledDisposes = engine.disposeCount();
     expect(settledDisposes).toBeGreaterThan(0);
+    expect(engine.requests.indexOf("PUT /auth/lpr_steady")).toBeLessThan(
+      engine.requests.indexOf("POST /instance/dispose"),
+    );
 
     // Every later pass sees byte-identical Den state. A pass that still reports
     // "applied" here is the runaway-dispose bug: on the 5-minute interval it
@@ -344,6 +471,22 @@ describe("engine reload guard", () => {
     // The credential push is fingerprint-guarded, so it must not re-deliver
     // on every pass either.
     expect(engine.requests.filter((entry) => entry === "PUT /auth/lpr_steady")).toHaveLength(1);
+
+    // A credential rotation leaves the provider config byte-identical, but
+    // the cached SDK client must still be replaced after the new auth lands.
+    provider.apiKey = "sk-steady-provider-rotated";
+    const beforeRotationDisposes = engine.disposeCount();
+    const rotated = await readJsonObject(await fetch(`${base}/cloud-provider-sync/run`, {
+      method: "POST",
+      headers: hostHeaders(),
+      body: JSON.stringify({ reason: "credential_rotated" }),
+    }));
+    expect(rotated.status).toBe("applied");
+    expect(engine.requests.filter((entry) => entry === "PUT /auth/lpr_steady")).toHaveLength(2);
+    expect(engine.disposeCount()).toBe(beforeRotationDisposes + 1);
+    expect(engine.requests.lastIndexOf("PUT /auth/lpr_steady")).toBeLessThan(
+      engine.requests.lastIndexOf("POST /instance/dispose"),
+    );
   });
 
   test("a deferred reload lands by itself once the engine idles, even with no Den session", async () => {

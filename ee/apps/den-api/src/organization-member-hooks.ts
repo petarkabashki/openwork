@@ -1,9 +1,10 @@
+import { peopleMemberCondition } from "./setup-agent-members.js"
 import { and, eq, isNull, sql } from "@openwork-ee/den-db/drizzle"
 import { MemberTable, OrganizationTable } from "@openwork-ee/den-db/schema"
 import { cache } from "./cache.js"
 import { db } from "./db.js"
 import { syncInferenceAfterMemberChange } from "./inference.js"
-import { syncInferenceSubscriptionQuantityAfterMemberChange, syncSeatSubscriptionQuantityAfterMemberChange } from "./stripe-billing.js"
+import { syncInferenceSubscriptionQuantityAfterMemberChange, syncSeatSubscriptionQuantityAfterMemberChange, syncWebSubscriptionQuantityAfterMemberChange } from "./stripe-billing.js"
 
 type OrgId = typeof OrganizationTable.$inferSelect.id
 type MemberId = typeof MemberTable.$inferSelect.id
@@ -20,16 +21,17 @@ type OrganizationMemberChangeHookInput = {
 type OrganizationMemberChangeHook = (input: OrganizationMemberChangeHookInput) => Promise<void>
 
 const organizationMemberChangeHooks: OrganizationMemberChangeHook[] = [
+  syncInferenceAfterMemberChange,
   syncSeatSubscriptionQuantityAfterMemberChange,
   syncInferenceSubscriptionQuantityAfterMemberChange,
-  syncInferenceAfterMemberChange,
+  syncWebSubscriptionQuantityAfterMemberChange,
 ]
 
 async function countOrganizationMembers(organizationId: OrgId) {
   const [row] = await db
     .select({ count: sql<number>`count(*)` })
     .from(MemberTable)
-    .where(and(eq(MemberTable.organizationId, organizationId), isNull(MemberTable.removedAt)))
+    .where(and(eq(MemberTable.organizationId, organizationId), peopleMemberCondition()))
   return Math.max(0, Number(row?.count ?? 0))
 }
 

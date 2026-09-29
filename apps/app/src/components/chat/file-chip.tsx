@@ -1,8 +1,10 @@
 "use client"
 
-import { ArrowUpRight, FileText } from "lucide-react"
+import { ArrowUpRight } from "lucide-react"
 
 import { useOpenArtifactPath } from "@/lib/artifacts"
+import { ActionContextMenu } from "@/components/ui/action-context-menu"
+import { toast } from "@/components/ui/sonner"
 import { cn } from "@/lib/utils"
 
 type FileChipProps = {
@@ -18,18 +20,32 @@ function baseName(path: string): string {
 
 /**
  * Paper "File paths → chips": never render raw absolute paths. A file
- * reference is an inline chip — icon + basename in mono, full path in
- * the tooltip. Click opens the artifact preview; ↗ opens the file in
- * the default app. Used in aggregate rows, failure reasons, and prose.
+ * reference is a quiet inline chip — basename in mono on the same soft
+ * background as inline code in chat prose (no border, no icon), full
+ * path in the tooltip. Click opens the artifact preview; the ↗ that
+ * appears on hover opens the file in the default app.
  */
 export function FileChip({ path, className }: FileChipProps) {
   const openArtifactPath = useOpenArtifactPath()
   const name = baseName(path)
 
   return (
-    <span
+    <ActionContextMenu
+      render={<span />}
+      actions={[
+        { type: "item", id: "open", label: "Open file", onSelect: () => openArtifactPath(path) },
+        { type: "item", id: "open-external", label: "Open in default app", onSelect: () => openArtifactPath(path, { external: true }) },
+        { type: "separator" },
+        { type: "item", id: "copy-path", label: "Copy path", onSelect: async () => {
+          try {
+            await navigator.clipboard.writeText(path)
+          } catch {
+            toast.error("Could not copy this path.")
+          }
+        } },
+      ]}
       className={cn(
-        "inline-flex items-stretch overflow-hidden rounded-md border border-border/70 bg-muted/50 align-middle",
+        "group/chip inline-flex items-center overflow-hidden rounded-md bg-gray-2/70 align-middle",
         className,
       )}
     >
@@ -37,9 +53,8 @@ export function FileChip({ path, className }: FileChipProps) {
         type="button"
         onClick={() => openArtifactPath(path)}
         title={path}
-        className="flex min-w-0 cursor-pointer items-center gap-1.5 px-1.5 py-0.5 transition-colors hover:bg-muted"
+        className="flex min-w-0 cursor-pointer items-center px-1.5 py-0.5 transition-colors hover:bg-gray-3/80"
       >
-        <FileText aria-hidden="true" className="size-3 shrink-0 text-muted-foreground" />
         <span className="min-w-0 truncate font-mono text-[11px] leading-4 text-foreground">
           {name}
         </span>
@@ -49,10 +64,10 @@ export function FileChip({ path, className }: FileChipProps) {
         onClick={() => openArtifactPath(path, { external: true })}
         title={`Open ${name} in default app`}
         aria-label={`Open ${name} in default app`}
-        className="flex cursor-pointer items-center border-l border-border/60 px-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        className="flex cursor-pointer items-center pr-1.5 text-muted-foreground opacity-0 transition-opacity focus-visible:opacity-100 group-hover/chip:opacity-100 hover:text-foreground"
       >
         <ArrowUpRight aria-hidden="true" className="size-2.5" />
       </button>
-    </span>
+    </ActionContextMenu>
   )
 }

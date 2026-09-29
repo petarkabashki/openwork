@@ -5,6 +5,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto"
 import type { Context, MiddlewareHandler } from "hono"
 import { getSignedCookie } from "hono/cookie"
 import { DEN_API_KEY_HEADER, getApiKeySessionById, type DenApiKeySession } from "./api-keys.js"
+import { auth } from "./auth.js"
 import { cache, type CachedAuthSession } from "./cache.js"
 import { db } from "./db.js"
 import { env } from "./env.js"
@@ -19,6 +20,11 @@ type AuthSessionValue = {
   }
 }
 type AuthSessionLike = AuthSessionValue | null
+type ApiKeyAuthResolution = {
+  apiKey: DenApiKeySession
+  user: AuthSessionValue["user"]
+  activeOrganizationId: string
+}
 type SessionRequestContext = {
   method: string
   path: string
@@ -35,6 +41,8 @@ const INTERNAL_MCP_PRINCIPAL_HEADER = "x-den-internal-mcp-principal"
 const INTERNAL_MCP_PRINCIPAL_TTL_MS = 60_000
 export const INTERNAL_CAPABILITY_CONNECTOR_HEADER = "x-den-internal-capability-connector"
 const BETTER_AUTH_SESSION_COOKIE_NAMES = [
+  "openwork-den.session_token",
+  "__Secure-openwork-den.session_token",
   "better-auth.session_token",
   "__Secure-better-auth.session_token",
   "better-auth-session_token",
@@ -238,6 +246,65 @@ function bearerSessionValue(row: CachedAuthSession): AuthSessionValue {
 
 const logger = appLogger.child({ component: "session" })
 
+function readDenApiKey(headers: Headers): string | null {
+  const apiKey = headers.get(DEN_API_KEY_HEADER)?.trim() ?? ""
+  return apiKey || null
+}
+
+async function getUserById(userId: string): Promise<AuthSessionValue["user"] | null> {
+  const rows = await db
+    .select({
+      id: AuthUserTable.id,
+      name: AuthUserTable.name,
+      email: AuthUserTable.email,
+      emailVerified: AuthUserTable.emailVerified,
+      image: AuthUserTable.image,
+      createdAt: AuthUserTable.createdAt,
+      updatedAt: AuthUserTable.updatedAt,
+    })
+    .from(AuthUserTable)
+    .where(eq(AuthUserTable.id, normalizeDenTypeId("user", userId)))
+    .limit(1)
+
+  const user = rows[0]
+  return user
+    ? {
+        ...user,
+        id: normalizeDenTypeId("user", user.id),
+      }
+    : null
+}
+
+async function getSessionFromApiKey(headers: Headers): Promise<ApiKeyAuthResolution | null> {
+  const apiKeySecret = readDenApiKey(headers)
+  if (!apiKeySecret) {
+    return null
+  }
+
+  const verified = await auth.api.verifyApiKey({
+    body: { key: apiKeySecret },
+  })
+  if (!verified.valid || !verified.key?.id) {
+    return null
+  }
+
+  const apiKey = await getApiKeySessionById(verified.key.id)
+  if (!apiKey?.metadata?.organizationId || apiKey.referenceId !== verified.key.referenceId) {
+    return null
+  }
+
+  const user = await getUserById(apiKey.referenceId)
+  if (!user) {
+    return null
+  }
+
+  return {
+    apiKey,
+    user,
+    activeOrganizationId: normalizeDenTypeId("organization", apiKey.metadata.organizationId),
+  }
+}
+
 function sessionRequestContext(context?: Context): SessionRequestContext | undefined {
   if (!context) {
     return undefined
@@ -354,28 +421,30 @@ export async function getRequestSession(headers: Headers, context?: Context): Pr
 }
 
 export function shouldSkipRequestSession(request: Request) {
-  return request.method.toUpperCase() === "POST"
-    && new URL(request.url).pathname === "/api/auth/sign-out"
-}
-
-async function getRequestApiKeySession(headers: Headers, session: AuthSessionLike): Promise<DenApiKeySession | null> {
-  if (!headers.has(DEN_API_KEY_HEADER) || !session?.session?.id) {
-    return null
-  }
-
-  return getApiKeySessionById(session.session.id)
+  const method = request.method.toUpperCase()
+  const path = new URL(request.url).pathname
+  // Browser readiness reads its signed cookie and live session directly. Polling
+  // must not renew sessions or accept a bearer in place of browser authentication.
+  return (method === "POST" && path === "/api/auth/sign-out")
+    || (method === "GET" && path === "/v1/inference-providers/oauth/browser-status")
 }
 
 export const sessionMiddleware: MiddlewareHandler<{ Variables: AuthContextVariables }> = async (c, next) => {
-  const resolved = shouldSkipRequestSession(c.req.raw)
+  const skipRequestSession = shouldSkipRequestSession(c.req.raw)
+  const apiKeyResolution = skipRequestSession
     ? null
-    : await getRequestSession(c.req.raw.headers, c)
-  const apiKey = await getRequestApiKeySession(c.req.raw.headers, resolved)
+    : await getSessionFromApiKey(c.req.raw.headers)
+  const resolved = apiKeyResolution
+    ? { user: apiKeyResolution.user, session: null }
+    : (skipRequestSession
+    ? null
+    : await getRequestSession(c.req.raw.headers, c))
   c.set("user", resolved?.user ?? null)
   c.set("session", resolved?.session ?? null)
-  if (resolved?.session?.activeOrganizationId) {
-    ;(c as unknown as { set: (key: string, value: unknown) => void }).set("activeOrganizationId", resolved.session.activeOrganizationId)
+  const activeOrganizationId = apiKeyResolution?.activeOrganizationId ?? resolved?.session?.activeOrganizationId
+  if (activeOrganizationId) {
+    ;(c as unknown as { set: (key: string, value: unknown) => void }).set("activeOrganizationId", activeOrganizationId)
   }
-  c.set("apiKey", apiKey)
+  c.set("apiKey", apiKeyResolution?.apiKey ?? null)
   await next()
 }

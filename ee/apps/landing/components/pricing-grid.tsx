@@ -2,11 +2,13 @@
 
 import {
   ArrowUpRight,
+  Clock,
   Code2,
   Download,
   FileText,
   KeyRound,
   Library,
+  Monitor,
   Plug,
   Server,
   Shield,
@@ -107,23 +109,25 @@ function PricingCardView({ card }: { card: PricingCard }) {
 export function PricingGrid(props: PricingGridProps) {
   const cards: PricingCard[] = [
     {
-      id: "solo",
-      title: "Solo",
-      price: "Free",
-      priceSub: "open source",
+      id: "free",
+      title: "Free",
+      price: "$0",
+      priceSub: "first 5 Cloud seats",
       ctaLabel: "Get Started for free",
       href: CLOUD_SIGNUP_URL,
       external: true,
       features: [
-        { text: "Open source desktop app", icon: Code2 },
-        { text: "macOS and Linux downloads", icon: Download },
+        { text: "Open source desktop app (MIT)", icon: Code2 },
+        { text: "Self-host the full platform, free for organizations up to 5 users", icon: Server },
         { text: "Bring your own keys", icon: KeyRound },
+        { text: "macOS, Windows, and Linux downloads", icon: Download },
+        { text: "Community support", icon: Plug },
       ],
-      footer: "Free forever",
+      footer: "First 5 Cloud seats free, any team size",
     },
     {
-      id: "cloud-workers",
-      title: "Team starter",
+      id: "team",
+      title: "Team",
       price: "$10",
       priceSub: "per seat / month",
       ctaLabel: "Start team plan",
@@ -131,32 +135,50 @@ export function PricingGrid(props: PricingGridProps) {
       external: true,
       badge: "Recommended",
       features: [
-        { text: "First 5 seats free", icon: Users },
-        { text: "API access", icon: Plug },
+        { text: "Everything in Free, unlimited users", icon: Users },
+        { text: "SSO / SAML", icon: Shield },
         { text: "Extension Marketplace", icon: Library },
         { text: "Bring your own LLM keys, distributed to your team", icon: KeyRound },
+        { text: "Cloud automations", icon: Clock },
+        { text: "Basic usage analytics", icon: SlidersHorizontal },
+        { text: "Standard support included", icon: Plug },
       ],
       footer: "Billed monthly. Cancel anytime.",
     },
     {
-      id: "enterprise-license",
+      id: "enterprise",
       title: "Enterprise",
-      price: "Custom pricing",
-      priceSub: "",
-      isCustomPricing: true,
+      price: "$20",
+      priceSub: "per user / month, billed annually",
       ctaLabel: "Talk to us",
       href: props.callUrl,
       external: /^https?:\/\//.test(props.callUrl),
       features: [
-        { text: "Everything in Team starter", icon: Users },
-        { text: "SSO / SAML and SCIM provisioning", icon: Shield },
-        { text: "Bring your own inference — self-hosted or private models", icon: Server },
+        { text: "Everything in Team, including SSO", icon: Users },
+        { text: "SCIM provisioning", icon: Shield },
+        { text: "Usage and adoption analytics", icon: SlidersHorizontal },
         { text: "Desktop policies and version controls", icon: SlidersHorizontal },
-        { text: "Managed deployment, self-hosted or hosted", icon: Server },
-        { text: "Custom skill development and MCP consulting", icon: Code2 },
-        { text: "Enterprise rollout support and custom commercial terms", icon: FileText },
+        { text: "Audit log and spend observability", icon: FileText },
+        { text: "Internal white-labeling — your name, logo, and branding", icon: FileText },
+        { text: "Bring your own inference — self-hosted or private models", icon: Server },
+        { text: "Standard SLA support included", icon: Plug },
       ],
-      footer: "For org-wide rollout and custom terms",
+      footer: "Same price cloud or self-hosted. Annual contract with a 60-day opt-out. Volume pricing above 250 users.",
+    },
+  ];
+
+  const addOns: Array<{ name: string; price: string; description: string; icon: typeof Download }> = [
+    {
+      name: "OpenWork Cloud Computer",
+      price: "$50 per member / month",
+      description: "A cloud computer for each member, accessible from the browser.",
+      icon: Monitor,
+    },
+    {
+      name: "OpenWork models",
+      price: "$10 per user / month",
+      description: "Managed inference — no keys to bring.",
+      icon: Code2,
     },
   ];
 
@@ -178,8 +200,48 @@ export function PricingGrid(props: PricingGridProps) {
         ))}
       </div>
 
+      <div className="grid grid-cols-1 border-l border-t border-dotted border-gray-400/50 bg-[#f6f9fc]/75 backdrop-blur-sm md:grid-cols-2">
+        {addOns.map((addOn) => {
+          const Icon = addOn.icon;
+          return (
+            <div
+              key={addOn.name}
+              className="flex items-start gap-4 border-b border-r border-dotted border-gray-400/50 p-6"
+            >
+              <Icon className="mt-0.5 h-[18px] w-[18px] shrink-0 text-gray-500" strokeWidth={1.5} />
+              <div className="flex flex-col gap-1">
+                <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                  <span className="text-[15px] font-medium tracking-tight text-gray-900">{addOn.name}</span>
+                  <span className="text-[12px] font-medium text-gray-500">{addOn.price}</span>
+                </div>
+                <p className="text-[13px] font-medium leading-snug text-gray-700">{addOn.description}</p>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
       <p className="text-center text-[12px] font-medium text-gray-500">
-        Prices exclude taxes.
+        Add-ons are available on Team and Enterprise. Prices exclude taxes. Paid plans cost the same on OpenWork Cloud
+        and self-hosted. No deployment fees.
+      </p>
+      <p className="text-center text-[12px] font-medium text-gray-500">
+        Self-hosting the control plane is free for organizations with up to 5 users (excluding Enterprise Features such as
+        SCIM, analytics, desktop policies, and white-labeling), free for development and testing, and
+        free to evaluate for 30 days at any size with all features — see the{" "}
+        <a
+          href="https://github.com/different-ai/openwork/blob/dev/ee/LICENSE"
+          rel="noreferrer"
+          target="_blank"
+          className="underline"
+        >
+          OpenWork EE License
+        </a>{" "}
+        and{" "}
+        <a href="/terms/subscription" className="underline">
+          subscription terms
+        </a>
+        .
       </p>
     </section>
   );

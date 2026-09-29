@@ -1,11 +1,20 @@
 /** @jsxImportSource react */
 import { useEffect } from "react"
-import { AUTOMATION_MODEL_ATTENTION_CAPABILITY } from "@openwork/types/automations"
+import {
+  AUTOMATION_MODEL_ATTENTION_CAPABILITY,
+  REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
+} from "@openwork/types/automations"
+import type {
+  AutomationDesktopRunnerCapability,
+  AutomationDesktopRunnerRegistration,
+} from "@openwork/types/automations"
 
 import { createDenClient, DenApiError, readDenSettings } from "@/app/lib/den"
 import { denSettingsChangedEvent } from "@/app/lib/den-session-events"
 import { isDesktopRuntime } from "@/app/utils"
 import { useDenAuth } from "@/react-app/domains/cloud/den-auth-provider"
+import { useEnterpriseActivationRequired } from "@/react-app/domains/cloud/enterprise-activation-gate"
+import { useAutomationDeploymentEnabled } from "./automation-availability"
 import { createAutomationRunnerConnectCoordinator } from "./automation-runner-connect-coordinator"
 
 const RUNNER_TOKEN_REFRESH_MS = 30 * 60_000
@@ -24,9 +33,15 @@ function resetDesktopRunnerId() {
   return desktopRunnerId()
 }
 
-/** Keeps this signed-in, preview-enabled desktop registered as the owner's Automation runner. */
-export function AutomationRunnerBridge({ enabled }: { enabled: boolean }) {
+/** Keeps this signed-in desktop registered as the owner's Automation runner when Den allows it. */
+export function AutomationRunnerBridge() {
+  if (useEnterpriseActivationRequired()) return null
+  return <ActivatedAutomationRunnerBridge />
+}
+
+function ActivatedAutomationRunnerBridge() {
   const { status } = useDenAuth()
+  const deploymentEnabled = useAutomationDeploymentEnabled()
 
   useEffect(() => {
     if (!isDesktopRuntime() || !window.__OPENWORK_ELECTRON__?.invokeDesktop) return
@@ -36,7 +51,7 @@ export function AutomationRunnerBridge({ enabled }: { enabled: boolean }) {
     const coordinator = createAutomationRunnerConnectCoordinator({
       refreshMs: RUNNER_TOKEN_REFRESH_MS,
       connect: async (isCurrent) => {
-        if (!enabled || status !== "signed_in") {
+        if (!deploymentEnabled || status !== "signed_in") {
           await disconnect()
           return
         }
@@ -54,32 +69,44 @@ export function AutomationRunnerBridge({ enabled }: { enabled: boolean }) {
           if (!isCurrent()) return
           const agent = navigator.userAgent
           const platform = /Mac/i.test(agent) ? "darwin" : /Win/i.test(agent) ? "win32" : "linux"
-          let runner: Awaited<ReturnType<typeof client.mintAutomationRunnerToken>>
-          try {
-            runner = await client.mintAutomationRunnerToken(organizationId, {
-              runnerId,
+          const mintRunner = async (id: string) => {
+            const registration = (
+              capabilities: AutomationDesktopRunnerCapability[],
+            ): AutomationDesktopRunnerRegistration => ({
+              runnerId: id,
               protocolVersion: 1,
               supportedExecutionTargets: ["desktop"],
-              capabilities: [AUTOMATION_MODEL_ATTENTION_CAPABILITY],
+              capabilities,
               appVersion: String(build?.version ?? "unknown"),
               platform,
               concurrency: 1,
             })
+            try {
+              return await client.mintAutomationRunnerToken(organizationId, registration([
+                AUTOMATION_MODEL_ATTENTION_CAPABILITY,
+                REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
+              ]))
+            } catch (error) {
+              // Older/self-hosted Den versions accept at most the original
+              // capability. Preserve existing Automation delivery until that
+              // server upgrades; it will not advertise remote-session presence.
+              if (!(error instanceof DenApiError) || error.status !== 400) throw error
+              return client.mintAutomationRunnerToken(
+                organizationId,
+                registration([AUTOMATION_MODEL_ATTENTION_CAPABILITY]),
+              )
+            }
+          }
+          let runner: Awaited<ReturnType<typeof client.mintAutomationRunnerToken>>
+          try {
+            runner = await mintRunner(runnerId)
           } catch (error) {
             if (!(error instanceof DenApiError) || error.status !== 409 || error.code !== "automation_runner_identity_conflict") {
               throw error
             }
             if (!isCurrent()) return
             runnerId = resetDesktopRunnerId()
-            runner = await client.mintAutomationRunnerToken(organizationId, {
-              runnerId,
-              protocolVersion: 1,
-              supportedExecutionTargets: ["desktop"],
-              capabilities: [AUTOMATION_MODEL_ATTENTION_CAPABILITY],
-              appVersion: String(build?.version ?? "unknown"),
-              platform,
-              concurrency: 1,
-            })
+            runner = await mintRunner(runnerId)
           }
           if (!isCurrent()) return
           await window.__OPENWORK_ELECTRON__?.invokeDesktop?.("automationRunnerConfigure", {
@@ -89,6 +116,7 @@ export function AutomationRunnerBridge({ enabled }: { enabled: boolean }) {
           })
         } catch (error) {
           if (isCurrent()) console.warn("[automation-runner] registration failed", error)
+          throw error
         }
       },
     })
@@ -96,6 +124,10 @@ export function AutomationRunnerBridge({ enabled }: { enabled: boolean }) {
     const requestConnect = () => void coordinator.request().catch(() => undefined)
     const handleSettingsChanged = () => requestConnect()
     window.addEventListener(denSettingsChangedEvent, handleSettingsChanged)
+    // Rejoining a network mints a fresh credential immediately instead of
+    // leaving this desktop unreachable until the next refresh, which is long
+    // enough for a scheduled occurrence to come due and be missed.
+    window.addEventListener("online", handleSettingsChanged)
     const unsubscribeCredentialRejected = window.__OPENWORK_ELECTRON__.automationRunner
       ?.onCredentialRejected?.(() => coordinator.credentialRejected())
     requestConnect()
@@ -103,9 +135,10 @@ export function AutomationRunnerBridge({ enabled }: { enabled: boolean }) {
       coordinator.dispose()
       unsubscribeCredentialRejected?.()
       window.removeEventListener(denSettingsChangedEvent, handleSettingsChanged)
+      window.removeEventListener("online", handleSettingsChanged)
       void disconnect()
     }
-  }, [enabled, status])
+  }, [deploymentEnabled, status])
 
   return null
 }

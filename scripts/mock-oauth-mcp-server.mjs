@@ -8,17 +8,40 @@ const issuer = process.env.ISSUER || `http://${host}:${port}`;
 const extraToolCount = Number(process.env.MOCK_EXTRA_TOOL_COUNT || 0);
 const autoApprove = process.env.AUTO_APPROVE !== "0";
 const disableDcr = process.env.DISABLE_DCR === "1";
+const rejectDcrRedirectUris = process.env.MOCK_REJECT_DCR_REDIRECT_URIS || "";
 const strictOAuth = process.argv.includes("--strict") || process.env.STRICT_OAUTH === "1";
 // Strict mode rejects refresh tokens this instance did not issue (and
 // rotates on every refresh grant). Off by default: eval flows restart the
 // mock mid-scenario and legitimately present pre-restart refresh tokens.
-const strictRefreshTokens = process.env.STRICT_REFRESH_TOKENS === "1";
+let strictRefreshTokens = process.env.STRICT_REFRESH_TOKENS === "1";
 const mockClientId = process.env.MOCK_CLIENT_ID || "mock-preregistered-client";
 const mockClientSecret = process.env.MOCK_CLIENT_SECRET || "mock-preregistered-secret";
 const preregisteredRedirectUris = (process.env.MOCK_REDIRECT_URIS || "")
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
+// Clients whose token requests fail the way a provider rejects a client whose
+// configured authentication does not match its registration. An entry is a
+// client id, or "id:secret" to reject only when that exact secret is presented
+// (so a request that lost the secret is observable). "@dynamic" rejects every
+// client this mock registered dynamically.
+const rejectedTokenClients = (process.env.MOCK_REJECT_TOKEN_CLIENT_IDS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean)
+  .map((entry) => {
+    const separator = entry.indexOf(":");
+    return separator === -1
+      ? { clientId: entry, clientSecret: null }
+      : { clientId: entry.slice(0, separator), clientSecret: entry.slice(separator + 1) };
+  });
+
+function rejectsTokenClient(clientId, clientSecret) {
+  return rejectedTokenClients.some((entry) => (
+    (entry.clientId === "@dynamic" && clients.has(clientId))
+    || (entry.clientId === clientId && (entry.clientSecret === null || entry.clientSecret === clientSecret))
+  ));
+}
 const advertisedScopes = ["mcp:read", "mcp:write"];
 const extraToolName = (process.env.MOCK_EXTRA_TOOL_NAME || "").trim();
 const extraToolTitle = (process.env.MOCK_EXTRA_TOOL_TITLE || extraToolName).trim();
@@ -32,6 +55,9 @@ const errorToolMode = (process.env.MOCK_ERROR_TOOL_MODE || "result").trim();
 const errorToolConnectUrl = (process.env.MOCK_ERROR_TOOL_CONNECT_URL || "https://connect.example.test/salesforce/start").trim();
 const errorToolProvider = (process.env.MOCK_ERROR_TOOL_PROVIDER || "salesforce").trim();
 const allowUnauthenticatedMcp = process.env.MOCK_ALLOW_UNAUTHENTICATED_MCP === "1";
+// An app-visible MCP App launch tool (`_meta.ui.resourceUri`), so dashboard
+// and MCP App specs can witness App catalogs without a real provider.
+const appToolName = (process.env.MOCK_APP_TOOL_NAME || "").trim();
 const syntheticTools = Array.from({ length: extraToolCount }, (_, index) => {
   const i = index + 1;
   return {
@@ -45,8 +71,19 @@ const clients = new Map();
 const codes = new Map();
 const tokens = new Set();
 const refreshTokens = new Set();
+let holdRefreshResponses = false;
+let nextRefreshResponseId = 0;
+const pendingRefreshResponses = new Map();
 const requests = [];
 const drafts = [];
+let agentWorkloads = [];
+let agentRequiredHeader = null;
+const agentReplyGates = new Map();
+const AGENT_REPLY_GATE_TIMEOUT_MS = 60_000;
+let agentRepliesHeld = false;
+const heldAgentReplies = new Set();
+let configuredTools = [];
+let oauthCallback = {};
 
 const gmailThreadId = "thread-q3-launch";
 
@@ -129,6 +166,7 @@ function json(res, status, body, headers = {}) {
 function text(res, status, body, headers = {}) {
   res.writeHead(status, {
     "access-control-allow-origin": "*",
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     "content-type": "text/html; charset=utf-8",
     ...headers,
   });
@@ -155,6 +193,502 @@ function readBody(req) {
   });
 }
 
+function agentContentText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(agentContentText).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return "";
+  if (typeof value.text === "string") return value.text;
+  return agentContentText(value.content);
+}
+
+function validateAgentWorkloads(value) {
+  if (!Array.isArray(value)) throw new Error("agent workloads must be an array");
+  const markers = new Set();
+  return value.map((workload) => {
+    if (!workload || typeof workload !== "object") throw new Error("agent workload must be an object");
+    const promptMarker = typeof workload.promptMarker === "string" ? workload.promptMarker.trim() : "";
+    const finalReply = typeof workload.finalReply === "string" ? workload.finalReply : "";
+    if (!promptMarker || !finalReply || !Array.isArray(workload.steps)) {
+      throw new Error("agent workload needs promptMarker, finalReply, and a steps array");
+    }
+    if (markers.has(promptMarker)) throw new Error(`duplicate agent workload marker: ${promptMarker}`);
+    markers.add(promptMarker);
+    // Deliver the final reply as consecutive content deltas of this many
+    // characters, so a spec can watch an answer render while it streams.
+    const finalReplyChunkSize = workload.finalReplyChunkSize === undefined ? null : workload.finalReplyChunkSize;
+    if (finalReplyChunkSize !== null && (!Number.isInteger(finalReplyChunkSize) || finalReplyChunkSize < 1)) {
+      throw new Error(`agent workload ${promptMarker} finalReplyChunkSize must be a positive integer`);
+    }
+    const finalReplyChunks = workload.finalReplyChunks === undefined ? null : workload.finalReplyChunks;
+    if (finalReplyChunks !== null && (!Array.isArray(finalReplyChunks) || finalReplyChunks.length === 0
+      || finalReplyChunks.some((chunk) => typeof chunk !== "string") || finalReplyChunks.join("") !== finalReply)) {
+      throw new Error(`agent workload ${promptMarker} finalReplyChunks must concatenate to finalReply`);
+    }
+    if (finalReplyChunks !== null && finalReplyChunkSize !== null) {
+      throw new Error(`agent workload ${promptMarker} cannot set both finalReplyChunks and finalReplyChunkSize`);
+    }
+    const finalReplyInitiallyReleasedChunks = workload.finalReplyInitiallyReleasedChunks === undefined
+      ? null : workload.finalReplyInitiallyReleasedChunks;
+    const gatedChunkCount = finalReplyChunks === null ? 1 : finalReplyChunks.length;
+    if (finalReplyInitiallyReleasedChunks !== null && (!Number.isInteger(finalReplyInitiallyReleasedChunks)
+      || finalReplyInitiallyReleasedChunks < 0 || finalReplyInitiallyReleasedChunks > gatedChunkCount
+      || workload.finalReplyFrom !== undefined)) {
+      throw new Error(`agent workload ${promptMarker} gated replies require a valid initial release count`);
+    }
+    if (workload.finalReasoning !== undefined && typeof workload.finalReasoning !== "string") {
+      throw new Error(`agent workload ${promptMarker} finalReasoning must be a string`);
+    }
+    if (workload.latestUserTurn !== undefined && typeof workload.latestUserTurn !== "boolean") {
+      throw new Error(`agent workload ${promptMarker} latestUserTurn must be a boolean`);
+    }
+    if (workload.finalReplyFrom !== undefined && !["last-tool-text", "system-text"].includes(workload.finalReplyFrom)) {
+      throw new Error(`agent workload ${promptMarker} has an unknown reply source`);
+    }
+    const steps = workload.steps.map((step) => {
+      if (!step || typeof step !== "object" || typeof step.tool !== "string" || !step.tool.trim()) {
+        throw new Error(`agent workload ${promptMarker} has an invalid tool step`);
+      }
+      if (!step.arguments || typeof step.arguments !== "object" || Array.isArray(step.arguments)) {
+        throw new Error(`agent workload ${promptMarker} tool ${step.tool} needs object arguments`);
+      }
+      if (step.argumentsFrom !== undefined && !["computer-mention", "skill-catalog", "capability-search", "skill-list"].includes(step.argumentsFrom)) {
+        throw new Error(`agent workload ${promptMarker} has an unknown argument source`);
+      }
+      if (step.allowUnadvertisedTool !== undefined && typeof step.allowUnadvertisedTool !== "boolean") {
+        throw new Error(`agent workload ${promptMarker} allowUnadvertisedTool must be a boolean`);
+      }
+      return { tool: step.tool.trim(), arguments: structuredClone(step.arguments), argumentsFrom: step.argumentsFrom,
+        allowUnadvertisedTool: step.allowUnadvertisedTool === true };
+    });
+    if (workload.matchAll !== undefined && typeof workload.matchAll !== "boolean")
+      throw new Error(`agent workload ${promptMarker} matchAll must be a boolean`);
+    const finalReplyDelayMs = workload.finalReplyDelayMs ?? 0;
+    if (!Number.isInteger(finalReplyDelayMs) || finalReplyDelayMs < 0 || finalReplyDelayMs > 10000)
+      throw new Error("finalReplyDelayMs must be between 0 and 10000");
+    const rateLimitAttempts = workload.rateLimitAttempts ?? 0;
+    if (!Number.isInteger(rateLimitAttempts) || rateLimitAttempts < 0 || rateLimitAttempts > 3)
+      throw new Error("rateLimitAttempts must be between 0 and 3");
+    const serverErrorAttempts = workload.serverErrorAttempts ?? 0;
+    if (!Number.isInteger(serverErrorAttempts) || serverErrorAttempts < 0 || serverErrorAttempts > 3)
+      throw new Error("serverErrorAttempts must be between 0 and 3");
+    return { promptMarker, matchAll: workload.matchAll === true, finalReply, finalReplyFrom: workload.finalReplyFrom, finalReplyChunkSize, finalReplyChunks,
+      finalReplyInitiallyReleasedChunks, finalReplyDelayMs, finalReasoning: workload.finalReasoning, steps,
+      latestUserTurn: workload.latestUserTurn === true, rateLimitAttempts, serverErrorAttempts };
+  });
+}
+
+function finalReplyChunks(workload) {
+  if (workload.finalReplyChunks !== null) return workload.finalReplyChunks;
+  if (workload.finalReplyChunkSize === null) return [workload.finalReply];
+  const chunks = [];
+  for (let offset = 0; offset < workload.finalReply.length; offset += workload.finalReplyChunkSize) {
+    chunks.push(workload.finalReply.slice(offset, offset + workload.finalReplyChunkSize));
+  }
+  return chunks;
+}
+
+function publicAgentReplyState(state) {
+  return {
+    promptMarker: state.promptMarker,
+    releasedChunks: state.releasedChunks,
+    deliveredChunks: state.deliveredChunks,
+    totalChunks: state.totalChunks,
+    prefix: state.prefix,
+    complete: state.complete,
+    waiting: state.waiters.length,
+    aborted: state.aborted,
+    timedOut: state.timedOut,
+  };
+}
+
+function createAgentReplyGate(workload, chunks) {
+  const previous = agentReplyGates.get(workload.promptMarker);
+  if (previous && !previous.complete) throw new Error(`agent reply ${workload.promptMarker} already has an active stream`);
+  const state = {
+    promptMarker: workload.promptMarker,
+    releasedChunks: workload.finalReplyInitiallyReleasedChunks,
+    deliveredChunks: 0,
+    totalChunks: chunks.length,
+    prefix: "",
+    complete: false,
+    aborted: false,
+    timedOut: false,
+    waiters: [],
+  };
+  agentReplyGates.set(workload.promptMarker, state);
+  return state;
+}
+
+function releaseAgentReplyWaiters(gate, released) {
+  for (const waiter of gate.waiters.splice(0)) waiter(released);
+}
+
+function waitForAgentReplyRelease(gate) {
+  if (gate.aborted || gate.timedOut) return Promise.resolve(false);
+  if (gate.deliveredChunks < gate.releasedChunks) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (released) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      const index = gate.waiters.indexOf(finish);
+      if (index >= 0) gate.waiters.splice(index, 1);
+      resolve(released);
+    };
+    // A 0-chunk hold is the pause surface for a later human decision; do not
+    // invent a timeout that would look like a model error mid-proof.
+    const timer = gate.releasedChunks === 0 && gate.deliveredChunks === 0
+      ? null
+      : setTimeout(() => {
+        gate.timedOut = true;
+        finish(false);
+      }, AGENT_REPLY_GATE_TIMEOUT_MS);
+    gate.waiters.push(finish);
+  });
+}
+
+async function gatedAgentStream(res, model, workload, finalReply) {
+  const chunks = finalReplyChunks({ ...workload, finalReply });
+  const gate = createAgentReplyGate(workload, chunks);
+  res.writeHead(200, {
+    "access-control-allow-origin": "*",
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+  const abort = () => {
+    if (gate.complete) return;
+    gate.aborted = true;
+    releaseAgentReplyWaiters(gate, false);
+  };
+  res.once("close", abort);
+  res.write(`data: ${JSON.stringify(agentChunk(model, { role: "assistant" }))}\n\n`);
+  if (workload.finalReasoning) {
+    res.write(`data: ${JSON.stringify(agentChunk(model, { reasoning_content: workload.finalReasoning }))}\n\n`);
+  }
+  for (const content of chunks) {
+    while (gate.deliveredChunks >= gate.releasedChunks) {
+      if (!await waitForAgentReplyRelease(gate)) {
+        if (!res.destroyed) res.destroy();
+        return;
+      }
+    }
+    if (gate.aborted || gate.timedOut || res.writableEnded || res.destroyed) return;
+    res.write(`data: ${JSON.stringify(agentChunk(model, { content }))}\n\n`);
+    gate.deliveredChunks += 1;
+    gate.prefix += content;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  if (gate.aborted || gate.timedOut || res.writableEnded || res.destroyed) return;
+  res.write(`data: ${JSON.stringify(agentChunk(model, {}, "stop"))}\n\n`);
+  gate.complete = true;
+  res.off("close", abort);
+  res.end("data: [DONE]\n\n");
+}
+
+function offeredAgentTool(body, wanted) {
+  if (!Array.isArray(body?.tools)) return null;
+  const names = body.tools.flatMap((tool) => (
+    tool && typeof tool === "object" && typeof tool.function?.name === "string"
+      ? [tool.function.name]
+      : []
+  ));
+  return names.find((name) => name === wanted)
+    ?? names.find((name) => name.endsWith(`_${wanted}`))
+    ?? null;
+}
+
+function skillCatalogArguments(messages, skillName) {
+  // The pinned AI SDK path preserves chronological instruction updates as
+  // XML-escaped system-update blocks. Ordinary user text is not discovery.
+  const system = messages.flatMap((message) => {
+    const text = agentContentText(message);
+    if (message.role === "system") return [text];
+    const update = message.role === "user" ? text.match(/^<system-update>\n([\s\S]*)\n<\/system-update>$/) : null;
+    return update ? [update[1].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")] : [];
+  }).join("\n");
+  if (!system.includes("You are OpenWork.")) throw new Error("The model did not receive OpenWork operating instructions");
+  // Replay the native catalog protocol in order: initial snapshots, additions,
+  // replacement snapshots, and removals. Historical entries are not current.
+  const catalog = new Map();
+  for (const update of system.split(/(?=<available_skills>|The available skills have changed|New skills are available|The following skill IDs|Skill guidance is no longer available|No skills are currently available)/)) {
+    if (update.startsWith("<available_skills>") || update.startsWith("The available skills have changed")
+      || update.startsWith("Skill guidance is no longer available") || update.startsWith("No skills are currently available")) catalog.clear();
+    for (const [, entry] of update.matchAll(/<skill>([\s\S]*?)<\/skill>/g)) {
+      const id = entry.match(/<id>([^<]+)<\/id>/)?.[1];
+      const name = entry.match(/<name>([^<]+)<\/name>/)?.[1];
+      if (id && name) catalog.set(id, name);
+    }
+    const removed = update.match(/The following skill IDs are no longer available and must not be used: ([^\n]+)\./)?.[1];
+    for (const id of removed?.split(", ") ?? []) catalog.delete(id);
+  }
+  const id = [...catalog].find(([, name]) => name === skillName)?.[0];
+  return id ? { id } : null;
+
+}
+
+function agentStream(res, model, chunks, hold = false) {
+  res.writeHead(200, {
+    "access-control-allow-origin": "*",
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+  const send = () => {
+    heldAgentReplies.delete(send);
+    if (res.destroyed) return;
+    let delayMs = 150;
+    for (const chunk of hold ? chunks.slice(1) : chunks) {
+      setTimeout(() => {
+        if (!res.destroyed && !res.writableEnded) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }, delayMs);
+      delayMs += 150;
+    }
+    setTimeout(() => {
+      if (!res.destroyed && !res.writableEnded) res.end("data: [DONE]\n\n");
+    }, delayMs);
+  };
+  if (hold) {
+    res.write(`data: ${JSON.stringify(chunks[0])}\n\n`);
+    heldAgentReplies.add(send);
+    res.once("close", () => heldAgentReplies.delete(send));
+  } else {
+    send();
+  }
+}
+
+function agentChunk(model, delta, finishReason = null) {
+  return {
+    id: `chatcmpl-mock-agent-${randomUUID()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  };
+}
+
+// A deterministic model that reads the submitted message, rather than replaying
+// an expected destination or task from the fixture.
+function computerMentionArguments(messages) {
+  const message = [...messages].reverse().find((candidate) => candidate?.role === "user"
+    && agentContentText(candidate).includes("[The user selected @"));
+  const text = agentContentText(message);
+  const instruction = text.match(/\[The user selected @(?:cloud|desktop):[\s\S]*?\]/)?.[0];
+  const target = instruction?.match(/execute it with target "(cloud|desktop)"/)?.[1];
+  if (!instruction || !target) throw new Error("computer task has no routing instruction");
+  const prompt = text.replace(instruction, "")
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
+    .replace(/(^|\s)@(cloud|desktop)(?=\s|$)/g, "$1")
+    .replace(/\s+/g, " ").trim();
+  if (!prompt) throw new Error("computer task has no prompt");
+  return { name: "remote-session:create", body: { target, prompt } };
+}
+
+// Resolve execution from the result the engine actually returned to the model.
+function lastToolText(messages) {
+  const message = [...messages].reverse().find((message) => message?.role === "tool");
+  const text = agentContentText(message);
+  if (!text) throw new Error("the model received no tool result");
+  return text;
+}
+
+function capabilitySearchArguments(messages) {
+  let payload = JSON.parse(lastToolText(messages));
+  if (Array.isArray(payload.content)) payload = JSON.parse(agentContentText(payload));
+  const matches = payload.matches;
+  if (!Array.isArray(matches) || matches.length !== 1 || typeof matches[0]?.name !== "string") {
+    throw new Error("capability search did not return exactly one named match");
+  }
+  return { name: matches[0].name };
+}
+
+// list_skills handoff: the next get_skill reads the one skill the catalog returned.
+function skillListArguments(messages) {
+  let payload = JSON.parse(lastToolText(messages));
+  if (Array.isArray(payload.content)) payload = JSON.parse(agentContentText(payload));
+  const skills = payload.skills;
+  if (!Array.isArray(skills) || skills.length !== 1 || typeof skills[0]?.capability !== "string") {
+    throw new Error("skill list did not return exactly one skill with a capability");
+  }
+  return { name: skills[0].capability };
+}
+
+// Native OpenAI Responses witness for plain-text workloads. Unsupported tool
+// scripts fail explicitly instead of pretending they executed.
+async function handleAgentResponse(req, res, entry) {
+  const body = await readJson(req);
+  const text = agentContentText(body.input);
+  const matched = agentWorkloads.filter((workload) => text.includes(workload.promptMarker));
+  const model = body.model;
+  const workload = matched[0];
+  const base = { model, reasoningEffort: body.reasoning?.effort ?? null, matchedMarkers: matched.map((item) => item.promptMarker), completedTools: 0, promptMarker: workload?.promptMarker ?? null, toolName: null, arguments: {} };
+  if (agentRequiredHeader && req.headers[agentRequiredHeader.name.toLowerCase()] !== agentRequiredHeader.value) {
+    entry.agentCompletion = { ...base, kind: "error" };
+    json(res, 401, { error: { message: "provider authentication handler was bypassed" } });
+    return;
+  }
+  if (matched.length > 1 || (workload && workload.steps.length)) {
+    entry.agentCompletion = { ...base, kind: "error" };
+    json(res, 400, { error: { message: "Responses witness requires one plain-text workload" } });
+    return;
+  }
+  entry.agentCompletion = { ...base, kind: workload ? "final" : "utility" };
+  const reply = workload?.finalReply ?? "Active session workload";
+  const item = { id: `msg_${randomUUID()}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: reply, annotations: [] }] };
+  const response = { id: `resp_${randomUUID()}`, object: "response", created_at: Math.floor(Date.now() / 1000), model, status: "completed", output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } };
+  if (!body.stream) { json(res, 200, response); return; }
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+  const events = [
+    { type: "response.created", response: { ...response, status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
+    { type: "response.content_part.added", item_id: item.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+    ...Array.from({ length: 3 }, (_, index) => ({ type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: reply.slice(Math.floor(reply.length * index / 3), Math.floor(reply.length * (index + 1) / 3)) })),
+    { type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text: reply },
+    { type: "response.content_part.done", item_id: item.id, output_index: 0, content_index: 0, part: item.content[0] },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response },
+  ];
+  for (const [sequence_number, event] of events.entries()) {
+    res.write(`event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`);
+    if (event.type === "response.output_text.delta") await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  res.end();
+}
+
+async function handleAgentCompletion(req, res, entry) {
+  const body = await readJson(req);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    json(res, 400, { error: { message: "completion body must be an object" } });
+    return;
+  }
+  const model = typeof body.model === "string" ? body.model : "mock-agent-workload-model";
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const conversationText = messages.map(agentContentText).join("\n");
+  // Native v2 inserts catalog updates as user-role protocol messages. They
+  // must not replace the person's turn or reset its completed tool count.
+  const latestUserIndex = messages.findLastIndex((message) => message?.role === "user"
+    && !/^<system-update>\n[\s\S]*\n<\/system-update>$/.test(agentContentText(message)));
+  const latestUserText = latestUserIndex < 0 ? "" : agentContentText(messages[latestUserIndex]);
+  const matched = agentWorkloads.filter((workload) =>
+    workload.matchAll || (workload.latestUserTurn ? latestUserText : conversationText).includes(workload.promptMarker));
+  const matchedMarkers = matched.map((workload) => workload.promptMarker);
+  const workload = matched[0];
+  const scopedMessages = workload?.latestUserTurn ? messages.slice(latestUserIndex + 1) : messages;
+  const completedTools = scopedMessages.filter((message) => message && typeof message === "object" && message.role === "tool").length;
+  const advertisedToolNames = (Array.isArray(body.tools) ? body.tools : []).map((tool) => tool?.function?.name).filter((name) => typeof name === "string");
+  const toolResultCodes = scopedMessages.filter((message) => message?.role === "tool").map((message) => {
+    const value = typeof message.content === "string" ? message.content : JSON.stringify(message.content) ?? "";
+    return {
+      codes: [...value.matchAll(/"(?:error|code)"\s*:\s*"([a-z_]{2,80})"/g)].map(match => match[1]),
+      isError: /"isError"\s*:\s*true/.test(value),
+      hasAppMetadata: value.includes("openwork/mcpApp"),
+      hasDraftResult: value.includes("Draft ready for Test recipient"),
+    };
+  });
+  const baseRequest = { model, reasoningEffort: body.reasoning_effort ?? null, matchedMarkers, completedTools, advertisedToolNames, toolResultCodes };
+
+  if (!Array.isArray(body.tools) || body.tools.length === 0) {
+    entry.agentCompletion = { ...baseRequest, kind: "utility", promptMarker: matchedMarkers[0] ?? null, toolName: null, arguments: {} };
+    agentStream(res, model, [
+      agentChunk(model, { role: "assistant" }),
+      agentChunk(model, { content: "Active session workload" }),
+      agentChunk(model, {}, "stop"),
+    ]);
+    return;
+  }
+  if (matchedMarkers.length !== 1) {
+    entry.agentCompletion = { ...baseRequest, kind: "error", promptMarker: null, toolName: null, arguments: {} };
+    json(res, 400, { error: { message: `expected one workload marker, found ${matchedMarkers.length}` } });
+    return;
+  }
+  if (!workload) throw new Error("matched agent workload disappeared");
+  if (workload.serverErrorAttempts > 0) {
+    workload.serverErrorAttempts -= 1;
+    entry.agentCompletion = { ...baseRequest, kind: "error", promptMarker: workload.promptMarker, toolName: null, arguments: {} };
+    res.setHeader("retry-after", "5");
+    json(res, 500, { error: { message: "Internal server error", type: "server_error" } });
+    return;
+  }
+  if (workload.rateLimitAttempts > 0) {
+    workload.rateLimitAttempts -= 1;
+    entry.agentCompletion = { ...baseRequest, kind: "error", promptMarker: workload.promptMarker, toolName: null, arguments: {} };
+    res.setHeader("retry-after", "5");
+    json(res, 429, { error: { message: "Rate limited for lifecycle verification" } });
+    return;
+  }
+  if (completedTools >= workload.steps.length) {
+    if (workload.finalReplyDelayMs) await new Promise(resolve => setTimeout(resolve, workload.finalReplyDelayMs));
+    const finalReply = workload.finalReplyFrom === "last-tool-text" ? lastToolText(scopedMessages)
+      : workload.finalReplyFrom === "system-text" ? messages
+        .filter((message) => message.role === "system" || message.role === "developer")
+        .map(agentContentText).join("\n") || "No system instructions"
+      : workload.finalReply;
+    const holdEntireReply = workload.finalReplyInitiallyReleasedChunks === 0;
+    if (!holdEntireReply) {
+      entry.agentCompletion = { ...baseRequest, kind: "final", promptMarker: workload.promptMarker, toolName: null, arguments: {} };
+    }
+    if (workload.finalReplyInitiallyReleasedChunks !== null) {
+      await gatedAgentStream(res, model, workload, finalReply);
+      if (holdEntireReply) {
+        const gate = agentReplyGates.get(workload.promptMarker);
+        entry.agentCompletion = {
+          ...baseRequest,
+          kind: gate?.complete ? "final" : "error",
+          promptMarker: workload.promptMarker,
+          toolName: null,
+          arguments: {},
+        };
+      }
+    } else {
+      agentStream(res, model, [
+        agentChunk(model, { role: "assistant" }),
+        ...(workload.finalReasoning ? [agentChunk(model, { reasoning_content: workload.finalReasoning })] : []),
+        ...finalReplyChunks({ ...workload, finalReply }).map((content) => agentChunk(model, { content })),
+        agentChunk(model, {}, "stop"),
+      ], agentRepliesHeld);
+    }
+    return;
+  }
+  const step = workload.steps[completedTools];
+  const toolName = offeredAgentTool(body, step.tool) ?? (step.allowUnadvertisedTool ? step.tool : null);
+  if (!toolName) {
+    entry.agentCompletion = { ...baseRequest, kind: "error", promptMarker: workload.promptMarker, toolName: step.tool, arguments: step.arguments };
+    json(res, 400, { error: { message: `tool ${step.tool} was not offered to the mock agent` } });
+    return;
+  }
+  const toolArguments = step.argumentsFrom === "computer-mention" ? computerMentionArguments(messages)
+    : step.argumentsFrom === "skill-catalog" ? skillCatalogArguments(messages, step.arguments.skill)
+    : step.argumentsFrom === "capability-search" ? { ...step.arguments, ...capabilitySearchArguments(scopedMessages) }
+    : step.argumentsFrom === "skill-list" ? { ...step.arguments, ...skillListArguments(scopedMessages) } : step.arguments;
+  if (step.argumentsFrom === "skill-catalog" && toolArguments === null) {
+    entry.agentCompletion = { ...baseRequest, kind: "final", promptMarker: workload.promptMarker, toolName: null, arguments: {} };
+    agentStream(res, model, [agentChunk(model, { role: "assistant" }),
+      ...finalReplyChunks(workload).map(content => agentChunk(model, { content })), agentChunk(model, {}, "stop")]);
+    return;
+  }
+  const callId = `call_${workload.promptMarker.replace(/[^a-zA-Z0-9_-]/g, "_")}_${completedTools + 1}`;
+  entry.agentCompletion = {
+    ...baseRequest,
+    kind: "tool",
+    promptMarker: workload.promptMarker,
+    toolName,
+    arguments: toolArguments,
+  };
+  agentStream(res, model, [
+    agentChunk(model, { role: "assistant" }),
+    agentChunk(model, {
+      tool_calls: [{
+        index: 0,
+        id: callId,
+        type: "function",
+        function: { name: toolName, arguments: JSON.stringify(toolArguments) },
+      }],
+    }),
+    agentChunk(model, {}, "tool_calls"),
+  ]);
+}
+
 async function readJson(req) {
   const raw = await readBody(req);
   if (!raw.trim()) return {};
@@ -166,7 +700,7 @@ async function readForm(req) {
   return Object.fromEntries(new URLSearchParams(raw));
 }
 
-function record(req, url) {
+function record(req, url, res) {
   const entry = {
     id: requests.length + 1,
     method: req.method,
@@ -175,6 +709,7 @@ function record(req, url) {
     at: new Date().toISOString(),
   };
   requests.push(entry);
+  res.once("finish", () => { entry.status = res.statusCode; });
   console.log(`[mock-oauth-mcp] ${entry.method} ${entry.path}`);
   return entry;
 }
@@ -191,6 +726,7 @@ function protectedResourceMetadata() {
 function authorizationServerMetadata() {
   return {
     issuer,
+    ...(process.env.MOCK_AUTHORIZATION_RESPONSE_ISSUER === undefined ? {} : { authorization_response_iss_parameter_supported: process.env.MOCK_AUTHORIZATION_RESPONSE_ISSUER === "1" }),
     authorization_endpoint: `${issuer}/authorize`,
     token_endpoint: `${issuer}/token`,
     ...(disableDcr ? {} : { registration_endpoint: `${issuer}/register` }),
@@ -204,9 +740,11 @@ function authorizationServerMetadata() {
 
 function basicClient(req) {
   const header = req.headers.authorization || "";
-  const match = header.match(/^Basic\s+(.+)$/i);
-  if (!match) return null;
-  const decoded = Buffer.from(match[1], "base64").toString("utf8");
+  if (header.length < 7 || header.slice(0, 6).toLowerCase() !== "basic ") return null;
+  let credentialStart = 6;
+  while (header[credentialStart] === " ") credentialStart += 1;
+  if (credentialStart === header.length) return null;
+  const decoded = Buffer.from(header.slice(credentialStart), "base64").toString("utf8");
   const separator = decoded.indexOf(":");
   if (separator === -1) return { clientId: decoded, clientSecret: "" };
   return {
@@ -284,6 +822,7 @@ function redirectWithCode(res, params) {
 
   const callback = new URL(redirectUri);
   callback.searchParams.set("code", code);
+  if (process.env.MOCK_AUTHORIZATION_RESPONSE_ISSUER === "1") callback.searchParams.set("iss", issuer);
   const state = params.get("state");
   if (state) callback.searchParams.set("state", state);
 
@@ -316,7 +855,7 @@ function authorize(req, res, url) {
     <h1>Mock MCP OAuth</h1>
     <p>This fake OAuth provider is for OpenWork MCP end-to-end tests.</p>
     ${requestedScopesHtml}
-    <form method="post" action="${approveUrl.pathname}${approveUrl.search}">
+    <form method="post" action="${escapeHtml(`${approveUrl.pathname}${approveUrl.search}`)}">
       <button style="font: inherit; padding: 10px 14px;">Approve OpenWork</button>
     </form>
   </body>
@@ -341,6 +880,29 @@ async function registerClient(req, res, entry) {
       token_endpoint_auth_method: body.token_endpoint_auth_method ?? null,
     };
   }
+  if (rejectDcrRedirectUris === "invalid_redirect_uri") {
+    json(res, 400, {
+      error: "invalid_redirect_uri",
+      error_description: "The provided redirect URIs are not approved for use by this authorization server.",
+    });
+    return;
+  }
+  if (rejectDcrRedirectUris === "invalid_request") {
+    const firstRedirectUri = Array.isArray(body.redirect_uris) && typeof body.redirect_uris[0] === "string"
+      ? body.redirect_uris[0]
+      : "";
+    let redirectHost = "";
+    try {
+      redirectHost = new URL(firstRedirectUri).host;
+    } catch {
+      // The mock still returns its deterministic rejection for malformed input.
+    }
+    json(res, 400, {
+      error: "invalid_request",
+      error_description: `Invalid redirect_uri: redirect_uri host '${redirectHost}' is not in the allowed list`,
+    });
+    return;
+  }
   const clientId = `mock-client-${randomUUID()}`;
   const client = {
     client_id: clientId,
@@ -359,11 +921,38 @@ async function issueToken(req, res, entry) {
   const form = await readForm(req);
   const grantType = form.grant_type || "authorization_code";
   if (entry) entry.grantType = grantType;
+  const respond = async (status, body) => {
+    if (grantType === "refresh_token" && holdRefreshResponses) {
+      const id = ++nextRefreshResponseId;
+      await new Promise((resolve) => {
+        const release = () => {
+          clearTimeout(timer);
+          pendingRefreshResponses.delete(id);
+          if (pendingRefreshResponses.size === 0) holdRefreshResponses = false;
+          resolve();
+        };
+        const timer = setTimeout(release, 30_000);
+        pendingRefreshResponses.set(id, {
+          id, status, tokenId: createHash("sha256").update(form.refresh_token || "").digest("hex").slice(0, 16), release,
+        });
+      });
+    }
+    json(res, status, body);
+  };
   let grantedScope = "mcp:read mcp:write";
+
+  const requestedClient = basicClient(req);
+  const requestedClientId = requestedClient?.clientId || form.client_id || "";
+  const requestedClientSecret = requestedClient?.clientSecret ?? form.client_secret ?? null;
+  if (rejectsTokenClient(requestedClientId, requestedClientSecret)) {
+    json(res, 400, { error: "invalid_client", error_description: "Unsupported client authentication method" });
+    return;
+  }
 
   if (grantType === "authorization_code") {
     const grant = codes.get(form.code);
     if (!grant) {
+      entry.oauthError = "invalid_grant";
       json(res, 400, { error: "invalid_grant" });
       return;
     }
@@ -382,13 +971,19 @@ async function issueToken(req, res, entry) {
         return;
       }
     }
+    if (oauthCallback.tokenErrorDescription !== undefined) {
+      codes.delete(form.code);
+      entry.oauthError = "invalid_grant";
+      json(res, 400, { error: "invalid_grant", error_description: oauthCallback.tokenErrorDescription });
+      return;
+    }
   } else if (grantType === "refresh_token") {
     if (!requirePreregisteredTokenClient(req, res, form, null)) {
       return;
     }
     if (strictRefreshTokens) {
       if (!form.refresh_token || !refreshTokens.has(form.refresh_token)) {
-        json(res, 400, { error: "invalid_grant", error_description: "unknown refresh token" });
+        await respond(400, { error: "invalid_grant", error_description: "unknown refresh token" });
         return;
       }
       // Rotate, like real providers (and the Den) do: the old refresh token
@@ -403,10 +998,13 @@ async function issueToken(req, res, entry) {
   const accessToken = `mock-access-${randomUUID()}`;
   tokens.add(accessToken);
   const refreshToken = `mock-refresh-${randomUUID()}`;
-  refreshTokens.add(refreshToken);
-  json(res, 200, {
+  const issueRefreshToken = oauthCallback.issueRefreshToken !== false;
+  if (issueRefreshToken) refreshTokens.add(refreshToken);
+  entry.tokenId = createHash("sha256").update(accessToken).digest("hex").slice(0, 12);
+  entry.refreshTokenIssued = issueRefreshToken;
+  await respond(200, {
     access_token: accessToken,
-    refresh_token: refreshToken,
+    ...(issueRefreshToken ? { refresh_token: refreshToken } : {}),
     token_type: "Bearer",
     expires_in: 3600,
     scope: grantedScope,
@@ -440,11 +1038,30 @@ function tokenFingerprint(req) {
 }
 
 function mcpResult(message) {
+  if (configuredTools.length && message.method === "tools/list") {
+    return { tools: configuredTools.map(({ result, delayMs, appHtml, validateRequiredArguments, ...tool }) => tool) };
+  }
+  if (message.method === "resources/read") {
+    const tool = configuredTools.find((candidate) => candidate._meta?.ui?.resourceUri === message.params?.uri);
+    if (tool?.appHtml !== undefined) {
+      return { contents: [{ uri: message.params.uri, mimeType: "text/html;profile=mcp-app", text: tool.appHtml }] };
+    }
+  }
+  if (message.method === "tools/call") {
+    const tool = configuredTools.find((candidate) => candidate.name === message.params?.name);
+    if (tool) return tool.result;
+  }
   switch (message.method) {
     case "initialize":
       return {
         protocolVersion: "2025-06-18",
-        capabilities: { tools: {} },
+        capabilities: {
+          tools: {},
+          ...(configuredTools.some((tool) => tool.appHtml !== undefined) ? {
+            resources: {},
+            extensions: { "io.modelcontextprotocol/ui": { mimeTypes: ["text/html;profile=mcp-app"] } },
+          } : {}),
+        },
         serverInfo: { name: "mock-oauth-mcp", version: "1.0.0" },
       };
     case "tools/list":
@@ -482,6 +1099,23 @@ function mcpResult(message) {
             },
           },
           ...syntheticTools,
+          ...(appToolName ? [{
+            name: appToolName,
+            title: "Search issues (JQL)",
+            description: "Runs a JQL search and renders the results as an MCP App view.",
+            inputSchema: {
+              type: "object",
+              properties: { jql: { type: "string" } },
+              required: ["jql"],
+            },
+            annotations: {
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
+            _meta: {
+              ui: { resourceUri: `ui://mock/${appToolName}/view.html` },
+            },
+          }] : []),
           ...(extraToolName ? [{
             name: extraToolName,
             title: extraToolTitle || extraToolName,
@@ -564,6 +1198,27 @@ function mcpResult(message) {
 }
 
 function mcpResponse(message) {
+  if (message.method === "tools/call") {
+    const tool = configuredTools.find((candidate) => candidate.name === message.params?.name);
+    if (tool?.validateRequiredArguments) {
+      const missing = (tool.inputSchema.required ?? []).filter((key) => message.params?.arguments?.[key] === undefined);
+      if (missing.length) {
+        return {
+          jsonrpc: "2.0",
+          id: message.id,
+          error: {
+            code: -32602,
+            message: `Invalid arguments for tool ${tool.name}: ${JSON.stringify(missing.map((key) => ({ path: [key], message: "Required" })))}`,
+          },
+        };
+      }
+    }
+  }
+  // This fixture speaks legacy MCP. Give modern clients the explicit fallback
+  // signal instead of a successful but malformed discovery response.
+  if (message.method === "server/discover") {
+    return { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } };
+  }
   if (
     errorToolMode === "authorization_required"
     && errorToolName
@@ -596,6 +1251,17 @@ async function handleMcp(req, res, entry) {
     .map((message) => message.method);
 
   const authorized = isAuthorized(req);
+  entry.tokenId = tokenFingerprint(req);
+  if (tokens.has(bearerToken(req)) && oauthCallback.resourceStatus !== undefined) {
+    const error = oauthCallback.resourceStatus === 403 ? "insufficient_scope" : "invalid_token";
+    entry.oauthError = error;
+    json(res, oauthCallback.resourceStatus, { error }, {
+      "www-authenticate": oauthCallback.resourceStatus === 403
+        ? 'Bearer error="insufficient_scope", scope="mcp:read mcp:write"'
+        : `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource"`,
+    });
+    return;
+  }
   if (!authorized) {
     json(res, 401, { error: "missing_mcp_token" }, {
       "www-authenticate": `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource"`,
@@ -615,7 +1281,6 @@ async function handleMcp(req, res, entry) {
   // Arguments + a token fingerprint make the connector the AUTHORITY on who
   // called it: a spec can prove two members each invoked a tool with their own
   // credential, without trusting the app's own UI state.
-  entry.tokenId = tokenFingerprint(req);
   entry.toolCalls = messages
     .filter((message) => message && typeof message === "object" && message.method === "tools/call" && typeof message.params?.name === "string")
     .map((message) => ({
@@ -623,6 +1288,9 @@ async function handleMcp(req, res, entry) {
       args: message.params.arguments ?? message.params.args ?? {},
       tokenId: entry.tokenId,
     }));
+  const responseDelay = Math.max(0, ...entry.toolNames.map((name) =>
+    configuredTools.find((tool) => tool.name === name)?.delayMs ?? 0));
+  if (responseDelay > 0) await new Promise((resolve) => setTimeout(resolve, responseDelay));
   const responses = messages.flatMap((message) => {
     if (!message || typeof message !== "object" || message.id === undefined) return [];
     return [mcpResponse(message)];
@@ -640,7 +1308,7 @@ async function handleMcp(req, res, entry) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", issuer);
-    const entry = record(req, url);
+    const entry = record(req, url, res);
 
     if (req.method === "OPTIONS") {
       json(res, 204, {});
@@ -648,12 +1316,118 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/health") {
-      json(res, 200, { ok: true, issuer, autoApprove, disableDcr, requests: requests.length });
+      json(res, 200, { ok: true, host, issuer, autoApprove, disableDcr, requests: requests.length });
       return;
     }
 
     if (url.pathname === "/requests") {
       json(res, 200, { requests });
+      return;
+    }
+
+    if (url.pathname === "/admin/oauth-callback" && req.method === "POST") {
+      const body = await readJson(req);
+      if (!body || typeof body !== "object" || Array.isArray(body)
+        || Object.keys(body).some((key) => !["issueRefreshToken", "resourceStatus", "tokenErrorDescription"].includes(key))
+        || (body.issueRefreshToken !== undefined && typeof body.issueRefreshToken !== "boolean")
+        || (body.resourceStatus !== undefined && ![401, 403].includes(body.resourceStatus))
+        || (body.tokenErrorDescription !== undefined && (typeof body.tokenErrorDescription !== "string"
+          || !body.tokenErrorDescription || body.tokenErrorDescription.length > 512))) {
+        json(res, 400, { error: "invalid_oauth_callback_options" });
+        return;
+      }
+      oauthCallback = body;
+      json(res, 200, { configured: true });
+      return;
+    }
+
+    if (url.pathname === "/admin/tools" && req.method === "POST") {
+      const body = await readJson(req);
+      if (!Array.isArray(body?.tools) || body.tools.some((tool) => !tool || typeof tool.name !== "string" || !tool.inputSchema || !tool.result
+        || (tool.delayMs !== undefined && (!Number.isFinite(tool.delayMs) || tool.delayMs < 0 || tool.delayMs > 30_000)))) {
+        json(res, 400, { error: "tools must have a name, inputSchema, and result" });
+        return;
+      }
+      configuredTools = body.tools;
+      json(res, 200, { configured: configuredTools.length });
+      return;
+    }
+
+    if (url.pathname === "/admin/agent-hold" && req.method === "POST") {
+      const body = await readJson(req);
+      if (typeof body?.held !== "boolean") throw new Error("held must be a boolean");
+      agentRepliesHeld = body.held;
+      if (!agentRepliesHeld) for (const send of [...heldAgentReplies]) send();
+      json(res, 200, { held: agentRepliesHeld, pending: heldAgentReplies.size });
+      return;
+    }
+
+    if (url.pathname === "/admin/agent-workloads" && req.method === "POST") {
+      const body = await readJson(req);
+      const requiredHeader = body?.requiredHeader;
+      if (requiredHeader !== undefined && (!requiredHeader || typeof requiredHeader.name !== "string"
+        || !requiredHeader.name.trim() || typeof requiredHeader.value !== "string" || !requiredHeader.value)) {
+        json(res, 400, { error: "requiredHeader needs a name and value" });
+        return;
+      }
+      agentWorkloads = validateAgentWorkloads(body?.workloads);
+      for (const state of agentReplyGates.values()) {
+        state.aborted = true;
+        releaseAgentReplyWaiters(state, false);
+      }
+      agentReplyGates.clear();
+      agentRequiredHeader = requiredHeader ?? null;
+      json(res, 200, { configured: agentWorkloads.length });
+      return;
+    }
+
+    if (url.pathname === "/admin/agent-reply" && req.method === "GET") {
+      const promptMarker = url.searchParams.get("promptMarker") ?? "";
+      const state = agentReplyGates.get(promptMarker);
+      if (!state) {
+        json(res, 404, { error: "agent_reply_not_started" });
+        return;
+      }
+      json(res, 200, publicAgentReplyState(state));
+      return;
+    }
+
+    if (url.pathname === "/admin/agent-reply" && req.method === "POST") {
+      const body = await readJson(req);
+      const state = agentReplyGates.get(body?.promptMarker);
+      if (!state) {
+        json(res, 404, { error: "agent_reply_not_started" });
+        return;
+      }
+      const count = body?.count ?? 1;
+      if (!Number.isInteger(count) || count < 1) {
+        json(res, 400, { error: "count_must_be_positive" });
+        return;
+      }
+      state.releasedChunks = Math.min(state.totalChunks, state.releasedChunks + count);
+      releaseAgentReplyWaiters(state, true);
+      json(res, 200, publicAgentReplyState(state));
+      return;
+    }
+
+    if (url.pathname === "/v1/models" && req.method === "GET") {
+      json(res, 200, {
+        object: "list",
+        data: [{ id: "mock-agent-workload-model", object: "model", owned_by: "openwork-testkit" }],
+      });
+      return;
+    }
+
+    if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
+      await handleAgentResponse(req, res, entry);
+      return;
+    }
+
+    if (
+      req.method === "POST"
+      && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")
+    ) {
+      await handleAgentCompletion(req, res, entry);
       return;
     }
 
@@ -704,14 +1478,36 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Test hook: invalidate both access and refresh credentials. With
-    // STRICT_REFRESH_TOKENS=1 the next authenticated MCP operation follows
-    // the production-shaped 401 -> refresh -> invalid_grant path.
+    // Hold completed refresh responses so a journey can commit a successful
+    // rotation before delivering another request's rejection of the old grant.
+    if (url.pathname === "/admin/refresh-responses" && req.method === "POST") {
+      tokens.clear();
+      strictRefreshTokens = true;
+      holdRefreshResponses = true;
+      json(res, 200, { holding: true });
+      return;
+    }
+    if (url.pathname === "/admin/refresh-responses" && req.method === "GET") {
+      json(res, 200, { responses: [...pendingRefreshResponses.values()].map(({ id, status, tokenId }) => ({ id, status, tokenId })) });
+      return;
+    }
+    const refreshRelease = url.pathname.match(/^\/admin\/refresh-responses\/(\d+)\/release$/);
+    if (refreshRelease && req.method === "POST") {
+      const pending = pendingRefreshResponses.get(Number(refreshRelease[1]));
+      if (!pending) { json(res, 404, { error: "unknown_refresh_response" }); return; }
+      pending.release();
+      json(res, 200, { released: true });
+      return;
+    }
+
+    // Test hook: revoke both grants and enforce that revocation on refresh,
+    // producing the 401 -> refresh -> invalid_grant path in every test lane.
     if (url.pathname === "/admin/expire-oauth-tokens" && req.method === "POST") {
       const expiredAccessTokens = tokens.size;
       const expiredRefreshTokens = refreshTokens.size;
       tokens.clear();
       refreshTokens.clear();
+      strictRefreshTokens = true;
       json(res, 200, { expiredAccessTokens, expiredRefreshTokens });
       return;
     }
@@ -791,7 +1587,8 @@ const server = http.createServer(async (req, res) => {
 
     json(res, 404, { error: "not_found" });
   } catch (error) {
-    json(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    console.error("[mock-oauth-mcp] request failed", error);
+    json(res, 500, { error: "internal_server_error" });
   }
 });
 

@@ -2,16 +2,48 @@ import type { SurfaceHandle, SurfaceKind } from "@openwork/cdp";
 
 export type { SurfaceHandle, SurfaceKind } from "@openwork/cdp";
 
+export type DesktopReleaseDistribution = "public" | "cloud" | "enterprise";
+
+export interface DesktopRelease {
+  version: string;
+  distribution: DesktopReleaseDistribution;
+}
+
+export type ElectronStartupObservation =
+  | { state: "cdp-responsive"; detail: string }
+  | { state: "crashed" | "unresponsive"; detail: string };
+
+export interface RetainedElectronSurface {
+  handle: SurfaceHandle;
+  startup: ElectronStartupObservation;
+}
+
 export interface ElectronSurfaceOptions {
-  profile?: "fresh" | "shared";
+  profile?: "fresh" | "shared" | "blank";
   /** Exact caller-owned profile root. Hosts preserve it on surface disposal. */
   profileDir?: string;
   bootstrap?: {
     baseUrl: string;
     apiBaseUrl?: string;
     requireSignin?: boolean;
+    /** Seed an installation already activated against its private Den. */
+    enterpriseActivation?: { activatedAt: string; denBaseUrl: string };
   };
   env?: Record<string, string>;
+  /** Exact executable on the target host. Unlike the ambient eval override, this is scoped to one launch. */
+  binaryPath?: string;
+  /** Published release to install before launching. Placement resolves this to binaryPath. */
+  release?: DesktopRelease;
+  /** Additional arguments passed to an explicit binary. */
+  launchArgs?: readonly string[];
+  /** Retained launch startup observation budget. */
+  startupTimeoutMs?: number;
+  /** Root package script used for a source Electron launch. Setting this bypasses explicit and ambient binaries. */
+  devCommand?: "dev" | "dev:electron";
+  /** Skip host-side sidecar/helper preparation when the caller intentionally uses existing resources. */
+  prepareSharedResources?: boolean;
+  /** Never share a pooled sandbox with another surface; placement provisions this one its own. */
+  ownSandbox?: boolean;
 }
 
 export interface ChromeSurfaceOptions {
@@ -47,6 +79,8 @@ export interface Host {
   workspaceRoot: string;
   previewUrl?(port: number): Promise<string>;
   spawnElectron(name: string, opts?: ElectronSurfaceOptions): Promise<SurfaceHandle>;
+  /** Launch without requiring product readiness; app crashes remain inspectable through the host viewer. */
+  spawnElectronRetained?(name: string, opts?: ElectronSurfaceOptions): Promise<RetainedElectronSurface>;
   spawnChrome(name: string, opts?: ChromeSurfaceOptions): Promise<SurfaceHandle>;
   startDen?(opts?: DenServiceOptions): Promise<DenServiceHandle>;
   share?(): Promise<ShareLinks>;

@@ -5,12 +5,14 @@
 // this hook next.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Client, ModelOption } from "@/app/types";
+import { getModelBehaviorSummary } from "@/app/lib/model-behavior";
 import { useCheckDesktopRestriction } from "@/react-app/domains/cloud/desktop-config-provider";
-import { isCloudManagedProviderKey } from "@/react-app/domains/connections/provider-auth/cloud-provider-config";
+import { isCloudManagedProviderKey, pendingGatewayModelOptions, type GatewayConnectProvider } from "@/react-app/domains/connections/provider-auth/cloud-provider-config";
 import { filterEntitledModelOptions } from "@/react-app/domains/connections/provider-auth/provider-policy";
 import {
   filterCloudManagedModelOptions,
   mergeModelOptions,
+  markDisabledModelOptions,
 } from "@/react-app/domains/connections/provider-auth/assigned-model-options";
 import {
   getConnectedProviderItems,
@@ -33,6 +35,8 @@ export type UseModelPickerInput = {
   fallbackOptions?: readonly ModelOption[];
   /** Account-scoped providers are hidden immediately after cloud sign-out. */
   cloudProvidersEnabled?: boolean;
+  pendingProviders?: readonly GatewayConnectProvider[];
+  disabledProviders?: readonly string[];
 };
 
 export function useModelPicker(input: UseModelPickerInput) {
@@ -44,6 +48,8 @@ export function useModelPicker(input: UseModelPickerInput) {
     onLoadError,
     fallbackOptions = [],
     cloudProvidersEnabled = true,
+    pendingProviders = [],
+    disabledProviders = [],
   } = input;
   const checkDesktopRestriction = useCheckDesktopRestriction();
 
@@ -111,7 +117,6 @@ export function useModelPicker(input: UseModelPickerInput) {
 
   const modelOptions = useMemo(() => {
     const data = providerListQuery.data;
-    if (!data?.all) return [];
 
     // Flag models from recently-added providers so they appear in the
     // "Recently added" section at the top of the picker.
@@ -131,15 +136,17 @@ export function useModelPicker(input: UseModelPickerInput) {
       const isNew = !seenIds.has(provider.id) || recentProviderIds.has(provider.id);
       for (const id of modelIds) {
         const model = provider.models[id];
+        const summary = getModelBehaviorSummary(provider.id, model, null, provider.name);
         next.push({
           providerID: provider.id,
           modelID: id,
           title: model.name || id,
           description: provider.name,
-          behaviorTitle: "Reasoning",
-          behaviorLabel: "Default",
-          behaviorDescription: "",
-          behaviorValue: null,
+          behaviorTitle: summary.title,
+          behaviorLabel: summary.label,
+          behaviorDescription: summary.description,
+          behaviorValue: summary.value,
+          behaviorOptions: summary.options,
           isFree: false,
           isRecommended: isNew,
           source: isCloudManagedProviderKey(provider.id) ? "cloud" : undefined,
@@ -147,24 +154,25 @@ export function useModelPicker(input: UseModelPickerInput) {
       }
     }
     return filterCloudManagedModelOptions(
-      mergeModelOptions(next, fallbackOptions),
+      mergeModelOptions(pendingGatewayModelOptions(pendingProviders), mergeModelOptions(next, fallbackOptions)),
       cloudProvidersEnabled,
     );
-  }, [cloudProvidersEnabled, fallbackOptions, providerListQuery.data, recentProviderIds]);
+  }, [cloudProvidersEnabled, fallbackOptions, pendingProviders, providerListQuery.data, recentProviderIds]);
 
   // Apply org-level restrictions (dev #1505) on top of the raw model list
   // so the picker never surfaces blocked options:
   //   - `allowZenModel` hides the built-in OpenCode provider entries when false
   //   - `allowCustomProviders` keeps org-managed providers, plus Zen when allowed.
-  const options = useMemo(() => {
+  const displayOptions = useMemo(() => {
     const restrictToCloud = checkDesktopRestriction({
       restriction: "allowCustomProviders",
     });
-    return filterEntitledModelOptions(modelOptions, {
+    return markDisabledModelOptions(filterEntitledModelOptions(modelOptions, {
       restrictToCloud,
       checkRestriction: checkDesktopRestriction,
-    });
-  }, [checkDesktopRestriction, modelOptions]);
+    }), disabledProviders);
+  }, [checkDesktopRestriction, disabledProviders, modelOptions]);
+  const options = useMemo(() => displayOptions.filter((option) => !option.disabled), [displayOptions]);
 
   return {
     open,
@@ -174,6 +182,7 @@ export function useModelPicker(input: UseModelPickerInput) {
     query,
     setQuery,
     options,
+    displayOptions,
     setRecentProviderIds,
   };
 }

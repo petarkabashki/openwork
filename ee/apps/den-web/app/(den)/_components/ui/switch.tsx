@@ -8,6 +8,7 @@ export type DenSwitchProps = {
   size?: DenSwitchSize;
   disabled?: boolean;
   "aria-label": string;
+  "aria-describedby"?: string;
   testId?: string;
 };
 
@@ -18,6 +19,7 @@ export function DenSwitch({
   size = "md",
   disabled = false,
   "aria-label": ariaLabel,
+  "aria-describedby": ariaDescribedBy,
   testId,
 }: DenSwitchProps) {
   return (
@@ -26,6 +28,7 @@ export function DenSwitch({
       role="switch"
       aria-checked={checked}
       aria-label={ariaLabel}
+      aria-describedby={ariaDescribedBy}
       data-testid={testId}
       disabled={disabled}
       onClick={disabled ? undefined : () => onChange(!checked)}
@@ -42,7 +45,7 @@ export function DenSwitch({
         aria-hidden="true"
         className={[
           size === "md" ? "h-5 w-5" : "h-4 w-4",
-          "rounded-full bg-white shadow-sm",
+          "rounded-full bg-white shadow-xs",
         ].join(" ")}
       />
     </button>

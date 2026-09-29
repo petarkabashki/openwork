@@ -1,4 +1,5 @@
 import { createDenTypeId, type DenTypeIdName } from "@openwork-ee/utils/typeid"
+import { requiresAdminError } from "../../agent-error-envelope.js"
 import { customAlphabet } from "nanoid"
 import { z } from "zod"
 import type { MemberTeamsContext, OrganizationContextVariables, UserOrganizationsContext } from "../../middleware/index.js"
@@ -23,7 +24,11 @@ export type OrgRouteVariables =
   & Partial<OrganizationContextVariables>
   & Partial<MemberTeamsContext>
 
-export const PRIVILEGED_SESSION_MAX_AGE_MS = 15 * 60 * 1000
+// Step-up window for high-risk workspace actions (security settings, API keys,
+// roles, credentials, deletion). Verifying again starts a new session, so this
+// counts from the last sign-in or identity check. Routine plugin, marketplace,
+// and connector work does not step up; normal role checks still apply.
+export const PRIVILEGED_SESSION_MAX_AGE_MS = 2 * 60 * 60 * 1000
 export const CONNECTIONS_READ_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000
 export const WORKSPACE_REAUTH_SECURITY_MESSAGE = "For security, confirm it's you before changing workspace settings."
 
@@ -42,7 +47,7 @@ export function getFreshPrivilegedSessionRequiredResponse(): FreshPrivilegedSess
 }
 
 type PrivilegedOrgRouteContext = {
-  get: <K extends "organizationContext" | "session">(key: K) => OrgRouteVariables[K]
+  get: <K extends "apiKey" | "organizationContext" | "session">(key: K) => OrgRouteVariables[K]
 }
 
 type OrganizationAdminRouteContext = {
@@ -70,9 +75,13 @@ export function hasFreshPrivilegedSession(
 }
 
 function ensureFreshPrivilegedSession(
-  c: { get: (key: "session") => OrgRouteVariables["session"] },
+  c: { get: <K extends "apiKey" | "session">(key: K) => OrgRouteVariables[K] },
   maxAgeMs = PRIVILEGED_SESSION_MAX_AGE_MS,
 ) {
+  if (c.get("apiKey")) {
+    return { ok: true as const }
+  }
+
   if (hasFreshPrivilegedSession({ session: c.get("session") }, new Date(), maxAgeMs)) {
     return { ok: true as const }
   }
@@ -175,7 +184,7 @@ export function ensureOrganizationAdminRole(c: OrganizationAdminRouteContext, me
     ok: false as const,
     response: {
       error: "forbidden",
-      message,
+      ...requiresAdminError(message),
     },
   }
 }
@@ -248,7 +257,7 @@ export function ensureInviteManager(c: PrivilegedOrgRouteContext) {
     ok: false as const,
     response: {
       error: "forbidden",
-      message: "Only workspace owners and admins can invite members.",
+      ...requiresAdminError("Only workspace owners and admins can invite members."),
     },
   }
 }

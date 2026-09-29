@@ -1,25 +1,17 @@
 version = 1
 
-# Warden gates clearance on blocking findings from two skills:
-# diff-security-review (all findings block) and desktop-den-sync-review (only
-# high findings block; medium findings are advisory). The clearance itself is
-# granted by .github/workflows/warden-clearance.yml.
-
+# Security review only. GitHub's admin-team rule owns merge approval.
 [defaults]
+defaultBranch = "dev"
 reportOn = "low"
-ignorePaths = [
-  "**/node_modules/**",
-  "**/pnpm-lock.yaml",
-  "**/dist/**",
-  "**/*.min.js",
-]
+ignorePaths = ["**/node_modules/**", "**/pnpm-lock.yaml", "**/dist/**", "**/*.min.js"]
+
+[defaults.scan]
+maxFileLines = 5000
 
 [defaults.agent]
 model = "openai/gpt-5.6-luna"
 
-# Auxiliary verifies/merges findings and gates what survives to the report;
-# keep it on the same strong model so weak verification can't cause a false
-# clearance.
 [defaults.auxiliary]
 model = "openai/gpt-5.6-luna"
 
@@ -28,26 +20,22 @@ name = "diff-security-review"
 
 [[skills.triggers]]
 type = "pull_request"
-actions = ["opened", "synchronize", "reopened"]
-draft = false
+actions = ["opened", "synchronize", "reopened", "ready_for_review"]
 
-# Lets developers run `warden` locally on uncommitted changes before pushing.
 [[skills.triggers]]
 type = "local"
+failOn = "info"
+minConfidence = "low"
 
+# Keep the public-repository confidentiality rule in AGENTS.md.
 [[skills]]
-name = "desktop-den-sync-review"
-paths = [
-  "apps/app/**",
-  "apps/desktop/**",
-  "ee/apps/den-api/**",
-  "packages/types/**",
-]
+name = "confidentiality-review"
 
 [[skills.triggers]]
 type = "pull_request"
-actions = ["opened", "synchronize", "reopened"]
-draft = false
+actions = ["opened", "synchronize", "reopened", "ready_for_review"]
 
 [[skills.triggers]]
 type = "local"
+failOn = "info"
+minConfidence = "low"

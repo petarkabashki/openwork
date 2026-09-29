@@ -1,13 +1,23 @@
-import { and, asc, count, eq, gt, inArray, isNotNull, isNull, sql } from "@openwork-ee/den-db/drizzle"
+import { peopleMemberCondition } from "./setup-agent-members.js"
+import { and, asc, count, eq, gt, inArray, isNotNull, isNull, or, sql } from "@openwork-ee/den-db/drizzle"
 import {
   AuthSessionTable,
   AuthUserTable,
+  ConfigObjectAccessGrantTable,
   ConnectedAccountTable,
+  ConnectorInstanceAccessGrantTable,
+  DashboardAccessGrantTable,
+  DesktopPolicyMemberTable,
+  ExternalMcpConnectionAccessGrantTable,
   InvitationTable,
   LlmProviderAccessTable,
+  LlmProviderMemberCredentialTable,
+  MarketplaceAccessGrantTable,
   MemberTable,
   OrganizationRoleTable,
   OrganizationTable,
+  PluginAccessGrantTable,
+  ScimGroupMemberTable,
   ScimProviderTable,
   ScimUserTombstoneTable,
   SsoConnectionTable,
@@ -19,6 +29,8 @@ import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { revokeOrganizationApiKeysForMember } from "./api-keys.js"
 import { cache } from "./cache.js"
 import { revokeMembershipSessionCredentials } from "./credential-revocation.js"
+import { revokeGoogleCredentials, revokeInferenceCredentialsForMembers } from "./llm/inference-provider-lifecycle.js"
+import { ensureMemberGatewayKey } from "./gateway-keys.js"
 import { db } from "./db.js"
 import { env } from "./env.js"
 import {
@@ -30,7 +42,9 @@ import {
   type MemberLifecycleValidation,
 } from "./organization-member-guards.js"
 import { runPostOrganizationMemberChangeHooks } from "./organization-member-hooks.js"
+import { isScimDeprovisionedIdentity } from "./scim-deprovisioning.js"
 import { getScimManagedTeamIds } from "./scim-groups.js"
+import { effectiveOrganizationRole, listOrganizationAdminTeamGrants, withOrganizationMembershipUsageMutation, withOrganizationTeamMutation, type OrganizationAdminTeam } from "./organization-team-roles.js"
 import {
   DEFAULT_ORGANIZATION_LIMITS,
   normalizeOrganizationMetadata,
@@ -44,7 +58,7 @@ import {
   type OrganizationPermissionRecord,
 } from "./organization-access.js"
 import { ensureDefaultDesktopPolicyForOrganization } from "./desktop-policies.js"
-import { isProtectedOrganizationRoleName, shouldRevokeSessionsForRoleChange } from "./organization-role-hierarchy.js"
+import { isProtectedOrganizationRoleName, organizationRoleValueSatisfies, shouldRevokeSessionsForRoleChange } from "./organization-role-hierarchy.js"
 import { appLogger } from "./observability/logger.js"
 import { isSingleOrgOwnerEmailEligible, resolveSingleOrgMembershipRole } from "./single-org-policy.js"
 
@@ -75,7 +89,7 @@ type MemberLifecycleValidationFailure = Extract<MemberLifecycleValidation, { ok:
 
 type MemberMutationFailure = {
   ok: false
-  error: "member_not_found" | MemberLifecycleValidationFailure["error"]
+  error: "member_not_found" | "forbidden" | MemberLifecycleValidationFailure["error"]
   message: string
 }
 
@@ -147,7 +161,10 @@ export type UserOrgSummary = {
   slug: string
   logo: string | null
   metadata: string | null
+  allowedEmailDomains: AllowedEmailDomains
   role: string
+  directRole: string
+  adminTeams: OrganizationAdminTeam[]
   orgMemberId: string
   membershipId: string
   memberCount: number
@@ -170,6 +187,8 @@ export type OrganizationContext = {
     id: MemberId
     userId: UserId
     role: string
+    directRole: string
+    adminTeams: OrganizationAdminTeam[]
     createdAt: Date
     joinedAt: Date | null
     isOwner: boolean
@@ -179,6 +198,8 @@ export type OrganizationContext = {
     userId: UserId | null
     inviteId: InvitationRow["id"] | null
     role: string
+    effectiveRole: string
+    adminTeams: OrganizationAdminTeam[]
     createdAt: Date
     joinedAt: Date | null
     isOwner: boolean
@@ -214,6 +235,7 @@ export type OrganizationContext = {
     updatedAt: Date
     memberIds: MemberId[]
     managedByScim: boolean
+    grantsOrganizationAdmin: boolean
   }>
 }
 
@@ -533,6 +555,7 @@ async function insertMemberIfMissing(input: {
 
   const existingMember = existing[0] ?? null
   if (existingMember) {
+    await ensureMemberGatewayKey({ organizationId: input.organizationId, memberId: existingMember.id })
     return existingMember
   }
 
@@ -543,6 +566,7 @@ async function insertMemberIfMissing(input: {
     defaultRole: input.role,
   })
   if (invitedMember) {
+    await ensureMemberGatewayKey({ organizationId: input.organizationId, memberId: invitedMember.id })
     // Accepting an invite materializes membership data; cached org/member reads
     // must be invalidated here because hot cache hits do not re-check the DB.
     await cache.org.deleteMemberList(input.organizationId)
@@ -580,7 +604,7 @@ async function insertMemberIfMissing(input: {
   if (!created[0]) {
     throw new Error("failed_to_create_member")
   }
-
+  await ensureMemberGatewayKey({ organizationId: input.organizationId, memberId: created[0].id })
   return created[0]
 }
 
@@ -717,7 +741,7 @@ async function acceptInvitation(invitation: InvitationRow, userId: UserId, optio
   }
 
   const availableRoles = await listAssignableRoles(invitation.organizationId)
-  return db.transaction(async (tx) => {
+  return withOrganizationMembershipUsageMutation(invitation.organizationId, async (tx) => {
     const lockedInvitations = await tx
       .select()
       .from(InvitationTable)
@@ -860,7 +884,7 @@ async function acceptInvitation(invitation: InvitationRow, userId: UserId, optio
 
     if (currentInvitation.teamId) {
       const teams = await tx
-        .select({ id: TeamTable.id })
+        .select({ id: TeamTable.id, grantsOrganizationAdmin: TeamTable.grantsOrganizationAdmin })
         .from(TeamTable)
         .where(and(
           eq(TeamTable.id, currentInvitation.teamId),
@@ -875,7 +899,15 @@ async function acceptInvitation(invitation: InvitationRow, userId: UserId, optio
           .where(and(eq(TeamMemberTable.teamId, currentInvitation.teamId), eq(TeamMemberTable.orgMembershipId, member.id)))
           .limit(1)
 
-        if (!existingTeamMember[0]) {
+        const inviters = currentInvitation.orgMemberId ? await tx.select({ role: MemberTable.role })
+          .from(MemberTable).where(and(
+            eq(MemberTable.id, currentInvitation.orgMemberId),
+            eq(MemberTable.organizationId, currentInvitation.organizationId),
+            isNull(MemberTable.removedAt),
+          )).limit(1) : []
+        const mayAssignTeam = !teams[0].grantsOrganizationAdmin || (inviters[0] && organizationRoleValueSatisfies({ roleValue: inviters[0].role, requiredRole: "super-admin" }))
+        const scimTeams = await getScimManagedTeamIds(currentInvitation.organizationId, tx)
+        if (!existingTeamMember[0] && mayAssignTeam && !scimTeams.has(teams[0].id)) {
           await tx.insert(TeamMemberTable).values({
             id: createDenTypeId("teamMember"),
             teamId: currentInvitation.teamId,
@@ -891,7 +923,7 @@ async function acceptInvitation(invitation: InvitationRow, userId: UserId, optio
       .where(and(eq(InvitationTable.id, currentInvitation.id), eq(InvitationTable.status, "pending")))
 
     return { status: "accepted" as const, invitation: currentInvitation, member, newlyAccepted: true }
-  })
+  }, async (tx) => (await tx.select({ id: MemberTable.id }).from(MemberTable).where(and(eq(MemberTable.organizationId, invitation.organizationId), or(eq(MemberTable.userId, userId), eq(MemberTable.inviteId, invitation.id))))).map((row) => row.id))
 }
 
 export async function acceptInvitationForUser(input: {
@@ -1077,6 +1109,7 @@ async function createOrganizationRecord(input: {
     userId: input.userId,
     role: "owner",
   })
+  await ensureMemberGatewayKey({ organizationId, memberId: ownerMemberId })
 
   await ensureDefaultDesktopPolicyForOrganization({
     organizationId,
@@ -1174,6 +1207,11 @@ export async function ensureSingletonOrganizationForUser(userId: UserId, options
         throw new Error("failed_to_create_single_org")
       }
     }
+  }
+
+  // Single-org session creation must not re-admit an identity the IdP deprovisioned.
+  if (await isScimDeprovisionedIdentity({ organizationId: organization.id, userId, email: userEmail })) {
+    return null
   }
 
   const activeOwnerCount = await countActiveOwners(organization.id)
@@ -1290,114 +1328,117 @@ export async function updateOrganizationSettings(input: {
     return null
   }
 
-  const updates: Partial<typeof OrganizationTable.$inferInsert> = {}
-  if (nextName) {
-    updates.name = nextName
-  }
-  if (input.allowedEmailDomains !== undefined) {
-    updates.allowedEmailDomains = normalizeAllowedEmailDomains(input.allowedEmailDomains).domains
-  }
-  if (input.allowedDesktopVersions !== undefined || input.requireSso !== undefined || input.brandAppName !== undefined || input.brandLogoUrl !== undefined || input.brandIconUrl !== undefined || input.brandLogoAsset !== undefined || input.brandIconAsset !== undefined || input.brandAccentColor !== undefined) {
-    const rows = await db
-      .select({ metadata: OrganizationTable.metadata })
+  return db.transaction(async (tx) => {
+    const updates: Partial<typeof OrganizationTable.$inferInsert> = {}
+    if (nextName) {
+      updates.name = nextName
+    }
+    if (input.allowedEmailDomains !== undefined) {
+      updates.allowedEmailDomains = normalizeAllowedEmailDomains(input.allowedEmailDomains).domains
+    }
+    if (input.allowedDesktopVersions !== undefined || input.requireSso !== undefined || input.brandAppName !== undefined || input.brandLogoUrl !== undefined || input.brandIconUrl !== undefined || input.brandLogoAsset !== undefined || input.brandIconAsset !== undefined || input.brandAccentColor !== undefined) {
+      const rows = await tx
+        .select({ metadata: OrganizationTable.metadata })
+        .from(OrganizationTable)
+        .where(eq(OrganizationTable.id, input.organizationId))
+        .limit(1)
+        .for("update")
+
+      const existingOrganization = rows[0]
+      if (!existingOrganization) {
+        return null
+      }
+
+      const nextMetadata: Record<string, unknown> = {
+        ...normalizeOrganizationMetadata(existingOrganization.metadata).metadata,
+      }
+
+      if (input.allowedDesktopVersions !== undefined) {
+        if (input.allowedDesktopVersions === null) {
+          delete nextMetadata.allowedDesktopVersions
+        } else {
+          nextMetadata.allowedDesktopVersions = input.allowedDesktopVersions
+        }
+      }
+
+      if (input.requireSso !== undefined) {
+        nextMetadata.requireSso = input.requireSso
+      }
+
+      if (input.brandAppName !== undefined) {
+        if (input.brandAppName === null) {
+          delete nextMetadata.brandAppName
+        } else {
+          nextMetadata.brandAppName = input.brandAppName
+        }
+      }
+
+      if (input.brandLogoUrl !== undefined) {
+        if (input.brandLogoUrl === null) {
+          delete nextMetadata.brandLogoUrl
+        } else {
+          nextMetadata.brandLogoUrl = input.brandLogoUrl
+        }
+        if (input.brandLogoAsset === undefined) {
+          delete nextMetadata.brandLogoAsset
+        }
+      }
+
+      if (input.brandIconUrl !== undefined) {
+        if (input.brandIconUrl === null) {
+          delete nextMetadata.brandIconUrl
+        } else {
+          nextMetadata.brandIconUrl = input.brandIconUrl
+        }
+        if (input.brandIconAsset === undefined) {
+          delete nextMetadata.brandIconAsset
+        }
+      }
+
+      if (input.brandLogoAsset !== undefined) {
+        if (input.brandLogoAsset === null) {
+          delete nextMetadata.brandLogoAsset
+        } else {
+          nextMetadata.brandLogoAsset = input.brandLogoAsset
+        }
+      }
+
+      if (input.brandIconAsset !== undefined) {
+        if (input.brandIconAsset === null) {
+          delete nextMetadata.brandIconAsset
+        } else {
+          nextMetadata.brandIconAsset = input.brandIconAsset
+        }
+      }
+
+      if (input.brandAccentColor !== undefined) {
+        if (input.brandAccentColor === null) {
+          delete nextMetadata.brandAccentColor
+        } else {
+          nextMetadata.brandAccentColor = input.brandAccentColor
+        }
+      }
+
+      updates.metadata = normalizeOrganizationMetadata(nextMetadata).metadata
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return null
+    }
+
+    await tx
+      .update(OrganizationTable)
+      .set(updates)
+      .where(eq(OrganizationTable.id, input.organizationId))
+
+    const rows = await tx
+      .select()
       .from(OrganizationTable)
       .where(eq(OrganizationTable.id, input.organizationId))
       .limit(1)
 
-    const existingOrganization = rows[0]
-    if (!existingOrganization) {
-      return null
-    }
-
-    const nextMetadata = {
-      ...normalizeOrganizationMetadata(existingOrganization.metadata).metadata,
-    } as Record<string, unknown>
-
-    if (input.allowedDesktopVersions !== undefined) {
-      if (input.allowedDesktopVersions === null) {
-        delete nextMetadata.allowedDesktopVersions
-      } else {
-        nextMetadata.allowedDesktopVersions = input.allowedDesktopVersions
-      }
-    }
-
-    if (input.requireSso !== undefined) {
-      nextMetadata.requireSso = input.requireSso
-    }
-
-    if (input.brandAppName !== undefined) {
-      if (input.brandAppName === null) {
-        delete nextMetadata.brandAppName
-      } else {
-        nextMetadata.brandAppName = input.brandAppName
-      }
-    }
-
-    if (input.brandLogoUrl !== undefined) {
-      if (input.brandLogoUrl === null) {
-        delete nextMetadata.brandLogoUrl
-      } else {
-        nextMetadata.brandLogoUrl = input.brandLogoUrl
-      }
-      if (input.brandLogoAsset === undefined) {
-        delete nextMetadata.brandLogoAsset
-      }
-    }
-
-    if (input.brandIconUrl !== undefined) {
-      if (input.brandIconUrl === null) {
-        delete nextMetadata.brandIconUrl
-      } else {
-        nextMetadata.brandIconUrl = input.brandIconUrl
-      }
-      if (input.brandIconAsset === undefined) {
-        delete nextMetadata.brandIconAsset
-      }
-    }
-
-    if (input.brandLogoAsset !== undefined) {
-      if (input.brandLogoAsset === null) {
-        delete nextMetadata.brandLogoAsset
-      } else {
-        nextMetadata.brandLogoAsset = input.brandLogoAsset
-      }
-    }
-
-    if (input.brandIconAsset !== undefined) {
-      if (input.brandIconAsset === null) {
-        delete nextMetadata.brandIconAsset
-      } else {
-        nextMetadata.brandIconAsset = input.brandIconAsset
-      }
-    }
-
-    if (input.brandAccentColor !== undefined) {
-      if (input.brandAccentColor === null) {
-        delete nextMetadata.brandAccentColor
-      } else {
-        nextMetadata.brandAccentColor = input.brandAccentColor
-      }
-    }
-
-    updates.metadata = normalizeOrganizationMetadata(nextMetadata).metadata
-  }
-
-  if (Object.keys(updates).length === 0) {
-    return null
-  }
-
-  await db
-    .update(OrganizationTable)
-    .set(updates)
-    .where(eq(OrganizationTable.id, input.organizationId))
-
-  const rows = await db
-    .select()
-    .from(OrganizationTable)
-    .where(eq(OrganizationTable.id, input.organizationId))
-    .limit(1)
-
-  return rows[0] ?? null
+    return rows[0] ?? null
+  })
 }
 
 export async function seedDefaultOrganizationRoles(orgId: OrgId) {
@@ -1452,27 +1493,33 @@ export async function listUserOrgs(userId: UserId) {
         memberCount: count(),
       })
       .from(MemberTable)
-      .where(and(inArray(MemberTable.organizationId, organizationIds), isNull(MemberTable.removedAt)))
+      .where(and(inArray(MemberTable.organizationId, organizationIds), peopleMemberCondition()))
       .groupBy(MemberTable.organizationId)
     for (const row of counts) {
       memberCounts.set(row.organizationId, row.memberCount)
     }
   }
 
-  return memberships.map((row) => ({
-    id: row.organization.id,
-    name: row.organization.name,
-    slug: row.organization.slug,
-    logo: row.organization.logo,
-    allowedEmailDomains: normalizeStoredAllowedEmailDomains(row.organization.allowedEmailDomains),
-    metadata: serializeMemberFacingOrganizationMetadata(row.organization.metadata),
-    role: row.role,
-    orgMemberId: row.membershipId,
-    membershipId: row.membershipId,
-    memberCount: memberCounts.get(row.organization.id) ?? 0,
-    createdAt: row.organization.createdAt,
-    updatedAt: row.organization.updatedAt,
-  })) satisfies UserOrgSummary[]
+  return Promise.all(memberships.map(async (row) => {
+    const grants = await listOrganizationAdminTeamGrants(row.organization.id)
+    const adminTeams = grants.filter((grant) => grant.memberId === row.membershipId).map(({ id, name }) => ({ id, name }))
+    return {
+      id: row.organization.id,
+      name: row.organization.name,
+      slug: row.organization.slug,
+      logo: row.organization.logo,
+      allowedEmailDomains: normalizeStoredAllowedEmailDomains(row.organization.allowedEmailDomains),
+      metadata: serializeMemberFacingOrganizationMetadata(row.organization.metadata),
+      role: effectiveOrganizationRole(row.role, adminTeams),
+      directRole: row.role,
+      adminTeams,
+      orgMemberId: row.membershipId,
+      membershipId: row.membershipId,
+      memberCount: memberCounts.get(row.organization.id) ?? 0,
+      createdAt: row.organization.createdAt,
+      updatedAt: row.organization.updatedAt,
+    } satisfies UserOrgSummary
+  }))
 }
 
 export async function resolveUserOrganizations(input: {
@@ -1566,6 +1613,11 @@ export async function getOrganizationContextForUser(input: {
     .orderBy(asc(OrganizationRoleTable.createdAt))
 
   const teams = await listOrganizationTeams(organization.id)
+  const adminGrants = await listOrganizationAdminTeamGrants(organization.id)
+  const adminTeamsFor = (memberId: MemberId) => adminGrants
+    .filter((grant) => grant.memberId === memberId)
+    .map(({ id, name }) => ({ id, name }))
+  const currentAdminTeams = adminTeamsFor(currentMember.id)
 
   return {
     organization: {
@@ -1581,12 +1633,17 @@ export async function getOrganizationContextForUser(input: {
     currentMember: {
       id: currentMember.id,
       userId: currentMember.userId,
-      role: currentMember.role,
+      role: effectiveOrganizationRole(currentMember.role, currentAdminTeams),
+      directRole: currentMember.role,
+      adminTeams: currentAdminTeams,
       createdAt: currentMember.createdAt,
       joinedAt: currentMember.joinedAt,
       isOwner: roleIncludesOwner(currentMember.role),
     },
-    members,
+    members: members.map((member) => {
+      const adminTeams = adminTeamsFor(member.id)
+      return { ...member, adminTeams, effectiveRole: effectiveOrganizationRole(member.role, adminTeams) }
+    }),
     invitations,
     roles: [
       {
@@ -1623,6 +1680,7 @@ async function listOrganizationTeams(organizationId: OrgId) {
         name: TeamTable.name,
         createdAt: TeamTable.createdAt,
         updatedAt: TeamTable.updatedAt,
+        grantsOrganizationAdmin: TeamTable.grantsOrganizationAdmin,
       })
       .from(TeamTable)
       .where(eq(TeamTable.organizationId, organizationId))
@@ -1738,7 +1796,7 @@ export async function updateOrganizationMemberRole(input: {
   memberId: MemberRow["id"]
   nextRole: string
 }): Promise<MemberRoleUpdateResult> {
-  const updated = await db.transaction(async (tx): Promise<MemberRoleUpdateResult> => {
+  const updated = await withOrganizationTeamMutation(input.organizationId, async (tx): Promise<MemberRoleUpdateResult> => {
     const activeRows = await tx
       .select({ member: MemberTable, userId: AuthUserTable.id })
       .from(MemberTable)
@@ -1848,7 +1906,7 @@ export async function transferOrganizationOwnership(input: {
     )
   }
 
-  const transfer: OwnershipTransferCommitResult = await db.transaction(async (tx): Promise<OwnershipTransferCommitResult> => {
+  const transfer: OwnershipTransferCommitResult = await withOrganizationTeamMutation(input.organizationId, async (tx): Promise<OwnershipTransferCommitResult> => {
     const memberRows = await tx
       .select({ member: MemberTable, userId: AuthUserTable.id })
       .from(MemberTable)
@@ -1968,12 +2026,13 @@ export async function removeOrganizationMember(input: {
   memberId: MemberRow["id"]
   removedByOrgMemberId?: MemberRow["id"]
 }): Promise<MemberMutationResult> {
-  const removed = await db.transaction(async (tx): Promise<MemberMutationResult> => {
+  let gatewayCredentials: Awaited<ReturnType<typeof revokeInferenceCredentialsForMembers>> = []
+  const removed = await withOrganizationMembershipUsageMutation(input.organizationId, async (tx): Promise<MemberMutationResult> => {
     const activeRows = await tx
       .select({ member: MemberTable, userId: AuthUserTable.id })
       .from(MemberTable)
       .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
-      .where(and(eq(MemberTable.organizationId, input.organizationId), isNull(MemberTable.removedAt)))
+      .where(and(eq(MemberTable.organizationId, input.organizationId), eq(MemberTable.id, input.memberId), isNull(MemberTable.removedAt)))
       .for("update")
 
     const memberRow = activeRows.find((row) => row.member.id === input.memberId) ?? null
@@ -1994,7 +2053,21 @@ export async function removeOrganizationMember(input: {
     }
 
     const member = memberRow.member
+    const removedAt = new Date()
 
+    if (input.removedByOrgMemberId) {
+      const adminTeams = await tx.select({ id: TeamTable.id }).from(TeamTable)
+        .innerJoin(TeamMemberTable, eq(TeamMemberTable.teamId, TeamTable.id))
+        .where(and(eq(TeamTable.organizationId, input.organizationId), eq(TeamTable.grantsOrganizationAdmin, true), eq(TeamMemberTable.orgMembershipId, member.id)))
+        .limit(1)
+      const [actor] = await tx.select({ role: MemberTable.role }).from(MemberTable)
+        .where(and(eq(MemberTable.id, input.removedByOrgMemberId), eq(MemberTable.organizationId, input.organizationId), isNull(MemberTable.removedAt), isNotNull(MemberTable.userId))).for("share")
+      if (adminTeams.length > 0 && (!actor || !organizationRoleValueSatisfies({ roleValue: actor.role, requiredRole: "super-admin" }))) {
+        return { ok: false, error: "forbidden", message: "Only workspace owners and super-admins can remove members with Admin team access." }
+      }
+    }
+
+    gatewayCredentials = await revokeInferenceCredentialsForMembers(tx, [member.id])
     await tx
       .delete(ConnectedAccountTable)
       .where(and(
@@ -2003,24 +2076,96 @@ export async function removeOrganizationMember(input: {
       ))
 
     await tx
+      .delete(LlmProviderMemberCredentialTable)
+      .where(and(
+        eq(LlmProviderMemberCredentialTable.organizationId, input.organizationId),
+        eq(LlmProviderMemberCredentialTable.orgMembershipId, member.id),
+      ))
+
+    await tx
       .delete(TeamMemberTable)
       .where(eq(TeamMemberTable.orgMembershipId, member.id))
+
+    await tx.update(ScimGroupMemberTable)
+      .set({ userId: null, orgMembershipId: null, teamMemberId: null, updatedAt: new Date() })
+      .where(and(eq(ScimGroupMemberTable.organizationId, input.organizationId), eq(ScimGroupMemberTable.orgMembershipId, member.id)))
 
     await tx
       .delete(LlmProviderAccessTable)
       .where(eq(LlmProviderAccessTable.orgMembershipId, member.id))
 
     await tx
+      .delete(DesktopPolicyMemberTable)
+      .where(and(
+        eq(DesktopPolicyMemberTable.organizationId, input.organizationId),
+        eq(DesktopPolicyMemberTable.orgMemberId, member.id),
+      ))
+
+    await tx
+      .delete(ExternalMcpConnectionAccessGrantTable)
+      .where(and(
+        eq(ExternalMcpConnectionAccessGrantTable.organizationId, input.organizationId),
+        eq(ExternalMcpConnectionAccessGrantTable.orgMembershipId, member.id),
+      ))
+
+    await tx
+      .update(MarketplaceAccessGrantTable)
+      .set({ removedAt })
+      .where(and(
+        eq(MarketplaceAccessGrantTable.organizationId, input.organizationId),
+        eq(MarketplaceAccessGrantTable.orgMembershipId, member.id),
+        isNull(MarketplaceAccessGrantTable.removedAt),
+      ))
+
+    await tx
+      .update(ConfigObjectAccessGrantTable)
+      .set({ removedAt })
+      .where(and(
+        eq(ConfigObjectAccessGrantTable.organizationId, input.organizationId),
+        eq(ConfigObjectAccessGrantTable.orgMembershipId, member.id),
+        isNull(ConfigObjectAccessGrantTable.removedAt),
+      ))
+
+    await tx
+      .update(PluginAccessGrantTable)
+      .set({ removedAt })
+      .where(and(
+        eq(PluginAccessGrantTable.organizationId, input.organizationId),
+        eq(PluginAccessGrantTable.orgMembershipId, member.id),
+        isNull(PluginAccessGrantTable.removedAt),
+      ))
+
+    await tx
+      .update(ConnectorInstanceAccessGrantTable)
+      .set({ removedAt })
+      .where(and(
+        eq(ConnectorInstanceAccessGrantTable.organizationId, input.organizationId),
+        eq(ConnectorInstanceAccessGrantTable.orgMembershipId, member.id),
+        isNull(ConnectorInstanceAccessGrantTable.removedAt),
+      ))
+
+    await tx
+      .update(DashboardAccessGrantTable)
+      .set({ removedAt })
+      .where(and(
+        eq(DashboardAccessGrantTable.organizationId, input.organizationId),
+        eq(DashboardAccessGrantTable.orgMembershipId, member.id),
+        isNull(DashboardAccessGrantTable.removedAt),
+      ))
+
+    await tx
       .update(MemberTable)
-      .set({ removedAt: new Date(), removedByOrgMember: input.removedByOrgMemberId ?? null })
+      .set({ removedAt, removedByOrgMember: input.removedByOrgMemberId ?? null })
       .where(and(eq(MemberTable.id, member.id), eq(MemberTable.organizationId, input.organizationId), isNull(MemberTable.removedAt)))
 
     return { ok: true, member }
-  })
+  }, [input.memberId])
 
   if (!removed.ok) {
     return removed
   }
+
+  await revokeGoogleCredentials(gatewayCredentials)
 
   await revokeOrganizationApiKeysForMember({
     organizationId: input.organizationId,

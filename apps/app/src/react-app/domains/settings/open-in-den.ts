@@ -5,20 +5,22 @@ export type DenLibraryTarget = {
   pluginId?: string;
 };
 
-/** Same create routes the Cloud dashboard already uses. */
-export const DEN_ADD_PATHS: Record<LibraryAddKind, string> = {
+/** Existing Cloud create routes and the member's available MCP inventory. */
+export const DEN_ADD_PATHS: Record<LibraryAddKind, string | null> = {
   skill: "/dashboard/plugins/new",
   command: "/dashboard/plugins/new",
   agent: "/dashboard/plugins/new",
   plugin: "/dashboard/plugins/import",
   connection: "/dashboard/mcp-connections",
-  mcp: "/dashboard/library",
+  mcp: "/dashboard/your-connections",
+  "workspace-mcp": null,
 };
 
 export function denAddUrl(baseUrl: string, kind: LibraryAddKind): string | null {
   const trimmed = baseUrl.trim();
-  if (!trimmed) return null;
-  return new URL(DEN_ADD_PATHS[kind], trimmed).toString();
+  const path = DEN_ADD_PATHS[kind];
+  if (!trimmed || !path) return null;
+  return new URL(path, trimmed).toString();
 }
 
 export function denLibraryFocus(target: DenLibraryTarget): string | null {

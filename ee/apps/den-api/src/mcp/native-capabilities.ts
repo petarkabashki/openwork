@@ -1,11 +1,12 @@
 import type { DenTypeId } from "@openwork-ee/utils/typeid"
 import type { Hono } from "hono"
-import { listNativeProviderUsableEntries, type NativeProviderConnectionEntry } from "../capability-sources/native-provider-connections.js"
+import { listNativeProviderUsableEntries, nativeProviderConnectionPolicyError, type NativeProviderConnectionEntry } from "../capability-sources/native-provider-connections.js"
 import type { McpPrincipal } from "./auth.js"
 import type { AgentToolContentPart } from "./tool-content.js"
 import {
   getJsonRequestBodySchema,
   getParameters,
+  getQueryParameterSchema,
   hasJsonRequestBody,
   pathParameterNamesFromTemplate,
   type McpToolOperation,
@@ -37,7 +38,6 @@ export function parseNativeCapabilityName(name: string): { connectionId: string;
 }
 
 export type NativeCapabilityMatch = CapabilityMatch & {
-  inputSchema?: McpToolOperation["inputSchema"]
   kind?: ExternalCapabilityMatch["kind"]
   status?: ExternalCapabilityMatch["status"]
   hint?: string
@@ -74,6 +74,7 @@ function capabilityMatch(
   scriptNamespace?: string,
 ): NativeCapabilityMatch {
   const bodySchema = getJsonRequestBodySchema(operation.operation)
+  const querySchema = getQueryParameterSchema(operation.operation)
   return {
     name: buildNativeCapabilityName(connection.id, operation.name),
     method: operation.method,
@@ -84,13 +85,14 @@ function capabilityMatch(
     queryParams: getParameters(operation.operation, "query")
       .flatMap((parameter) => typeof parameter.name === "string" ? [parameter.name] : []),
     hasBody: hasJsonRequestBody(operation.operation),
-    inputSchema: operation.inputSchema,
     ...(bodySchema === undefined ? {} : { bodySchema }),
+    ...(querySchema === undefined ? {} : { querySchema }),
+    ...(operation.outputSchema === undefined ? {} : { outputSchema: operation.outputSchema }),
     ...(scriptNamespace ? { scriptPath: codemodeScriptPath(scriptNamespace, operation.name) } : {}),
   }
 }
 
-function connectionStatusMatch(
+export function connectionStatusMatch(
   connection: NativeProviderConnectionEntry,
   score: number,
 ): NativeCapabilityMatch {
@@ -122,16 +124,13 @@ export async function searchNativeCapabilities(input: {
   query: string
   catalog: readonly McpToolOperation[]
   limit: number
-  includeScriptPaths?: boolean
   namespaceContext?: CodemodeConnectionNamespaceContext
 }): Promise<NativeCapabilityMatch[]> {
   if (!input.member) return []
-  const namespaceContext = input.includeScriptPaths
-    ? input.namespaceContext ?? await resolveCodemodeConnectionNamespaceContext({
-      organizationId: input.organizationId,
-      member: input.member,
-    })
-    : input.namespaceContext
+  const namespaceContext = input.namespaceContext ?? await resolveCodemodeConnectionNamespaceContext({
+    organizationId: input.organizationId,
+    member: input.member,
+  })
   const connections = namespaceContext?.nativeProviderEntries ?? await listNativeProviderUsableEntries({
     organizationId: input.organizationId,
     orgMembershipId: input.member.orgMembershipId,
@@ -152,7 +151,7 @@ export async function searchNativeCapabilities(input: {
         connection,
         operation,
         score,
-        input.includeScriptPaths ? namespaceContext?.namespaces.native.get(connection.id) : undefined,
+        namespaceContext?.namespaces.native.get(connection.id),
       ))
     }
   }
@@ -183,6 +182,8 @@ async function resolveNativeCapability(input: {
 type NativeCapabilityToolResult = {
   isError?: boolean
   content: AgentToolContentPart[]
+  /** Untruncated route payload; set only when the caller passes includePayload (Code Mode). */
+  payload?: unknown
 }
 
 export async function executeNativeCapability(input: {
@@ -196,6 +197,7 @@ export async function executeNativeCapability(input: {
   path?: unknown
   query?: unknown
   body?: unknown
+  includePayload?: boolean
 }): Promise<NativeCapabilityToolResult | null> {
   const parsed = parseNativeCapabilityName(input.name)
   if (!parsed) return null
@@ -207,6 +209,10 @@ export async function executeNativeCapability(input: {
     catalog: input.catalog,
   })
   if (!resolved) {
+    const policyError = await nativeProviderConnectionPolicyError(input.organizationId)
+    if (policyError) {
+      return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: policyError.kind, message: policyError.message }) }] }
+    }
     return {
       isError: true,
       content: [{
@@ -224,6 +230,7 @@ export async function executeNativeCapability(input: {
     operation: resolved.operation,
     principal: input.principal,
     nativeConnectionId: resolved.connection.id,
+    includePayload: input.includePayload,
     toolInput: {
       path: normalizeToolRecord(input.path),
       query: normalizeToolRecord(input.query),

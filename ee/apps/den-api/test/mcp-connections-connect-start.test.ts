@@ -108,7 +108,7 @@ beforeAll(async () => {
     activeOrganizationId: organizationId,
     token: staleSessionToken,
     expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-    createdAt: new Date(Date.now() - 60 * 60 * 1000),
+    createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
   })
   const connection = await createExternalMcpConnection({
     organizationId,
@@ -146,12 +146,14 @@ function request(path: string) {
   return principalRequest(userId, path)
 }
 
-function principalRequest(principalUserId: string, path: string, method = "GET") {
+function principalRequest(principalUserId: string, path: string, method = "GET", body?: unknown) {
   return app.fetch(new Request(`http://den-api.local${path}`, {
     method,
     headers: {
       "x-den-internal-mcp-principal": session.createInternalMcpPrincipalHeader({ userId: principalUserId, organizationId }),
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
     },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   }))
 }
 
@@ -273,6 +275,14 @@ test("requirements discovery is side-effect free", async () => {
   expect(after).toEqual(before)
 })
 
+test("members can check an MCP server before adding it to their own Library", async () => {
+  const response = await principalRequest(regularUserId, "/v1/mcp-connections/discover", "POST", {
+    url: "http://127.0.0.1:9/mcp",
+  })
+  expect(response.status).toBe(200)
+  expect(await response.json()).toMatchObject({ status: "unreachable", server: { initialize: "failed" } })
+})
+
 test("public client metadata exposes only the deployment-wide web callback", async () => {
   const response = await app.fetch(new Request("http://den-api.local/oauth/client-metadata.json"))
   expect(response.status).toBe(200)
@@ -356,8 +366,18 @@ test("callback isolation replaces SDK registration state and exposes the scoped 
 test("connect start keeps the shared callback for a pre-registered confidential client without response issuer support", async () => {
   let origin = ""
   let expectedCodeChallenge = ""
+  let expectedRedirectUri = ""
   let initializeRequests = 0
   let toolsListRequests = 0
+  let validationMode: "hold" | "succeed" | "fail" = "hold"
+  let markValidationStarted = () => {}
+  let releaseValidation = () => {}
+  const validationStarted = new Promise<void>((resolve) => {
+    markValidationStarted = resolve
+  })
+  const validationReleased = new Promise<void>((resolve) => {
+    releaseValidation = resolve
+  })
   const server = Bun.serve({
     port: 0,
     async fetch(incoming) {
@@ -387,6 +407,7 @@ test("connect start keeps the shared callback for a pre-registered confidential 
         expect(form.get("client_secret")).toBe("confidential-secret")
         expect(form.get("grant_type")).toBe("authorization_code")
         expect(form.get("code")).toBe("shared-authorization-code")
+        expect(form.get("redirect_uri")).toBe(expectedRedirectUri)
         expect(form.get("resource")).toBe(`${origin}/mcp`)
         const verifier = form.get("code_verifier")
         expect(verifier?.length).toBeGreaterThanOrEqual(43)
@@ -401,6 +422,14 @@ test("connect start keeps the shared callback for a pre-registered confidential 
       }
       if (url.pathname === "/mcp") {
         if (incoming.headers.get("authorization") === "Bearer shared-access-token") {
+          if (validationMode === "hold") {
+            markValidationStarted()
+            await validationReleased
+            validationMode = "succeed"
+          }
+          if (validationMode === "fail") {
+            return Response.json({ error: "post_authorization_validation_failed" }, { status: 500 })
+          }
           if (incoming.method !== "POST") return new Response(null, { status: 405 })
           const rpc: unknown = await incoming.json()
           if (!isRecord(rpc)) return Response.json({ error: "invalid_request" }, { status: 400 })
@@ -453,10 +482,8 @@ test("connect start keeps the shared callback for a pre-registered confidential 
       createdByOrgMembershipId: memberId,
       access: { orgWide: true, memberIds: [], teamIds: [] },
     })
-    const sharedCallback = new URL(
-      "/v1/mcp-connections/oauth/callback",
-      process.env.DEN_API_PUBLIC_URL ?? "http://127.0.0.1:8790",
-    ).toString()
+    const sharedCallback = "https://app.openworklabs.com/api/den/v1/mcp-connections/oauth/callback"
+    expectedRedirectUri = sharedCallback
     await upsertOrgOAuthClient({
       organizationId,
       providerId: connection.id,
@@ -505,11 +532,31 @@ test("connect start keeps the shared callback for a pre-registered confidential 
     expect(isRecord(pendingAuthorizations) && Array.isArray(pendingAuthorizations.transactions)
       ? pendingAuthorizations.transactions
       : []).toHaveLength(1)
+    expect((await getOrgOAuthClient(organizationId, connection.id))?.extra?.registeredRedirectUri).toBe(sharedCallback)
 
-    const callbackUrl = new URL(sharedCallback)
+    // The provider redirects to the legacy app/proxy callback. Den Web forwards
+    // that browser request to this direct API route, but token exchange must
+    // still send the original registered redirect_uri.
+    const callbackUrl = new URL(
+      "/v1/mcp-connections/oauth/callback",
+      process.env.DEN_API_PUBLIC_URL ?? "http://127.0.0.1:8790",
+    )
     callbackUrl.searchParams.set("code", "shared-authorization-code")
     callbackUrl.searchParams.set("state", signedState)
-    const callbackResponse = await app.fetch(new Request(callbackUrl))
+    const callbackPending = app.fetch(new Request(callbackUrl))
+    await validationStarted
+
+    const pendingListResponse = await request("/v1/mcp-connections?scope=manageable")
+    expect(pendingListResponse.status).toBe(200)
+    const pendingList: unknown = await pendingListResponse.json()
+    if (!isRecord(pendingList) || !Array.isArray(pendingList.connections)) {
+      throw new Error("Expected manageable connections during callback validation.")
+    }
+    const pendingConnection = pendingList.connections.find((entry) => isRecord(entry) && entry.id === connection.id)
+    expect(pendingConnection).toMatchObject({ connected: false, connectedForMe: false })
+
+    releaseValidation()
+    const callbackResponse = await callbackPending
     expect(callbackResponse.status).toBe(200)
     expect(await callbackResponse.text()).toContain("You're connected")
 
@@ -523,6 +570,441 @@ test("connect start keeps the shared callback for a pre-registered confidential 
     expect(connectedRows[0]?.scope).toBe("mcp_server")
     expect(initializeRequests).toBeGreaterThan(0)
     expect(toolsListRequests).toBeGreaterThan(0)
+
+    const connectedListResponse = await request("/v1/mcp-connections?scope=manageable")
+    expect(connectedListResponse.status).toBe(200)
+    const connectedList: unknown = await connectedListResponse.json()
+    if (!isRecord(connectedList) || !Array.isArray(connectedList.connections)) {
+      throw new Error("Expected manageable connections after callback validation.")
+    }
+    expect(connectedList.connections.find((entry) => isRecord(entry) && entry.id === connection.id))
+      .toMatchObject({ connected: true, connectedForMe: true, credentialHealth: "ready" })
+
+    const disconnectResponse = await principalRequest(
+      userId,
+      `/v1/mcp-connections/${connection.id}/disconnect`,
+      "POST",
+    )
+    expect(disconnectResponse.status).toBe(200)
+    validationMode = "fail"
+
+    const restarted = await request(`/v1/mcp-connections/${connection.id}/connect/start`)
+    expect(restarted.status).toBe(200)
+    const restartedBody: unknown = await restarted.json()
+    if (!isRecord(restartedBody) || typeof restartedBody.authorizeUrl !== "string") {
+      throw new Error("Expected a fresh OAuth authorize URL after disconnect.")
+    }
+    const restartedAuthorizeUrl = new URL(restartedBody.authorizeUrl)
+    expectedCodeChallenge = restartedAuthorizeUrl.searchParams.get("code_challenge") ?? ""
+    const failedCallbackUrl = new URL(
+      "/v1/mcp-connections/oauth/callback",
+      process.env.DEN_API_PUBLIC_URL ?? "http://127.0.0.1:8790",
+    )
+    failedCallbackUrl.searchParams.set("code", "shared-authorization-code")
+    failedCallbackUrl.searchParams.set("state", restartedAuthorizeUrl.searchParams.get("state") ?? "")
+    const failedCallbackResponse = await app.fetch(new Request(failedCallbackUrl))
+    expect(failedCallbackResponse.status).toBe(400)
+
+    const failedListResponse = await request("/v1/mcp-connections?scope=manageable")
+    expect(failedListResponse.status).toBe(200)
+    const failedList: unknown = await failedListResponse.json()
+    if (!isRecord(failedList) || !Array.isArray(failedList.connections)) {
+      throw new Error("Expected manageable connections after callback validation failed.")
+    }
+    expect(failedList.connections.find((entry) => isRecord(entry) && entry.id === connection.id)).toMatchObject({
+      connected: false,
+      connectedForMe: false,
+      credentialHealth: "reconnect_required",
+      credentialHealthReason: "post_authorization_validation_failed",
+    })
+  } finally {
+    server.stop(true)
+  }
+})
+
+test("connect start records the shared callback mode for an isolated row whose pre-registered client keeps the shared redirect", async () => {
+  let origin = ""
+  let expectedCodeChallenge = ""
+  const tokenRedirectUris: string[] = []
+  const server = Bun.serve({
+    port: 0,
+    async fetch(incoming) {
+      const url = new URL(incoming.url)
+      if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+        return Response.json({ resource: `${origin}/mcp`, authorization_servers: [origin], scopes_supported: ["mcp_server"] })
+      }
+      if (url.pathname === "/.well-known/oauth-authorization-server") {
+        return Response.json({
+          issuer: origin,
+          authorization_endpoint: `${origin}/authorize`,
+          token_endpoint: `${origin}/token`,
+          response_types_supported: ["code"],
+          grant_types_supported: ["authorization_code"],
+          token_endpoint_auth_methods_supported: ["client_secret_post"],
+          code_challenge_methods_supported: ["S256"],
+          scopes_supported: ["mcp_server"],
+        })
+      }
+      if (url.pathname === "/token") {
+        const form = new URLSearchParams(await incoming.text())
+        expect(form.get("client_id")).toBe("kept-preregistered-client")
+        expect(form.get("client_secret")).toBe("kept-preregistered-secret")
+        expect(form.get("code")).toBe("isolated-row-authorization-code")
+        tokenRedirectUris.push(form.get("redirect_uri") ?? "")
+        expect(createHash("sha256").update(form.get("code_verifier") ?? "").digest("base64url")).toBe(expectedCodeChallenge)
+        return Response.json({ access_token: "isolated-row-access-token", token_type: "Bearer", expires_in: 3_600, scope: "mcp_server" })
+      }
+      if (url.pathname === "/mcp") {
+        if (incoming.headers.get("authorization") !== "Bearer isolated-row-access-token") {
+          return new Response(null, {
+            status: 401,
+            headers: { "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp", scope="mcp_server"` },
+          })
+        }
+        if (incoming.method !== "POST") return new Response(null, { status: 405 })
+        const rpc: unknown = await incoming.json()
+        if (!isRecord(rpc)) return Response.json({ error: "invalid_request" }, { status: 400 })
+        if (rpc.method === "notifications/initialized") return new Response(null, { status: 202 })
+        const id = typeof rpc.id === "string" || typeof rpc.id === "number" ? rpc.id : null
+        if (rpc.method === "tools/list") {
+          return Response.json({ jsonrpc: "2.0", id, result: { tools: [{ name: "list-records", description: "Lists records.", inputSchema: { type: "object", properties: {} } }] } })
+        }
+        return Response.json({
+          jsonrpc: "2.0",
+          id,
+          result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "isolated-row-test", version: "1.0.0" } },
+        })
+      }
+      return new Response(null, { status: 404 })
+    },
+  })
+  origin = `http://127.0.0.1:${server.port}`
+  const publicOrigin = process.env.DEN_API_PUBLIC_URL ?? "http://127.0.0.1:8790"
+  const sharedCallback = new URL("/v1/mcp-connections/oauth/callback", publicOrigin).toString()
+
+  try {
+    // Historical sequence: a shared-v1 row with an admin-registered client whose
+    // recorded redirect is the shared callback, then callback isolation, which
+    // kept the pre-registered client while flipping the row to isolated-v1.
+    const connection = await createExternalMcpConnection({
+      organizationId,
+      name: "Isolated row with shared registration",
+      url: `${origin}/mcp`,
+      authType: "oauth",
+      credentialMode: "per_member",
+      createdByOrgMembershipId: memberId,
+      access: { orgWide: true, memberIds: [], teamIds: [] },
+    })
+    await db
+      .update(schema.ExternalMcpConnectionTable)
+      .set({
+        oauthConfiguration: {
+          version: 1,
+          authorizationServerIssuer: origin,
+          requestedScopes: [],
+          callbackMode: "shared-v1",
+          discovery: {
+            authorizationServerUrl: origin,
+            authorizationServerMetadata: { issuer: origin, authorization_response_iss_parameter_supported: false, code_challenge_methods_supported: ["S256"] },
+            resourceMetadata: { authorization_servers: [origin] },
+          },
+        },
+      })
+      .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, connection.id))
+    await upsertOrgOAuthClient({
+      organizationId,
+      providerId: connection.id,
+      clientId: "kept-preregistered-client",
+      clientSecret: "kept-preregistered-secret",
+      extra: {
+        enterpriseMcpRegistrationSource: "pre-registered",
+        registrationContractVersion: 2,
+        registeredRedirectUri: sharedCallback,
+        authorizationServerIssuer: origin,
+        tokenEndpointAuthMethod: "client_secret_post",
+      },
+      createdByOrgMembershipId: memberId,
+    })
+    const isolated = await isolateExternalMcpOAuthCallback({ organizationId, connectionId: connection.id })
+    expect(isolated.oauthConfiguration?.callbackMode).toBe("isolated-v1")
+    const keptClient = await getOrgOAuthClient(organizationId, connection.id)
+    expect(keptClient?.clientId).toBe("kept-preregistered-client")
+
+    const inconsistentList = await request("/v1/mcp-connections?scope=manageable")
+    const inconsistentBody: unknown = await inconsistentList.json()
+    if (!isRecord(inconsistentBody) || !Array.isArray(inconsistentBody.connections)) throw new Error("Expected manageable connections.")
+    expect(inconsistentBody.connections.find((entry) => isRecord(entry) && entry.id === connection.id))
+      .toMatchObject({ oauthCallbackMode: "isolated-v1", oauthCallbackUrl: sharedCallback, oauthRegistrationSource: "pre-registered" })
+
+    // A transaction signed with the stale row mode still fails closed at the
+    // shared route, before and after the row is reconciled.
+    const staleState = createOAuthStateToken({
+      organizationId,
+      orgMembershipId: regularMemberId,
+      providerId: connection.id,
+      binding: externalMcpIdentityBinding(isolated),
+      version: 2,
+      callbackMode: "isolated-v1",
+      authorizationServerIssuer: origin,
+      authorizationResponseIssuerRequired: false,
+      secret: process.env.BETTER_AUTH_SECRET ?? "",
+    })
+    const staleSharedCallback = new URL(sharedCallback)
+    staleSharedCallback.searchParams.set("code", "stale-code")
+    staleSharedCallback.searchParams.set("state", staleState)
+    const staleRejected = await app.fetch(new Request(staleSharedCallback))
+    expect(staleRejected.status).toBe(400)
+    expect(await staleRejected.json()).toEqual({
+      error: "invalid_request",
+      message: "This authorization callback must use the shared callback selected when authorization started.",
+    })
+
+    // A granted member starts sign-in: the row adopts the shared mode its
+    // registered redirect already uses, and nothing else about the client changes.
+    const started = await principalRequest(regularUserId, `/v1/mcp-connections/${connection.id}/connect/start`)
+    expect(started.status).toBe(200)
+    const startedBody: unknown = await started.json()
+    if (!isRecord(startedBody) || typeof startedBody.authorizeUrl !== "string") throw new Error("Expected an OAuth authorize URL.")
+    const authorizeUrl = new URL(startedBody.authorizeUrl)
+    expect(authorizeUrl.searchParams.get("client_id")).toBe("kept-preregistered-client")
+    expect(authorizeUrl.searchParams.get("redirect_uri")).toBe(sharedCallback)
+    expectedCodeChallenge = authorizeUrl.searchParams.get("code_challenge") ?? ""
+    expect(expectedCodeChallenge.length).toBeGreaterThan(0)
+    const signedState = authorizeUrl.searchParams.get("state") ?? ""
+    expect(verifyOAuthStateToken({ token: signedState, secret: process.env.BETTER_AUTH_SECRET ?? "" })).toMatchObject({
+      providerId: connection.id,
+      orgMembershipId: regularMemberId,
+      callbackMode: "shared-v1",
+      authorizationServerIssuer: origin,
+      authorizationResponseIssuerRequired: false,
+    })
+    const [reconciled] = await db
+      .select()
+      .from(schema.ExternalMcpConnectionTable)
+      .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, connection.id))
+      .limit(1)
+    expect(reconciled?.oauthConfiguration?.callbackMode).toBe("shared-v1")
+    expect(reconciled?.updatedAt.getTime()).toBeGreaterThan(isolated.updatedAt.getTime())
+    expect(await getOrgOAuthClient(organizationId, connection.id)).toMatchObject({
+      clientId: "kept-preregistered-client",
+      clientSecret: "kept-preregistered-secret",
+      extra: { enterpriseMcpRegistrationSource: "pre-registered", registeredRedirectUri: sharedCallback },
+    })
+
+    const staleScopedCallback = new URL(`/v1/mcp-connections/${connection.id}/connect/callback`, publicOrigin)
+    staleScopedCallback.searchParams.set("code", "stale-code")
+    staleScopedCallback.searchParams.set("state", staleState)
+    const staleScopedRejected = await app.fetch(new Request(staleScopedCallback))
+    expect(staleScopedRejected.status).toBe(400)
+    expect(await staleScopedRejected.json()).toMatchObject({ error: "invalid_request", message: expect.stringContaining("changed after authorization started") })
+    expect(tokenRedirectUris).toEqual([])
+
+    const callbackUrl = new URL(sharedCallback)
+    callbackUrl.searchParams.set("code", "isolated-row-authorization-code")
+    callbackUrl.searchParams.set("state", signedState)
+    const callbackResponse = await app.fetch(new Request(callbackUrl))
+    expect(callbackResponse.status).toBe(200)
+    expect(await callbackResponse.text()).toContain("You're connected")
+    expect(tokenRedirectUris).toEqual([sharedCallback])
+    const [account] = await db
+      .select({ accessToken: schema.ConnectedAccountTable.accessToken })
+      .from(schema.ConnectedAccountTable)
+      .where(drizzle.and(
+        drizzle.eq(schema.ConnectedAccountTable.providerId, connection.id),
+        drizzle.eq(schema.ConnectedAccountTable.orgMembershipId, regularMemberId),
+      ))
+      .limit(1)
+    expect(account?.accessToken).toBe("isolated-row-access-token")
+    const connectedList = await request("/v1/mcp-connections?scope=manageable")
+    const connectedBody: unknown = await connectedList.json()
+    if (!isRecord(connectedBody) || !Array.isArray(connectedBody.connections)) throw new Error("Expected manageable connections.")
+    expect(connectedBody.connections.find((entry) => isRecord(entry) && entry.id === connection.id))
+      .toMatchObject({ connected: true, oauthCallbackMode: "shared-v1", oauthCallbackUrl: sharedCallback })
+
+    // Control: a legacy row whose pre-registered client recorded its own
+    // per-connection callback keeps that mode.
+    const legacy = await createExternalMcpConnection({
+      organizationId,
+      name: "Legacy row with scoped registration",
+      url: "http://127.0.0.1:9/legacy-scoped-mcp",
+      authType: "oauth",
+      credentialMode: "shared",
+      createdByOrgMembershipId: memberId,
+      access: { orgWide: true, memberIds: [], teamIds: [] },
+    })
+    await db
+      .update(schema.ExternalMcpConnectionTable)
+      .set({ oauthConfiguration: { version: 1, authorizationServerIssuer: null, requestedScopes: [], callbackMode: "legacy-v1" } })
+      .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, legacy.id))
+    const legacyCallback = new URL(`/v1/mcp-connections/${legacy.id}/connect/callback`, publicOrigin).toString()
+    await upsertOrgOAuthClient({
+      organizationId,
+      providerId: legacy.id,
+      clientId: "legacy-scoped-client",
+      clientSecret: null,
+      extra: { enterpriseMcpRegistrationSource: "pre-registered", registrationContractVersion: 2, registeredRedirectUri: legacyCallback },
+      createdByOrgMembershipId: memberId,
+    })
+    expect((await request(`/v1/mcp-connections/${legacy.id}/connect/start`)).status).toBe(502)
+    const [legacyRow] = await db
+      .select({ oauthConfiguration: schema.ExternalMcpConnectionTable.oauthConfiguration })
+      .from(schema.ExternalMcpConnectionTable)
+      .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, legacy.id))
+      .limit(1)
+    expect(legacyRow?.oauthConfiguration?.callbackMode).toBe("legacy-v1")
+  } finally {
+    server.stop(true)
+  }
+})
+
+test("a provider invalid_client rejection keeps the administrator-supplied client but still replaces SDK registrations", async () => {
+  let origin = ""
+  const tokenClientIds: string[] = []
+  const tokenClientSecrets: (string | null)[] = []
+  const registeredClientIds: string[] = []
+  const server = Bun.serve({
+    port: 0,
+    async fetch(incoming) {
+      const url = new URL(incoming.url)
+      if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+        return Response.json({ resource: `${origin}/mcp`, authorization_servers: [origin], scopes_supported: ["mcp_server"] })
+      }
+      if (url.pathname === "/.well-known/oauth-authorization-server") {
+        return Response.json({
+          issuer: origin,
+          authorization_endpoint: `${origin}/authorize`,
+          token_endpoint: `${origin}/token`,
+          registration_endpoint: `${origin}/register`,
+          response_types_supported: ["code"],
+          grant_types_supported: ["authorization_code", "refresh_token"],
+          token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"],
+          code_challenge_methods_supported: ["S256"],
+          scopes_supported: ["mcp_server"],
+        })
+      }
+      if (url.pathname === "/register") {
+        const clientId = `dynamic-client-${registeredClientIds.length + 1}`
+        registeredClientIds.push(clientId)
+        return Response.json({ client_id: clientId, token_endpoint_auth_method: "none", redirect_uris: [] }, { status: 201 })
+      }
+      if (url.pathname === "/token") {
+        const form = new URLSearchParams(await incoming.text())
+        tokenClientIds.push(form.get("client_id") ?? "")
+        tokenClientSecrets.push(form.get("client_secret"))
+        // Every exchange is rejected the way a provider rejects a client whose
+        // configured authentication does not match its registration.
+        return Response.json({ error: "invalid_client", error_description: "Unsupported client authentication method" }, { status: 400 })
+      }
+      if (url.pathname === "/mcp") {
+        return new Response(null, {
+          status: 401,
+          headers: { "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp", scope="mcp_server"` },
+        })
+      }
+      return new Response(null, { status: 404 })
+    },
+  })
+  origin = `http://127.0.0.1:${server.port}`
+  const publicOrigin = process.env.DEN_API_PUBLIC_URL ?? "http://127.0.0.1:8790"
+  const sharedCallback = new URL("/v1/mcp-connections/oauth/callback", publicOrigin).toString()
+
+  const startAndCallback = async (connectionId: string) => {
+    const started = await request(`/v1/mcp-connections/${connectionId}/connect/start`)
+    expect(started.status).toBe(200)
+    const startedBody: unknown = await started.json()
+    if (!isRecord(startedBody) || typeof startedBody.authorizeUrl !== "string") throw new Error("Expected an OAuth authorize URL.")
+    const authorizeUrl = new URL(startedBody.authorizeUrl)
+    const callbackUrl = new URL(sharedCallback)
+    callbackUrl.searchParams.set("code", "rejected-authorization-code")
+    callbackUrl.searchParams.set("state", authorizeUrl.searchParams.get("state") ?? "")
+    const callback = await app.fetch(new Request(callbackUrl))
+    return { clientId: authorizeUrl.searchParams.get("client_id"), callback }
+  }
+  const rowState = async (connectionId: string) => {
+    const [row] = await db
+      .select({ oauthConfiguration: schema.ExternalMcpConnectionTable.oauthConfiguration, credentialHealth: schema.ExternalMcpConnectionTable.credentialHealth, accessToken: schema.ExternalMcpConnectionTable.accessToken })
+      .from(schema.ExternalMcpConnectionTable)
+      .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, connectionId))
+      .limit(1)
+    if (!row) throw new Error("Connection row missing.")
+    return row
+  }
+
+  try {
+    const created = await staleSessionRequest("/v1/mcp-connections", "POST", {
+      name: "Administrator-registered MCP",
+      url: `${origin}/mcp`,
+      authType: "oauth",
+      credentialMode: "shared",
+      oauthClient: { clientId: "admin-preregistered-client", clientSecret: "admin-preregistered-secret", tokenEndpointAuthMethod: "client_secret_post" },
+    })
+    expect(created.status).toBe(200)
+    const createdBody: unknown = await created.json()
+    if (!isRecord(createdBody) || typeof createdBody.id !== "string") throw new Error("Expected a created connection id.")
+    const adminConnectionId = createdBody.id
+    const adminClientBefore = await getOrgOAuthClient(organizationId, adminConnectionId)
+    expect(adminClientBefore).toMatchObject({ clientId: "admin-preregistered-client", clientSecret: "admin-preregistered-secret" })
+
+    const first = await startAndCallback(adminConnectionId)
+    expect(first.clientId).toBe("admin-preregistered-client")
+    expect(first.callback.status).toBe(400)
+    const firstPage = await first.callback.text()
+    expect(firstPage).toContain("rejected the OAuth client configured for this connection")
+    expect(firstPage).toContain("Unsupported client authentication method")
+    expect(firstPage).not.toContain("admin-preregistered-secret")
+    expect(tokenClientIds).toEqual(["admin-preregistered-client"])
+    expect(registeredClientIds).toEqual([])
+
+    // The administrator's configuration survives the provider rejection; only
+    // the unusable credential state is cleared and reported.
+    expect(await getOrgOAuthClient(organizationId, adminConnectionId)).toMatchObject({
+      clientId: "admin-preregistered-client",
+      clientSecret: "admin-preregistered-secret",
+      extra: { enterpriseMcpRegistrationSource: "pre-registered", registeredRedirectUri: sharedCallback, tokenEndpointAuthMethod: "client_secret_post" },
+    })
+    const adminRow = await rowState(adminConnectionId)
+    expect(adminRow.accessToken).toBeNull()
+    expect(adminRow.credentialHealth).toMatchObject({ status: "reconnect_required", reason: "authorization_rejected" })
+    const listed = await request("/v1/mcp-connections?scope=manageable")
+    const listedBody: unknown = await listed.json()
+    if (!isRecord(listedBody) || !Array.isArray(listedBody.connections)) throw new Error("Expected manageable connections.")
+    expect(listedBody.connections.find((entry) => isRecord(entry) && entry.id === adminConnectionId)).toMatchObject({
+      connected: false,
+      needsReconnect: true,
+      credentialHealth: "reconnect_required",
+      oauthClientConfigured: true,
+      oauthClientId: "admin-preregistered-client",
+      oauthRegistrationSource: "pre-registered",
+      oauthCallbackUrl: sharedCallback,
+    })
+
+    // Retrying uses the same configured client and never registers a new one.
+    const second = await startAndCallback(adminConnectionId)
+    expect(second.clientId).toBe("admin-preregistered-client")
+    expect(second.callback.status).toBe(400)
+    expect(tokenClientIds).toEqual(["admin-preregistered-client", "admin-preregistered-client"])
+    // The retained secret is what the provider receives after the rejection.
+    expect(tokenClientSecrets).toEqual(["admin-preregistered-secret", "admin-preregistered-secret"])
+    expect(registeredClientIds).toEqual([])
+
+    // Control: an SDK-registered client is still discarded and re-registered.
+    const dynamic = await createExternalMcpConnection({
+      organizationId,
+      name: "Dynamically registered MCP",
+      url: `${origin}/mcp`,
+      authType: "oauth",
+      credentialMode: "shared",
+      createdByOrgMembershipId: memberId,
+      access: { orgWide: true, memberIds: [], teamIds: [] },
+    })
+    const dynamicFirst = await startAndCallback(dynamic.id)
+    expect(dynamicFirst.clientId).toBe("dynamic-client-1")
+    expect(dynamicFirst.callback.status).toBe(400)
+    expect(await getOrgOAuthClient(organizationId, dynamic.id)).toBeNull()
+    const dynamicSecond = await startAndCallback(dynamic.id)
+    expect(dynamicSecond.clientId).toBe("dynamic-client-2")
+    expect(registeredClientIds).toEqual(["dynamic-client-1", "dynamic-client-2"])
+    expect(tokenClientIds.slice(2)).toEqual(["dynamic-client-1", "dynamic-client-2"])
   } finally {
     server.stop(true)
   }
@@ -535,6 +1017,19 @@ test("connect start repairs a verified stale resource issuer alias before author
     port: 0,
     async fetch(incoming) {
       const url = new URL(incoming.url)
+      if (url.pathname === "/.well-known/oauth-authorization-server") {
+        return Response.json({
+          issuer: authorizationOrigin,
+          authorization_endpoint: `${authorizationOrigin}/authorize`,
+          token_endpoint: `${authorizationOrigin}/token`,
+          registration_endpoint: `${authorizationOrigin}/register`,
+          authorization_response_iss_parameter_supported: true,
+          response_types_supported: ["code"],
+          grant_types_supported: ["authorization_code", "refresh_token"],
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["none"],
+        })
+      }
       if (url.pathname === "/register") {
         const metadata: unknown = await incoming.json()
         const redirectUris = isRecord(metadata) && isStringArray(metadata.redirect_uris)
@@ -616,9 +1111,9 @@ test("connect start repairs a verified stale resource issuer alias before author
             authorizationServerUrl: resourceOrigin,
             authorizationServerMetadata: {
               issuer: authorizationOrigin,
-              authorization_endpoint: `${authorizationOrigin}/authorize`,
-              token_endpoint: `${authorizationOrigin}/token`,
-              registration_endpoint: `${authorizationOrigin}/register`,
+              authorization_endpoint: "http://127.0.0.1:1/authorize",
+              token_endpoint: "http://127.0.0.1:1/token",
+              registration_endpoint: "http://127.0.0.1:1/register",
               authorization_response_iss_parameter_supported: true,
               code_challenge_methods_supported: ["S256"],
             },
@@ -647,6 +1142,9 @@ test("connect start repairs a verified stale resource issuer alias before author
       .limit(1)
     expect(repaired?.oauthConfiguration?.authorizationServerIssuer).toBe(authorizationOrigin)
     expect(repaired?.oauthIssuerReviewRequiredAt).toBeNull()
+    expect(repaired?.oauthConfiguration?.discovery?.authorizationServerUrl).toBe(authorizationOrigin)
+    expect(repaired?.oauthConfiguration?.discovery?.authorizationServerMetadata?.authorization_endpoint).toBe(`${authorizationOrigin}/authorize`)
+    expect(repaired?.oauthConfiguration?.discovery?.authorizationServerMetadata?.token_endpoint).toBe(`${authorizationOrigin}/token`)
 
     if (!repaired?.oauthConfiguration?.discovery) throw new Error("Expected repaired discovery state.")
     await db
@@ -658,6 +1156,18 @@ test("connect start repairs a verified stale resource issuer alias before author
         },
       })
       .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, connection.id))
+    const [staleAgain] = await db
+      .select()
+      .from(schema.ExternalMcpConnectionTable)
+      .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, connection.id))
+      .limit(1)
+    expect(staleAgain?.oauthConfiguration?.authorizationServerIssuer).toBe(resourceOrigin)
+    expect(staleAgain?.oauthConfiguration?.discovery?.authorizationServerUrl).toBe(authorizationOrigin)
+    expect(staleAgain?.oauthConfiguration?.discovery?.authorizationServerMetadata).toMatchObject({
+      issuer: authorizationOrigin,
+      authorization_endpoint: `${authorizationOrigin}/authorize`,
+      token_endpoint: `${authorizationOrigin}/token`,
+    })
     const memberResponse = await principalRequest(
       regularUserId,
       `/v1/mcp-connections/${connection.id}/connect/start`,
@@ -677,6 +1187,128 @@ test("connect start repairs a verified stale resource issuer alias before author
   } finally {
     resourceServer.stop(true)
     authorizationServer.stop(true)
+  }
+})
+
+test("connect start reloads and retries once when the selected issuer changes during client registration", async () => {
+  let origin = ""
+  let currentIssuer = ""
+  let racedConnectionId: DenTypeId<"externalMcpConnection"> | undefined
+  const registrationAttempts: string[] = []
+  const server = Bun.serve({
+    port: 0,
+    async fetch(incoming) {
+      const url = new URL(incoming.url)
+      if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+        return Response.json({
+          resource: `${origin}/mcp`,
+          authorization_servers: [currentIssuer],
+        })
+      }
+      const issuerName = url.pathname === "/.well-known/oauth-authorization-server/issuer-a"
+        || url.pathname === "/issuer-a/.well-known/oauth-authorization-server"
+        ? "issuer-a"
+        : url.pathname === "/.well-known/oauth-authorization-server/issuer-b"
+          || url.pathname === "/issuer-b/.well-known/oauth-authorization-server"
+          ? "issuer-b"
+          : null
+      if (issuerName) {
+        const issuer = `${origin}/${issuerName}`
+        return Response.json({
+          issuer,
+          authorization_endpoint: `${origin}/authorize-${issuerName}`,
+          token_endpoint: `${origin}/token-${issuerName}`,
+          registration_endpoint: `${origin}/register-${issuerName}`,
+          authorization_response_iss_parameter_supported: true,
+          response_types_supported: ["code"],
+          grant_types_supported: ["authorization_code", "refresh_token"],
+          code_challenge_methods_supported: ["S256"],
+          token_endpoint_auth_methods_supported: ["none"],
+        })
+      }
+      if (url.pathname === "/register-issuer-a" || url.pathname === "/register-issuer-b") {
+        const issuerName = url.pathname.endsWith("issuer-a") ? "issuer-a" : "issuer-b"
+        const metadata: unknown = await incoming.json()
+        const redirectUris = isRecord(metadata) && isStringArray(metadata.redirect_uris)
+          ? metadata.redirect_uris
+          : []
+        registrationAttempts.push(issuerName)
+        if (issuerName === "issuer-a") {
+          if (!racedConnectionId) throw new Error("Expected the raced MCP connection id.")
+          currentIssuer = `${origin}/issuer-b`
+          const [current] = await db
+            .select()
+            .from(schema.ExternalMcpConnectionTable)
+            .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, racedConnectionId))
+            .limit(1)
+          if (!current?.oauthConfiguration) throw new Error("Expected the raced OAuth configuration.")
+          const { discovery: _discovery, ...configuration } = current.oauthConfiguration
+          await db
+            .update(schema.ExternalMcpConnectionTable)
+            .set({
+              oauthConfiguration: {
+                ...configuration,
+                authorizationServerIssuer: currentIssuer,
+              },
+            })
+            .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, racedConnectionId))
+        }
+        return Response.json({
+          client_id: `${issuerName}-client`,
+          token_endpoint_auth_method: "none",
+          redirect_uris: redirectUris,
+        }, { status: 201 })
+      }
+      if (url.pathname === "/mcp") {
+        return new Response(null, {
+          status: 401,
+          headers: {
+            "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
+          },
+        })
+      }
+      return new Response(null, { status: 404 })
+    },
+  })
+  origin = `http://127.0.0.1:${server.port}`
+  currentIssuer = `${origin}/issuer-a`
+
+  try {
+    const connection = await createExternalMcpConnection({
+      organizationId,
+      name: "Concurrent issuer update MCP",
+      url: `${origin}/mcp`,
+      authType: "oauth",
+      credentialMode: "shared",
+      oauthConfiguration: {
+        version: 1,
+        authorizationServerIssuer: currentIssuer,
+        requestedScopes: [],
+      },
+      createdByOrgMembershipId: memberId,
+      access: { orgWide: true, memberIds: [], teamIds: [] },
+    })
+    racedConnectionId = connection.id
+
+    const response = await request(`/v1/mcp-connections/${connection.id}/connect/start`)
+    expect(response.status).toBe(200)
+    const body: unknown = await response.json()
+    if (!isRecord(body) || typeof body.authorizeUrl !== "string") {
+      throw new Error("Expected an OAuth authorize URL after the configuration retry.")
+    }
+    expect(new URL(body.authorizeUrl).pathname).toBe("/authorize-issuer-b")
+    expect(registrationAttempts).toEqual(["issuer-a", "issuer-b"])
+
+    const [savedClient] = await db
+      .select()
+      .from(schema.OrgOAuthClientTable)
+      .where(drizzle.eq(schema.OrgOAuthClientTable.providerId, connection.id))
+      .limit(1)
+    expect(savedClient?.clientId).toBe("issuer-b-client")
+    expect(savedClient?.extra?.authorizationServerIssuer).toBe(`${origin}/issuer-b`)
+    expect(JSON.stringify(savedClient)).not.toContain("issuer-a-client")
+  } finally {
+    server.stop(true)
   }
 })
 
@@ -859,7 +1491,7 @@ test("public OAuth callback scopes the signed connection lookup to its organizat
   expect(body).toEqual({ error: "invalid_request", message: "Unknown authorization transaction." })
 })
 
-test("public OAuth callback validates state and renders a safe provider-denial diagnostic", async () => {
+test("public OAuth callback accepts a signed pre-hash binding and renders a safe provider-denial diagnostic", async () => {
   const issuer = "https://identity.example.test/tenant"
   await db
     .update(schema.ExternalMcpConnectionTable)
@@ -884,11 +1516,11 @@ test("public OAuth callback validates state and renders a safe provider-denial d
     organizationId,
     orgMembershipId: memberId,
     providerId: seededConnectionId(),
-    binding: externalMcpIdentityBinding({
-      url: "http://127.0.0.1:9/mcp",
-      authType: "oauth",
-      credentialMode: "per_member",
-    }),
+    binding: Buffer.from(JSON.stringify([
+      "http://127.0.0.1:9/mcp",
+      "oauth",
+      "per_member",
+    ])).toString("base64url"),
     version: 2,
     callbackMode: "shared-v1",
     authorizationServerIssuer: issuer,
@@ -1114,11 +1746,13 @@ test("shared-callback version-two state is rejected by the legacy callback even 
   expect(await response.json()).toEqual({ error: "invalid_request", message: "Invalid or expired state." })
 })
 
-test("non-OAuth create validation returns the same structured network diagnostic", async () => {
+test.each(["none", "apikey"] as const)("failed %s creation returns the diagnostic without retaining a ready connection", async (authType) => {
+  const name = `Broken ${authType} MCP`
   const response = await staleSessionRequest("/v1/mcp-connections", "POST", {
-    name: "Broken no-auth MCP",
+    name,
     url: "http://127.0.0.1:9/mcp",
-    authType: "none",
+    authType,
+    ...(authType === "apikey" ? { apiKey: "invalid-test-api-key" } : {}),
     credentialMode: "shared",
   })
   expect(response.status).toBe(502)
@@ -1135,6 +1769,14 @@ test("non-OAuth create validation returns the same structured network diagnostic
   })
   expect(typeof body.diagnostic.referenceId).toBe("string")
   expect(response.headers.get("x-request-id")).toBeNull()
+  const retained = await db.select().from(schema.ExternalMcpConnectionTable).where(drizzle.and(
+    drizzle.eq(schema.ExternalMcpConnectionTable.organizationId, organizationId),
+    drizzle.eq(schema.ExternalMcpConnectionTable.name, name),
+  ))
+  expect(retained).toHaveLength(0)
+  expect(await db.select().from(schema.ExternalMcpConnectionTable).where(
+    drizzle.eq(schema.ExternalMcpConnectionTable.id, seededConnectionId()),
+  )).toHaveLength(1)
 })
 
 test("connection configuration rejects credentials embedded in MCP URLs", async () => {

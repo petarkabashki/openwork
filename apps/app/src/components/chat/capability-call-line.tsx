@@ -2,9 +2,9 @@
 
 import { useState } from "react"
 import type { DynamicToolUIPart } from "ai"
-import { ChevronRight, CircleAlert, ExternalLink, LoaderCircle, RefreshCcw } from "lucide-react"
+import { Ellipsis, ExternalLink, LoaderCircle, RefreshCcw } from "lucide-react"
 
-import { attributeChatToolError } from "@/components/tools/error-attribution"
+import { describeChatToolFailure } from "@/components/tools/error-attribution"
 import {
   useChatToolReconnect,
   type ChatToolReconnectCallbacks,
@@ -15,17 +15,52 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible"
-import { DotMatrixLoader } from "@/components/ui/dot-matrix-loader"
-import { getCapabilityCallQuote, getCapabilityCallSentence, parseRecord } from "@/lib/capability-call"
-import { normalizeErrorText } from "@/lib/error-text"
+import { getCapabilityCallQuote, getCapabilityCallSentence } from "@/lib/capability-call"
 import { trackToolCallDuration } from "@/lib/tool-call-duration"
 import { isToolPartInFlight } from "@/lib/tool-activity"
 import { cn } from "@/lib/utils"
-import { McpAppFrame } from "./mcp-app-frame"
+import type { ConnectorToolIdentity } from "@/react-app/domains/connections/connector-tool-identity"
 
 type CapabilityCallLineProps = ChatToolReconnectCallbacks & {
   part: DynamicToolUIPart
   className?: string
+  connector?: ConnectorToolIdentity | null
+  resultUnavailable?: boolean
+  statusUnknown?: boolean
+  quietFailure?: boolean
+  shimmer?: boolean
+}
+
+function ConnectorMark({ connector }: { connector: ConnectorToolIdentity }) {
+  const [failedUrl, setFailedUrl] = useState<string | null>(null)
+  const showImage = Boolean(connector.iconUrl && failedUrl !== connector.iconUrl)
+  return (
+    <span
+      data-connector-icon={connector.id}
+      data-connector-name={connector.name}
+      className={cn(
+        "flex size-5 shrink-0 items-center justify-center overflow-hidden rounded-md",
+        // The muted chip only exists to make the single-letter fallback read
+        // as an avatar; real brand icons render without a background.
+        !showImage && "bg-muted text-[10px] font-semibold text-foreground",
+      )}
+      title={connector.name}
+      aria-hidden="true"
+    >
+      {showImage && connector.iconUrl ? (
+        <img
+          src={connector.iconUrl}
+          alt=""
+          className="size-4 object-contain"
+          loading="lazy"
+          decoding="async"
+          onError={() => setFailedUrl(connector.iconUrl)}
+        />
+      ) : (
+        connector.name.charAt(0).toUpperCase()
+      )}
+    </span>
+  )
 }
 
 function formatTechnicalValue(value: unknown): string {
@@ -43,34 +78,10 @@ function failureInstruction(part: DynamicToolUIPart, reconnectName: string | nul
     return `${reconnectName} needs a fresh sign-in — reconnect it, then retry.`
   }
   const errorText = part.state === "output-error" ? part.errorText : null
-  const attribution = errorText ? attributeChatToolError(errorText) : null
-  if (attribution) return attribution.description
-
-  // Structured provider errors ({ error, details: [{ message }] }) should
-  // read as a sentence, never as raw JSON.
-  const record = errorText ? parseRecord(errorText) : null
-  if (record) {
-    const code = typeof record.error === "string" ? record.error : null
-    const detailMessage = Array.isArray(record.details)
-      ? record.details
-        .map((detail) => (typeof detail === "object" && detail !== null && "message" in detail && typeof detail.message === "string" ? detail.message : null))
-        .find((message) => message)
-      : null
-    const message = detailMessage ?? (typeof record.message === "string" ? record.message : null)
-    const summary = [code?.replace(/_/g, " "), message].filter(Boolean).join(" — ")
-    if (summary) return `The provider rejected the call: ${summary}.`
-  }
-
-  const firstLine = errorText?.split("\n")[0]?.trim()
-  if (firstLine && !firstLine.startsWith("{") && !firstLine.startsWith("[") && !firstLine.startsWith("<")) return firstLine
-  if (firstLine?.startsWith("<") && errorText) {
-    const normalizedFirstLine = normalizeErrorText(errorText, { cap: 500 }).display.split("\n")[0]?.trim()
-    if (normalizedFirstLine && !normalizedFirstLine.startsWith("<")) return normalizedFirstLine
-  }
-  return "The call failed. Full error is under Technical details."
+  return describeChatToolFailure(errorText ?? "")
 }
 
-function TechnicalDetailsPanel({ part }: { part: DynamicToolUIPart }) {
+export function TechnicalDetailsPanel({ part, resultUnavailable = false }: { part: DynamicToolUIPart; resultUnavailable?: boolean }) {
   return (
     <div className="mt-2 flex flex-col gap-2 rounded-lg bg-muted p-2 text-xs">
       <div className="font-mono text-[11px] text-muted-foreground">
@@ -86,6 +97,9 @@ function TechnicalDetailsPanel({ part }: { part: DynamicToolUIPart }) {
           {formatTechnicalValue(part.output)}
         </pre>
       ) : null}
+      {resultUnavailable ? (
+        <p>The engine did not provide an individual result for this action. See the execution details.</p>
+      ) : null}
       {part.state === "output-error" && part.errorText ? (
         <pre className="max-h-60 overflow-auto whitespace-pre-wrap wrap-break-word opacity-80">
           {part.errorText}
@@ -96,9 +110,9 @@ function TechnicalDetailsPanel({ part }: { part: DynamicToolUIPart }) {
 }
 
 /**
- * Paper "Capability calls → sentences" + "No icon per tool call":
- * a plain muted text line — dot-matrix while running, past-tense verb
- * with duration when done. IDs, schema digests, and raw payloads live
+ * Capability calls stay sentence-first. Calls attributed to a connector add
+ * that connector's first-class brand mark; unbranded calls keep the circular
+ * spinner while running. IDs, schema digests, and raw payloads live
  * under a collapsed "Technical details" section.
  * Failures render the Paper "Failed Call Card": service avatar +
  * present-participle headline, the interpreted ask as a quote, one
@@ -108,29 +122,51 @@ function TechnicalDetailsPanel({ part }: { part: DynamicToolUIPart }) {
 export function CapabilityCallLine({
   part,
   className,
+  connector,
+  resultUnavailable = false,
+  statusUnknown = false,
+  quietFailure = false,
+  shimmer = false,
   onReconnect,
   onReopenAuthorization,
-  onRetry,
 }: CapabilityCallLineProps) {
   const [open, setOpen] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
-  const inFlight = isToolPartInFlight(part)
+  const inFlight = !statusUnknown && isToolPartInFlight(part)
   const isFailed = part.state === "output-error"
-  const duration = trackToolCallDuration(part)
+  const duration = statusUnknown ? null : trackToolCallDuration(part)
   const { reconnectAction, reconnectState, reconnectError, reconnectPresentation, handleReconnect } =
-    useChatToolReconnect(part, { onReconnect, onReopenAuthorization, onRetry })
+    useChatToolReconnect(part, { onReconnect, onReopenAuthorization })
   const ReconnectIcon = reconnectState === "opening"
     ? LoaderCircle
     : reconnectState === "authorization_opened"
       ? ExternalLink
       : RefreshCcw
 
+  // Inner script failures are frequent and often recovered. Keep their place
+  // in the rail without turning a failed call into a prominent card.
+  if (isFailed && quietFailure && !reconnectAction) {
+    const sentence = getCapabilityCallSentence(part, { includeQuery: false, connectionName: connector?.name })
+    const label = sentence.failure ?? `Couldn't complete ${sentence.past.toLowerCase()}`
+    return (
+      <Collapsible data-capability-call={part.toolName} open={open} onOpenChange={setOpen} className={className}>
+        <CollapsibleTrigger className="flex min-w-0 items-center gap-2 text-start text-sm text-muted-foreground hover:text-foreground" aria-label={`${label}. ${open ? "Hide" : "Show"} technical details`}>
+          {connector ? <ConnectorMark connector={connector} /> : null}
+          <span className="min-w-0 truncate">{label}</span>
+          {duration ? <span className="shrink-0 text-xs tabular-nums text-muted-foreground/70">{duration}</span> : null}
+        </CollapsibleTrigger>
+        <CollapsibleContent><TechnicalDetailsPanel part={part} /></CollapsibleContent>
+      </Collapsible>
+    )
+  }
+
   // Failures stay minimal until the user asks for more: one collapsed
   // line, expanding into the Paper "Failed Call Card" (quote, instruction
   // + Reconnect/Retry, technical details).
   if (isFailed) {
-    const sentence = getCapabilityCallSentence(part, { includeQuery: false })
-    const quote = getCapabilityCallQuote(part)
+    const sentence = getCapabilityCallSentence(part, { includeQuery: false, connectionName: connector?.name })
+    const failureLabel = sentence.failure ?? `${sentence.past} failed`
+    const quote = sentence.failure ? null : getCapabilityCallQuote(part)
     const initial = sentence.service?.charAt(0).toUpperCase() ?? null
     return (
       <Collapsible
@@ -141,22 +177,21 @@ export function CapabilityCallLine({
       >
         <CollapsibleTrigger
           className="group flex min-w-0 max-w-full cursor-pointer items-center gap-2 text-start text-sm text-muted-foreground transition-colors hover:text-foreground"
-          aria-label={open ? `${sentence.past}. Hide failure details` : `${sentence.past} failed. Show what to do next`}
+          aria-label={open ? `${failureLabel}. Hide failure details` : `${failureLabel}. Show what to do next`}
         >
-          <ChevronRight
-            aria-hidden="true"
-            className={cn("size-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-150", open && "rotate-90")}
-          />
-          <span className="min-w-0 truncate">{sentence.past}</span>
-          <span className="shrink-0 text-xs font-medium text-destructive">failed</span>
+          {connector ? <ConnectorMark connector={connector} /> : null}
+          <span className="min-w-0 truncate">{sentence.failure ?? sentence.past}</span>
+          {!sentence.failure ? <span className="shrink-0 text-xs text-dls-secondary">failed</span> : null}
           {duration ? (
             <span className="shrink-0 text-xs tabular-nums text-muted-foreground/70">{duration}</span>
           ) : null}
         </CollapsibleTrigger>
         <CollapsibleContent className="h-(--collapsible-panel-height) overflow-hidden transition-[height] duration-150 ease-out data-starting-style:h-0 data-ending-style:h-0 [&[hidden]:not([hidden='until-found'])]:hidden">
-          <div className="mt-2 flex flex-col gap-3 rounded-xl border border-border bg-muted/30 p-4">
+          <div className="mt-2 flex flex-col gap-2 border-s border-border ps-3">
             <div className="flex min-w-0 items-center gap-2.5">
-              {initial ? (
+              {connector ? (
+                <ConnectorMark connector={connector} />
+              ) : initial ? (
                 <span
                   aria-hidden="true"
                   className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted text-xs font-semibold text-foreground"
@@ -165,7 +200,7 @@ export function CapabilityCallLine({
                 </span>
               ) : null}
               <span className="min-w-0 truncate text-sm font-medium text-foreground">
-                {sentence.present}
+                {sentence.failure ?? sentence.present}
               </span>
             </div>
             {quote ? (
@@ -175,16 +210,15 @@ export function CapabilityCallLine({
               </div>
             ) : null}
             <div className="flex min-w-0 items-center gap-2">
-              <CircleAlert aria-hidden="true" className="size-3.5 shrink-0 text-destructive" />
-              <p className="min-w-0 text-[13px] leading-5 text-destructive/90">
-                {failureInstruction(part, reconnectAction?.connectionName ?? null)}
+              <p className="min-w-0 text-sm leading-5 text-dls-secondary">
+                {reconnectState === "connected" ? "The connection is restored. Check whether the action finished before retrying." : failureInstruction(part, reconnectAction?.connectionName ?? null)}
               </p>
               {reconnectAction && onReconnect ? (
                 <Button
                   type="button"
                   variant="ghost"
                   size="xs"
-                  className="ms-auto h-6 shrink-0 gap-1.5 rounded-md px-2 font-semibold text-blue-11 shadow-none before:shadow-none hover:bg-blue-3/60"
+                  className="ms-auto shrink-0"
                   data-testid="chat-mcp-reconnect-action"
                   disabled={reconnectPresentation?.disabled}
                   title={`${reconnectPresentation?.buttonLabel} ${reconnectAction.connectionName}`}
@@ -201,24 +235,15 @@ export function CapabilityCallLine({
               ) : null}
             </div>
             {reconnectError ? (
-              <p className="text-xs text-destructive" role="alert">{reconnectError}</p>
+              <p className="text-xs text-dls-secondary" role="alert">{describeChatToolFailure(reconnectError)}</p>
             ) : null}
-            <div className="border-t border-border/60 pt-2.5">
-              <button
-                type="button"
+            <div>
+              <Button variant="ghost" size="icon-xs" title="Technical details" aria-label="Technical details"
                 onClick={() => setDetailsOpen(!detailsOpen)}
                 aria-expanded={detailsOpen}
-                className="flex min-w-0 cursor-pointer items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
               >
-                <ChevronRight
-                  aria-hidden="true"
-                  className={cn("size-3 shrink-0 transition-transform duration-150", detailsOpen && "rotate-90")}
-                />
-                <span className="shrink-0">Technical details</span>
-                <span className="min-w-0 truncate text-muted-foreground/60">
-                  capability name · arguments · schema digest
-                </span>
-              </button>
+                <Ellipsis aria-hidden="true" />
+              </Button>
               {detailsOpen ? <TechnicalDetailsPanel part={part} /> : null}
             </div>
           </div>
@@ -227,32 +252,32 @@ export function CapabilityCallLine({
     )
   }
 
-  const sentence = getCapabilityCallSentence(part)
-  const line = inFlight ? sentence.present : sentence.past
+  const sentence = getCapabilityCallSentence(part, { connectionName: connector?.name })
+  const line = statusUnknown ? `${sentence.present} — status unavailable` : inFlight ? sentence.present : sentence.past
   return (
-    <>
     <Collapsible data-capability-call={part.toolName} open={open} onOpenChange={setOpen} className={className}>
       <div className="flex min-w-0 items-center gap-2">
         <CollapsibleTrigger
           className="group flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-start text-sm text-muted-foreground transition-colors hover:text-foreground"
           aria-label={open ? `${line}. Hide technical details` : `${line}. Show technical details`}
         >
-          {inFlight ? (
+          {connector ? (
+            <ConnectorMark connector={connector} />
+          ) : inFlight ? (
             <span className="flex size-3.5 shrink-0 items-center justify-center">
-              <DotMatrixLoader label={line} className="text-muted-foreground" />
+              {shimmer ? <span aria-hidden="true" className="size-1 rounded-full bg-muted-foreground" />
+                : <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin text-muted-foreground" />}
             </span>
           ) : null}
-          <span className="min-w-0 truncate">{line}</span>
+          <span className={cn("min-w-0 truncate", shimmer && inFlight && "ow-text-shimmer motion-reduce:animate-none")}>{line}</span>
           {duration ? (
             <span className="shrink-0 text-xs tabular-nums text-muted-foreground/70">{duration}</span>
           ) : null}
         </CollapsibleTrigger>
       </div>
       <CollapsibleContent className="h-(--collapsible-panel-height) overflow-hidden transition-[height] duration-150 ease-out data-starting-style:h-0 data-ending-style:h-0 [&[hidden]:not([hidden='until-found'])]:hidden">
-        <TechnicalDetailsPanel part={part} />
+        <TechnicalDetailsPanel part={part} resultUnavailable={resultUnavailable} />
       </CollapsibleContent>
     </Collapsible>
-    {part.state === "output-available" ? <McpAppFrame part={part} /> : null}
-    </>
   )
 }

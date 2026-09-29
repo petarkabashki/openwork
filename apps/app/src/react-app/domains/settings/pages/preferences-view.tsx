@@ -10,6 +10,8 @@ import {
 import { Switch } from "@/components/ui/switch";
 
 import { t } from "@/i18n";
+import { isElectronRuntime } from "@/app/utils";
+import { isLinkOpenDestination, type LinkOpenDestination } from "@/react-app/kernel/local-preferences-storage";
 import {
   DESKTOP_NOTIFICATION_PREFERENCE_VALUES,
   isDesktopNotificationPreference,
@@ -40,12 +42,8 @@ export type PreferencesViewProps = {
   onToggleAnalytics: () => void;
   desktopNotifications: DesktopNotificationPreference;
   onDesktopNotificationsChange: (value: DesktopNotificationPreference) => void;
-  continuousEngineAvailable: boolean;
-  continuousEngineEnabled: boolean;
-  continuousEngineBusy: boolean;
-  onToggleContinuousEngine: () => void;
-  memoryEnabled: boolean;
-  onToggleMemory: () => void;
+  linkOpenDestination: LinkOpenDestination;
+  onLinkOpenDestinationChange: (value: LinkOpenDestination) => void;
 };
 
 function desktopNotificationPreferenceLabel(value: DesktopNotificationPreference) {
@@ -60,6 +58,10 @@ function desktopNotificationPreferenceLabel(value: DesktopNotificationPreference
 }
 
 export function PreferencesView(props: PreferencesViewProps) {
+  const linkDestinationItems = [
+    { value: "openwork", label: "OpenWork" },
+    { value: "external", label: t("settings.links.external") },
+  ];
   const desktopNotificationItems = DESKTOP_NOTIFICATION_PREFERENCE_VALUES.map((value) => ({
     value,
     label: desktopNotificationPreferenceLabel(value),
@@ -149,24 +151,36 @@ export function PreferencesView(props: PreferencesViewProps) {
 
       <DesktopIntegrationSection />
 
-      {props.continuousEngineAvailable ? (
+      {isElectronRuntime() ? (
         <LayoutSection>
           <LayoutSectionHeader>
-            <LayoutSectionTitle>{t("settings.engine_rollover_title")}</LayoutSectionTitle>
-            <LayoutSectionDescription>{t("settings.engine_rollover_section_desc")}</LayoutSectionDescription>
+            <LayoutSectionTitle>{t("settings.browser_title")}</LayoutSectionTitle>
+            <LayoutSectionDescription>{t("settings.browser_section_desc")}</LayoutSectionDescription>
           </LayoutSectionHeader>
 
           <LayoutSectionItem>
-            <LayoutSectionItemHeader>
-              <LayoutSectionItemTitle>{t("settings.engine_rollover_toggle")}</LayoutSectionItemTitle>
-              <LayoutSectionItemDescription>{t("settings.engine_rollover_toggle_desc")}</LayoutSectionItemDescription>
-              <LayoutSectionItemHeaderActions>
-                <Switch
-                  aria-label={t("settings.engine_rollover_toggle")}
-                  checked={props.continuousEngineEnabled}
-                  disabled={props.busy || props.continuousEngineBusy}
-                  onCheckedChange={props.onToggleContinuousEngine}
-                />
+            <LayoutSectionItemHeader className="min-h-10 items-center">
+              <LayoutSectionItemTitle>{t("settings.links.open_in")}</LayoutSectionItemTitle>
+              <LayoutSectionItemDescription>{t("settings.links.open_in_desc")}</LayoutSectionItemDescription>
+              <LayoutSectionItemHeaderActions className="self-center">
+                <Select
+                  value={props.linkOpenDestination}
+                  items={linkDestinationItems}
+                  onValueChange={(value) => {
+                    if (isLinkOpenDestination(value)) props.onLinkOpenDestinationChange(value);
+                  }}
+                >
+                  <SelectTrigger className="w-44" aria-label={t("settings.links.open_in")}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {linkDestinationItems.map(({ value, label }) => (
+                        <SelectItem key={value} value={value}>{label}</SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
               </LayoutSectionItemHeaderActions>
             </LayoutSectionItemHeader>
           </LayoutSectionItem>
@@ -189,28 +203,6 @@ export function PreferencesView(props: PreferencesViewProps) {
                 checked={props.analyticsEnabled}
                 disabled={props.busy}
                 onCheckedChange={props.onToggleAnalytics}
-              />
-            </LayoutSectionItemHeaderActions>
-          </LayoutSectionItemHeader>
-        </LayoutSectionItem>
-      </LayoutSection>
-
-      <LayoutSection>
-        <LayoutSectionHeader>
-          <LayoutSectionTitle>{t("memory.preferences_title")}</LayoutSectionTitle>
-          <LayoutSectionDescription>{t("memory.preferences_section_desc")}</LayoutSectionDescription>
-        </LayoutSectionHeader>
-
-        <LayoutSectionItem>
-          <LayoutSectionItemHeader>
-            <LayoutSectionItemTitle>{t("memory.preferences_toggle")}</LayoutSectionItemTitle>
-            <LayoutSectionItemDescription>{t("memory.preferences_toggle_desc")}</LayoutSectionItemDescription>
-            <LayoutSectionItemHeaderActions>
-              <Switch
-                aria-label={t("memory.preferences_toggle")}
-                checked={props.memoryEnabled}
-                disabled={props.busy}
-                onCheckedChange={props.onToggleMemory}
               />
             </LayoutSectionItemHeaderActions>
           </LayoutSectionItemHeader>

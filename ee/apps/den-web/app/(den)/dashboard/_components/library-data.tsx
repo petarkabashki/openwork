@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { queryOptions, useQuery } from "@tanstack/react-query";
 
 import { getErrorMessage, requestJson } from "../../_lib/den-flow";
 import type { PluginAccessRole } from "./plugin-access-data";
@@ -47,8 +47,8 @@ export type LibraryConnectionItem = {
   edges: LibraryAccessEdge[];
 };
 
-export type LibraryProgramItem = {
-  type: "program";
+export type LibraryWorkflowItem = {
+  type: "workflow";
   id: string;
   plugin: LibraryNamedEntity | null;
   name: string;
@@ -64,7 +64,7 @@ export type LibraryProgramItem = {
   source: { kind: "created" | "installed_template"; templateName?: string; templateVersion?: string };
 };
 
-export type LibraryItem = LibraryPluginItem | LibraryConnectionItem | LibraryProgramItem;
+export type LibraryItem = LibraryPluginItem | LibraryConnectionItem | LibraryWorkflowItem;
 
 export const libraryQueryKeys = {
   items: ["me", "library"],
@@ -222,7 +222,7 @@ function parseConnection(value: Record<string, unknown>): LibraryConnectionItem 
   };
 }
 
-function parseProgram(value: Record<string, unknown>): LibraryProgramItem | null {
+function parseWorkflow(value: Record<string, unknown>): LibraryWorkflowItem | null {
   const id = readString(value.id);
   const plugin = value.plugin === null ? null : parseNamedEntity(value.plugin);
   const name = readString(value.name);
@@ -235,7 +235,7 @@ function parseProgram(value: Record<string, unknown>): LibraryProgramItem | null
   const viewState = value.viewState === "default" || value.viewState === "custom_active" || value.viewState === "build_failed" || value.viewState === "retired" ? value.viewState : null;
   const activeViewTitle = readNullableString(value.activeViewTitle);
   const sourceKind = isRecord(value.source) && (value.source.kind === "created" || value.source.kind === "installed_template") ? value.source.kind : null;
-  const source: LibraryProgramItem["source"] | null = isRecord(value.source) && sourceKind
+  const source: LibraryWorkflowItem["source"] | null = isRecord(value.source) && sourceKind
     ? {
         kind: sourceKind,
         ...(readString(value.source.templateName) ? { templateName: readString(value.source.templateName) ?? undefined } : {}),
@@ -245,7 +245,7 @@ function parseProgram(value: Record<string, unknown>): LibraryProgramItem | null
   if (!id || (value.plugin !== null && !plugin) || !name || description === undefined || !role || !edges || !state || !resultState
     || latestSuccessfulAt === undefined || !viewState || activeViewTitle === undefined || !source
     || typeof value.automationCount !== "number" || !Number.isInteger(value.automationCount) || value.automationCount < 0) return null;
-  return { type: "program", id, plugin, name, description, role, edges, state, resultState, latestSuccessfulAt, viewState, activeViewTitle, automationCount: value.automationCount, source };
+  return { type: "workflow", id, plugin, name, description, role, edges, state, resultState, latestSuccessfulAt, viewState, activeViewTitle, automationCount: value.automationCount, source };
 }
 
 function parseLibraryItem(value: unknown): LibraryItem | null {
@@ -253,7 +253,7 @@ function parseLibraryItem(value: unknown): LibraryItem | null {
   if (value.type === "plugin") return parsePlugin(value);
   if (value.type === "app") return null;
   if (value.type === "connection") return parseConnection(value);
-  if (value.type === "program") return parseProgram(value);
+  if (value.type === "workflow") return parseWorkflow(value);
   return null;
 }
 
@@ -271,8 +271,8 @@ export function parseLibraryPayload(payload: unknown): LibraryItem[] {
   return items;
 }
 
-export function useLibrary() {
-  return useQuery({
+export function libraryQueryOptions() {
+  return queryOptions({
     queryKey: libraryQueryKeys.items,
     queryFn: async (): Promise<LibraryItem[]> => {
       const { response, payload } = await requestJson(
@@ -286,4 +286,8 @@ export function useLibrary() {
       return parseLibraryPayload(payload);
     },
   });
+}
+
+export function useLibrary() {
+  return useQuery(libraryQueryOptions());
 }

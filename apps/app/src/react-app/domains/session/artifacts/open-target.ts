@@ -1,7 +1,7 @@
 import type { UIMessage } from "ai";
 
 type OpenTargetKind = "url" | "file";
-export type OpenTargetPreview = "browser" | "markdown" | "sheet" | "slides" | "document" | "image" | "pdf" | "html" | "text" | "external";
+export type OpenTargetPreview = "browser" | "markdown" | "code" | "sheet" | "slides" | "document" | "image" | "pdf" | "html" | "text" | "external";
 
 export interface TextData {
   kind: "text";
@@ -28,13 +28,50 @@ export type OpenTarget = {
   updatedAt?: number;
 };
 
+/** Explicit links preserve the full address, unlike URLs extracted from prose. */
+export function openTargetFromUrl(href: string): OpenTarget | null {
+  const value = href.trim();
+  try {
+    if (!["http:", "https:"].includes(new URL(value).protocol)) return null;
+  } catch {
+    return null;
+  }
+  return {
+    id: `url:${value}`, kind: "url", value, name: value,
+    preview: "browser", confidence: 100, reason: "explicit link",
+  };
+}
+
+export function sameOpenTargets(left: OpenTarget[], right: OpenTarget[]): boolean {
+  return left.length === right.length && left.every((target, index) => {
+    const other = right[index];
+    return other !== undefined
+      && target.id === other.id
+      && target.kind === other.kind
+      && target.value === other.value
+      && target.name === other.name
+      && target.preview === other.preview
+      && target.confidence === other.confidence
+      && target.reason === other.reason
+      && target.exists === other.exists
+      && target.size === other.size
+      && target.updatedAt === other.updatedAt;
+  });
+}
+
 const WORKSPACES_PREFIX_PATTERN = /^workspaces\/[^/]+\//i;
 const WORKSPACE_ID_PREFIX_PATTERN = /^workspace\/(?:ws_[^/]+|\d+|[0-9a-f-]{6,})\//i;
 
 const FILE_PATTERN = /(?:^|[\s"'`([{])((?:\.{1,2}[/\\]|~[/\\]|[/\\])?[\w.\-]+(?:[/\\][\w.\-]+)+\.[a-z][a-z0-9]{0,9}|[\w.\-]+\.[a-z][a-z0-9]{0,9})/gi;
 const URL_PATTERN = /https?:\/\/[^\s)\]}>"'`]+/gi;
 const SOCKET_PATTERN = /(?:ws|wss):\/\/[^\s)\]}>"'`]+/gi;
-const SIDEBAR_ARTIFACT_FILE_PREVIEWS = new Set<OpenTargetPreview>(["markdown", "sheet", "slides", "document", "image", "pdf", "html"]);
+const SIDEBAR_ARTIFACT_FILE_PREVIEWS = new Set<OpenTargetPreview>(["markdown", "code", "sheet", "slides", "document", "image", "pdf", "html"]);
+const CODE_EXTENSIONS = new Set([
+  ".astro", ".bash", ".c", ".cc", ".cpp", ".cs", ".css", ".dart", ".ex", ".exs", ".go", ".graphql",
+  ".h", ".hpp", ".java", ".js", ".jsx", ".kt", ".kts", ".lua", ".mjs", ".cjs", ".php", ".prisma",
+  ".py", ".rb", ".rs", ".scss", ".sh", ".sql", ".svelte", ".swift", ".ts", ".tsx", ".vue", ".zig",
+  ".json", ".jsonc", ".toml", ".xml", ".yaml", ".yml",
+]);
 const MARKDOWN_LINK_PATTERN = /\[([^\]\n]+)\]\(([^)\s]+)\)/g;
 const ASSISTANT_ARTIFACT_MENTION_PATTERN = /\b(?:artifact|created|deck|deliverable|exported|file|generated|opened|presentation|saved|slides?|updated|wrote)\b/i;
 const DISCOVERY_TOOL_NAMES = new Set(["glob", "grep", "search", "find"]);
@@ -79,18 +116,27 @@ function extname(value: string) {
   return index >= 0 ? name.slice(index) : "";
 }
 
-function classifyOpenTarget(value: string, kind: OpenTargetKind): OpenTargetPreview {
+export function classifyOpenTarget(value: string, kind: OpenTargetKind): OpenTargetPreview {
   if (kind === "url") return "browser";
   const ext = extname(value);
-  if ([".md", ".markdown", ".mdx"].includes(ext)) return "markdown";
-  if ([".csv", ".tsv", ".xlsx", ".xls", ".ods"].includes(ext)) return "sheet";
+  if ([".md", ".markdown", ".mdx", ".mmd"].includes(ext)) return "markdown";
+  if ([".csv", ".tsv", ".xlsx"].includes(ext)) return "sheet";
   if ([".ppt", ".pptx", ".pptm", ".pot", ".potx", ".odp", ".key", ".sxi"].includes(ext)) return "slides";
   if (ext === ".docx") return "document";
   if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"].includes(ext)) return "image";
   if (ext === ".pdf") return "pdf";
   if ([".html", ".htm"].includes(ext)) return "html";
-  if ([".txt", ".log", ".json", ".jsonc", ".yaml", ".yml", ".toml", ".xml", ".ts", ".tsx", ".js", ".jsx", ".css", ".scss"].includes(ext)) return "text";
+  if (CODE_EXTENSIONS.has(ext)) return "code";
+  if ([".txt", ".log"].includes(ext)) return "text";
   return "external";
+}
+
+export function openTargetFromWorkspaceFile(
+  path: string,
+  metadata: { size?: number; updatedAt?: number } = {},
+): OpenTarget | null {
+  const target = targetFromFile(path, 100, "workspace tree");
+  return target ? { ...target, exists: true, ...metadata } : null;
 }
 
 function shouldScanAssistantFileMentions(text: string) {
@@ -296,76 +342,93 @@ function addFileValues(map: Map<string, OpenTarget>, values: string[], confidenc
   }
 }
 
+// Session sync replaces changed parts; unchanged tools survive text-only deltas.
+const partOpenTargets = new WeakMap<UIMessage["parts"][number], Map<string, OpenTarget[]>>();
+
+function extractPartOpenTargets(part: UIMessage["parts"][number], confidence: number, includeFileMentions: boolean) {
+  // Only text extraction depends on message role or file-mention options.
+  const key = part.type === "text" ? `${confidence}:${includeFileMentions}` : "default";
+  let variants = partOpenTargets.get(part);
+  const cached = variants?.get(key);
+  if (cached) return cached;
+
+  const targets = new Map<string, OpenTarget>();
+  if (part.type === "text" && typeof part.text === "string") {
+    scanText(targets, part.text, confidence, "message", {
+      includeFiles: includeFileMentions || (confidence === 65 && shouldScanAssistantFileMentions(part.text)),
+    });
+  } else if (part.type === "file") {
+    const path = filePathFromFileUrl(part.url);
+    if (path) {
+      const target = targetFromFile(path, 95, "chat attachment");
+      addTarget(targets, target && part.filename ? { ...target, name: part.filename } : target);
+    }
+  } else if (part.type === "source-document") {
+    addTarget(
+      targets,
+      part.filename
+        ? targetFromFile(part.filename, 95, "attachment source")
+        : URI_PATTERN.test(part.title)
+          ? targetFromUrl(part.title, 95, "attachment source")
+          : targetFromFile(part.title, 95, "attachment source"),
+    );
+  } else if (part.type === "dynamic-tool") {
+    const discoveryTool = isDiscoveryTool(part.toolName);
+    const writeTool = isWriteTool(part.toolName);
+    const artifactMetadataTool = isArtifactMetadataTool(part.toolName);
+
+    if (writeTool) {
+      addFileValues(
+        targets,
+        [part.input, part.output].flatMap(collectFileMetadataValues),
+        95,
+        "write tool metadata",
+      );
+      addFileValues(targets, collectPatchFileValues(part.input), 95, "patch metadata");
+      if (typeof part.output === "string") {
+        scanText(targets, part.output, 90, "write tool output", { includeFiles: true });
+      }
+    }
+
+    if (artifactMetadataTool) {
+      addFileValues(
+        targets,
+        [part.input, part.output].flatMap(collectNestedFileMetadataValues),
+        95,
+        "artifact tool metadata",
+      );
+    }
+
+    if (!discoveryTool) {
+      scanText(targets, JSON.stringify(part.output ?? part.input ?? ""), 75, "tool output", { includeFiles: false });
+    }
+  }
+
+  const extracted = Array.from(targets.values());
+  if (!variants) {
+    variants = new Map();
+    partOpenTargets.set(part, variants);
+  }
+  variants.set(key, extracted);
+  return extracted;
+}
+
 export function deriveOpenTargets(messages: UIMessage[], options: DeriveOpenTargetsOptions = {}): OpenTarget[] {
   const targets = new Map<string, OpenTarget>();
+  const includeFileMentions = options.includeFileMentions === true;
 
   for (const message of messages) {
+    const confidence = message.role === "assistant" ? 65 : 40;
     for (const part of message.parts) {
-      if (part.type === "text" && typeof part.text === "string") {
-        scanText(targets, part.text, message.role === "assistant" ? 65 : 40, "message", {
-          includeFiles: options.includeFileMentions === true || (message.role === "assistant" && shouldScanAssistantFileMentions(part.text)),
-        });
-        continue;
-      }
-
-      if (part.type === "file") {
-        const path = filePathFromFileUrl(part.url);
-        if (path) {
-          const target = targetFromFile(path, 95, "chat attachment");
-          addTarget(targets, target && part.filename ? { ...target, name: part.filename } : target);
-        }
-        continue;
-      }
-
-      if (part.type === "source-document") {
-        addTarget(
-          targets,
-          part.filename
-            ? targetFromFile(part.filename, 95, "attachment source")
-            : URI_PATTERN.test(part.title)
-              ? targetFromUrl(part.title, 95, "attachment source")
-              : targetFromFile(part.title, 95, "attachment source"),
-        );
-        continue;
-      }
-
-      if (part.type !== "dynamic-tool") {
-        continue;
-      }
-
-      const discoveryTool = isDiscoveryTool(part.toolName);
-      const writeTool = isWriteTool(part.toolName);
-      const artifactMetadataTool = isArtifactMetadataTool(part.toolName);
-
-      if (writeTool) {
-        addFileValues(
-          targets,
-          [part.input, part.output].flatMap(collectFileMetadataValues),
-          95,
-          "write tool metadata",
-        );
-        addFileValues(targets, collectPatchFileValues(part.input), 95, "patch metadata");
-        if (typeof part.output === "string") {
-          scanText(targets, part.output, 90, "write tool output", { includeFiles: true });
-        }
-      }
-
-      if (artifactMetadataTool) {
-        addFileValues(
-          targets,
-          [part.input, part.output].flatMap(collectNestedFileMetadataValues),
-          95,
-          "artifact tool metadata",
-        );
-      }
-
-      if (!discoveryTool) {
-        scanText(targets, JSON.stringify(part.output ?? part.input ?? ""), 75, "tool output", { includeFiles: false });
+      for (const target of extractPartOpenTargets(part, confidence, includeFileMentions)) {
+        addTarget(targets, target);
       }
     }
   }
 
   return Array.from(targets.values())
     .filter(isArtifactTarget)
-    .sort((left, right) => right.confidence - left.confidence);
+    .sort((left, right) => right.confidence - left.confidence)
+    // Callers may attach verification metadata or otherwise mutate their targets.
+    .map((target) => ({ ...target }));
 }

@@ -6,6 +6,7 @@ import { BrowserRouter, HashRouter } from "react-router";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { initializeDenBootstrapConfig } from "./app/lib/den";
+import { startWebErrorMonitoring } from "./app/lib/error-monitoring";
 import { getOpenWorkDeployment } from "./app/lib/openwork-deployment";
 import { bootstrapTheme } from "./app/theme";
 import { isDesktopRuntime } from "./app/utils";
@@ -16,15 +17,12 @@ import {
   PlatformProvider,
 } from "./react-app/kernel/platform";
 import { AppProviders } from "./react-app/shell/providers";
+import { AppErrorBoundary } from "./react-app/shell/app-error-boundary";
 import { AppRoot } from "./react-app/shell/app-root";
 import { setWebNotificationHandler } from "./react-app/shell/desktop-notifications";
 import { startDeepLinkBridge } from "./react-app/shell/startup-deep-links";
+import { StartupApp, StartupScreen } from "./react-app/shell/startup-screen";
 import "./app/index.css";
-
-bootstrapTheme();
-initLocale();
-startDeepLinkBridge();
-await initializeDenBootstrapConfig();
 
 const root = document.getElementById("root");
 
@@ -32,15 +30,22 @@ if (!root) {
   throw new Error("Root element not found");
 }
 
-root.dataset.openworkDeployment = getOpenWorkDeployment();
+// Keep one startup promise across StrictMode renders. Rejections now reach the
+// error boundary, and pending bootstrap IPC no longer leaves an empty root.
+const startup = Promise.resolve().then(async () => {
+  startWebErrorMonitoring();
+  bootstrapTheme();
+  initLocale();
+  startDeepLinkBridge();
+  await initializeDenBootstrapConfig();
 
-const platform = createDefaultPlatform();
-setWebNotificationHandler(platform.notify);
-const queryClient = getReactQueryClient();
-const Router = isDesktopRuntime() ? HashRouter : BrowserRouter;
+  root.dataset.openworkDeployment = getOpenWorkDeployment();
+  const platform = createDefaultPlatform();
+  setWebNotificationHandler(platform.notify);
+  const queryClient = getReactQueryClient();
+  const Router = isDesktopRuntime() ? HashRouter : BrowserRouter;
 
-ReactDOM.createRoot(root).render(
-  <React.StrictMode>
+  return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <PlatformProvider value={platform}>
@@ -52,5 +57,15 @@ ReactDOM.createRoot(root).render(
         </PlatformProvider>
       </TooltipProvider>
     </QueryClientProvider>
+  );
+});
+
+ReactDOM.createRoot(root).render(
+  <React.StrictMode>
+    <AppErrorBoundary>
+      <React.Suspense fallback={<StartupScreen />}>
+        <StartupApp startup={startup} />
+      </React.Suspense>
+    </AppErrorBoundary>
   </React.StrictMode>,
 );

@@ -2,6 +2,8 @@ minimumReleaseAge: 4320
 
 packages:
   - "packages/*"
+  - "../scenarios"
 
 allowBuilds:
   esbuild: true
+  msgpackr-extract: false

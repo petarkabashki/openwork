@@ -12,18 +12,64 @@ Current desktop policy keys map to concrete product capabilities:
 - `Custom providers`: allow or block locally added model providers that were not deployed through OpenWork Cloud.
 - `Enable OpenCode Zen Models`: allow or block built-in OpenCode models.
 - `Multiple workspaces`: allow or block creating or configuring more than one local workspace.
-- `Control Settings`: allow or block changing desktop settings.
-- `Manage Extensions`: allow or block local extension management.
+- `Control Settings`: allow or block desktop settings. When blocked, the desktop app hides every settings page except the Cloud account page, and hides the settings shortcuts in the command palette and account menu. Members can still see their account, switch organizations, and log out.
+- `Manage Extensions`: allow or block installing and managing local extensions and MCP servers. When blocked, the Library hides the workspace MCP and GitHub import flows and marks third-party directory entries as `Disabled by organization`; organization-approved skills, connections, and built-in OpenWork extensions still work.
 - `Built-in Extensions`: allow or block OpenWork-provided built-in extensions, including browser, image, and local-provider extensions.
+- `Alpha updates`: allow or block opting into experimental Alpha desktop updates.
 - `Welcome Page`: show or hide the getting-started page for new users.
+
+Legacy desktop policies combine grants from the default policy and every assigned policy: any grant can allow a capability. Explicit Team Access blocks are applied afterward and take precedence over those grants. Restrict members by turning capabilities off in the default policy, then grant more to specific members or teams with assigned policies.
+
+## Approved websites
+
+Limit the built-in browser without turning off all built-in extensions:
+
+1. Open **Members > Teams > your team > Access** and expand **Browse websites**.
+2. Set **Website access** to **Approved sites only**, enter a complete site address, and choose **Add site** for each website.
+3. Choose **Review changes**, then **Save permissions**.
+
+In the general **Desktop policies** editor, the same setting is **Restrict browsing to approved sites** under **Commands & browser**, with one address per line.
+
+Approved websites are exact HTTP or HTTPS origins: the scheme, hostname, and port together. For example, `https://portal.example.com` permits pages on that origin, but not `http://portal.example.com`, `https://portal.example.com:8443`, or `https://docs.portal.example.com`. Default ports normalize to the same origin, so `https://portal.example.com:443` is equivalent to `https://portal.example.com`.
+
+- Add up to 100 complete site addresses per policy, without paths, sign-in credentials, queries, or fragments.
+- Add subdomains, sign-in sites, and resource sites separately. Wildcards do not grant access to subdomains.
+- Rules cover browser requests, including navigation, redirects, frames, and resources such as scripts and images. A resource from an unapproved origin is blocked even when the page itself is approved.
+- **Blocked**, or an empty approved-site list, denies all websites. Removing the final site does not turn restrictions off.
+- **All websites** removes this policy's approved-site restriction. It does not override restrictions from another applicable policy or the **Built-in Extensions** control.
+
+Unlike legacy boolean grants, approved-site restrictions **intersect** across the default policy and all matching member, team, and role policies. A site must appear in every applicable restricted list. A targeted policy can restrict browsing even when the default policy allows all websites. Policies without an approved-site list impose no additional origin restriction.
+
+The policy document stores these settings in `execution.browserOrigins`: an omitted field adds no origin restriction, while `[]` denies every website. The local policy service verifies managed browser requests independently of the desktop's cached display settings. If managed policy cannot be verified, requests are blocked; signing out does not clear retained managed restrictions into unrestricted browsing. This does not prevent genuinely unmanaged local use.
+
+Once approved-site policy has reached the managed engine, generated permissions block that engine's built-in `websearch` and `webfetch` tools. Changes can wait for an engine refresh; this is not a fresh Den check before every tool call and does not filter third-party MCP search or fetch traffic. **Upload files & submit forms** is a separate built-in-browser restriction: it blocks WebSocket connections, requests with upload data, and methods other than `GET`, `HEAD`, and `OPTIONS`. GET-based forms and other read URLs can still send data to approved sites. These controls are not device-wide data-loss prevention: allowed computer commands and third-party connections can use other network transports. Block computer commands too when members must not use that route.
+
+## Restricted mode
+
+Every policy has a mode selector at the top of its editor:
+
+- `Custom` lets you choose each capability.
+- `Restricted` gives members a vanilla OpenWork: they can chat and use organization-approved skills, but cannot change desktop settings, add providers or use models outside the organization, add workspaces, use built-in extensions, install extensions or MCP servers, or opt into Alpha updates. The locked capabilities stay off until you switch the policy back to `Custom`. The `Welcome Page` preference stays editable in both modes.
+
+Because the effective policy is a union of grants, apply `Restricted` to the default policy to lock members down. A targeted policy in `Restricted` mode grants nothing on its own.
 
 ## Configure a policy
 
 1. Open [app.openworklabs.com](https://app.openworklabs.com/) and choose your organization.
 2. Go to `Desktop policies`.
 3. Create a new policy or edit the default policy.
-4. Turn capabilities on or off.
+4. Pick `Restricted`, or stay in `Custom` and turn capabilities on or off.
 5. Assign the policy to members or teams when it should not apply to everyone.
 6. Save the policy, then have members reload, refresh their Cloud account, switch the active organization, or wait for the hourly desktop-config refresh.
 
-The desktop app explains blocked capabilities as organization-controlled. For example, a built-in extension disabled by policy is hidden from the normal catalog and can appear in hidden views with a `Disabled by organization` explanation.
+The desktop app explains blocked capabilities as organization-controlled. For example, a built-in extension disabled by policy is hidden from the normal catalog and can appear in hidden views with a `Disabled by organization` explanation, and the account page lists effective capabilities in its **App permissions** tab.
+
+## Team access
+
+Open **Members → your team → Access** to choose **Locked** or **Custom** and save permissions. Owners and super-admins can change these controls; other administrators can review them.
+
+Locked blocks app customization, including adding tools and MCP servers, changing settings, adding providers and workspaces, using built-in extensions and OpenCode models, and opting into experimental updates. Members can still chat and use available connections. Existing installed tools are not removed, Cloud authoring still follows member roles, and this does not suspend accounts.
+
+Custom lets you block individual app capabilities. Switching to Locked and back preserves the Custom choices. A block applies even when the default policy or another team grants that capability. Allowing a capability does not override another restriction. Existing policies without explicit access limits retain their grant behavior.
+
+Open **Account → App permissions** in the desktop app to see which capabilities are Allowed or Blocked and how to request changes from your administrator. These permissions are read-only in the desktop app. The Library explains how to ask an administrator for an MCP server when local tool management is blocked. Updates arrive when the app refreshes, including on reload or its periodic configuration refresh.

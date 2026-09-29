@@ -14,6 +14,7 @@ const userId = createDenTypeId("user")
 const organizationId = createDenTypeId("organization")
 let organizationMetadata: Record<string, unknown> | null = null
 let selectCount = 0
+let recordedRows: unknown[] = []
 let registerAgentMcpRoutes: typeof import("../src/mcp/agent.js")["registerAgentMcpRoutes"]
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -24,9 +25,10 @@ function installMocks() {
   mock.module("../src/db.js", () => ({
     db: {
       insert: () => ({
-        values: () => ({
-          execute: () => Promise.resolve(),
-        }),
+        values: (row: unknown) => {
+          recordedRows.push(row)
+          return { execute: () => Promise.resolve() }
+        },
       }),
       select: () => ({
         from: () => ({
@@ -74,11 +76,11 @@ function buildApp() {
           tags: ["Workers"],
         },
       },
-      "/v1/codemode-scripts": {
+      "/v1/workflows": {
         post: {
-          operationId: "saveProgram",
-          summary: "Save a successful Code Mode run as a Program inside an OpenWork Connect Plugin",
-          tags: ["Codemode Runs"],
+          operationId: "saveWorkflow",
+          summary: "Save a successful Code Mode run as a Workflow inside an OpenWork Connect Plugin",
+          tags: ["Workflows"],
         },
       },
     },
@@ -110,16 +112,15 @@ function resultRecord(payload: Record<string, unknown>) {
   return payload.result
 }
 
+function errorRecord(payload: Record<string, unknown>) {
+  if (!isRecord(payload.error)) throw new Error("Expected JSON-RPC error")
+  return payload.error
+}
+
 function listedToolNames(payload: Record<string, unknown>): string[] {
   const tools = resultRecord(payload).tools
   if (!Array.isArray(tools)) throw new Error("Expected MCP tools list")
   return tools.flatMap((tool) => isRecord(tool) && typeof tool.name === "string" ? [tool.name] : [])
-}
-
-function listedTools(payload: Record<string, unknown>): Record<string, unknown>[] {
-  const tools = resultRecord(payload).tools
-  if (!Array.isArray(tools)) throw new Error("Expected MCP tools list")
-  return tools.filter(isRecord)
 }
 
 function firstText(payload: Record<string, unknown>): string {
@@ -139,59 +140,63 @@ beforeAll(async () => {
 beforeEach(() => {
   organizationMetadata = null
   selectCount = 0
+  recordedRows = []
 })
 
 afterAll(() => {
   mock.restore()
 })
 
-test("does not register execute_capability_script when the org flag is off", async () => {
+test("registers the direct skill tools next to the capability-routing tools", async () => {
   const tools = listedToolNames(await rpc(buildApp(), "tools/list"))
-  expect(tools).not.toContain("execute_capability_script")
+  expect(tools).toContain("search_capabilities")
+  expect(tools).toContain("execute_capability")
+  expect(tools).toContain("list_skills")
+  expect(tools).toContain("get_skill")
+})
+
+test("registers execute_capability_script without any org rollout flag", async () => {
+  const tools = listedToolNames(await rpc(buildApp(), "tools/list"))
+  expect(tools).toContain("execute_capability_script")
   expect(tools).not.toContain("save_artifact_view")
   expect(tools).not.toContain("activate_artifact_view_revision")
   expect(tools).not.toContain("retire_artifact_view")
 })
 
 test("registers Code Mode without enabling agent-authored MCP App views", async () => {
-  organizationMetadata = { capabilities: { codemodeScripts: true } }
-  const tools = listedTools(await rpc(buildApp(), "tools/list"))
-  const names = tools.flatMap((tool) => typeof tool.name === "string" ? [tool.name] : [])
+  const names = listedToolNames(await rpc(buildApp(), "tools/list"))
   expect(names).toContain("execute_capability_script")
+  expect(names).toContain("render_workflow_artifact")
   expect(names).toContain("render_dynamic_artifact")
-  expect(names).toContain("search_programs")
-  expect(names).toContain("select_program")
-  expect(names).toContain("clear_program_selection")
   expect(names).not.toContain("save_artifact_view")
   expect(names).not.toContain("activate_artifact_view_revision")
   expect(names).not.toContain("retire_artifact_view")
-  expect(isRecord(tools.find((tool) => tool.name === "search_programs")?.outputSchema)).toBe(true)
-  expect(isRecord(tools.find((tool) => tool.name === "select_program")?.outputSchema)).toBe(true)
-  expect(isRecord(tools.find((tool) => tool.name === "clear_program_selection")?.outputSchema)).toBe(true)
+  expect(names.filter((name) => /^(search|select|clear)_programs?$|^(run|render)_selected_program$/.test(name))).toEqual([])
 })
 
-test("rejects guessed generated-view tool calls while keeping Programs enabled", async () => {
-  organizationMetadata = { capabilities: { codemodeScripts: true } }
+test("rejects guessed generated-view tool calls while keeping Workflows enabled", async () => {
   for (const name of ["save_artifact_view", "activate_artifact_view_revision", "retire_artifact_view"]) {
     const payload = await rpc(buildApp(), "tools/call", { name, arguments: {} })
-    expect(resultRecord(payload).isError).toBe(true)
-    expect(JSON.stringify(payload)).toContain("not found")
+    expect(errorRecord(payload)).toMatchObject({ code: -32602, message: expect.stringContaining("not found") })
   }
 })
 
-test("advertises external-only MCP App authoring instructions", async () => {
+test("advertises standard Workflow discovery and execution instructions", async () => {
   const initialized = resultRecord(await rpc(buildApp(), "initialize", {
     protocolVersion: "2025-11-25",
     capabilities: {},
     clientInfo: { name: "agent-codemode-test", version: "1.0.0" },
   }))
-  expect(initialized.instructions).toContain("authored and bundled outside OpenWork")
-  expect(initialized.instructions).toContain("never send inline HTML")
-  expect(initialized.instructions).not.toContain("Compile React source")
+  expect(initialized.instructions).toContain("Workflows are saved procedures discovered through search_capabilities")
+  expect(initialized.instructions).toContain("Use execute_capability only with exact names returned by search_capabilities")
+  expect(initialized.instructions).toContain("For an app, dashboard, or artifact view of Workflow results")
+  expect(initialized.instructions).toContain("Direct MCP tools are not capability search results")
+  expect(initialized.instructions).not.toContain("Always call search_capabilities first")
+  expect(initialized.instructions).toContain("Workflow runs produce artifacts rendered by render_workflow_artifact")
+  expect(initialized.instructions).not.toContain("search/selection tools")
 })
 
-test("executes a confined script when the org flag is on", async () => {
-  organizationMetadata = { capabilities: { codemodeScripts: true } }
+test("executes a confined script by default", async () => {
   const payload = await rpc(buildApp(), "tools/call", {
     name: "execute_capability_script",
     arguments: { code: "return 1 + 1" },
@@ -199,8 +204,29 @@ test("executes a confined script when the org flag is on", async () => {
   expect(firstText(payload)).toBe("2")
 })
 
+test("normalizes JSON-encoded script input", async () => {
+  const payload = await rpc(buildApp(), "tools/call", {
+    name: "execute_capability_script",
+    arguments: {
+      code: "return { t: typeof input, v: input.channel }",
+      input: "{\"channel\":\"bug\"}",
+    },
+  })
+  expect(JSON.parse(firstText(payload))).toEqual({ t: "object", v: "bug" })
+})
+
+test("keeps object script input unchanged", async () => {
+  const payload = await rpc(buildApp(), "tools/call", {
+    name: "execute_capability_script",
+    arguments: {
+      code: "return { t: typeof input, v: input.channel }",
+      input: { channel: "bug" },
+    },
+  })
+  expect(JSON.parse(firstText(payload))).toEqual({ t: "object", v: "bug" })
+})
+
 test("exposes in-program capability search over the Den namespace", async () => {
-  organizationMetadata = { capabilities: { codemodeScripts: true } }
   const payload = await rpc(buildApp(), "tools/call", {
     name: "execute_capability_script",
     arguments: { code: "return await tools.$codemode.search({ query: \"workers\" })" },
@@ -208,11 +234,66 @@ test("exposes in-program capability search over the Den namespace", async () => 
   expect(firstText(payload)).toContain("tools.den.getWorkers")
 })
 
-test("makes the Program save operation discoverable through the standard capability catalog", async () => {
-  organizationMetadata = { capabilities: { codemodeScripts: true } }
+test("makes the Workflow save operation discoverable through the standard capability catalog", async () => {
   const payload = await rpc(buildApp(), "tools/call", {
     name: "search_capabilities",
-    arguments: { query: "save Program to Plugin" },
+    arguments: { query: "save Workflow to Plugin" },
   })
-  expect(firstText(payload)).toContain("saveProgram")
+  expect(firstText(payload)).toContain("saveWorkflow")
+})
+
+test("advertises authoring modes, contracts and exact discovered invocation guidance", async () => {
+  const tools = resultRecord(await rpc(buildApp(), "tools/list")).tools
+  if (!Array.isArray(tools)) throw new Error("Missing tools")
+  const tool = tools.find((item) => isRecord(item) && item.name === "execute_capability_script")
+  if (!isRecord(tool) || !isRecord(tool.inputSchema) || !isRecord(tool.inputSchema.properties)) throw new Error("Missing input schema")
+  expect(Object.keys(tool.inputSchema.properties)).toEqual(["code", "mode", "input", "timeZone", "inputSchema", "outputSchema"])
+  expect(tool.description).toContain("exact scriptPath")
+  expect(tool.description).toContain("wrapped in query")
+  expect(tool.description).toContain("outputSchema")
+})
+
+test("returns receipt metadata without changing legacy text or persisting raw artifact data", async () => {
+  const payload = await rpc(buildApp(), "tools/call", {
+    name: "execute_capability_script",
+    arguments: { code: "return input", input: { privateValue: "private-test-value" }, outputSchema: { type: "object" } },
+  })
+  expect(JSON.parse(firstText(payload))).toEqual({ privateValue: "private-test-value" })
+  const result = resultRecord(payload)
+  if (!isRecord(result.structuredContent)) throw new Error("Missing structured content")
+  expect(result.structuredContent).toMatchObject({
+    value: { privateValue: "private-test-value" },
+    metadata: { receiptId: expect.any(String), mode: "adhoc", executionType: "authoring-test", verification: "schema",
+      executedAt: expect.any(String), fetchedAt: expect.any(String), retention: { available: false, canSaveByReceipt: false } },
+  })
+  expect(result.content).toHaveLength(2)
+  const receipt = recordedRows.find((row) => isRecord(row) && row.source === "adhoc")
+  expect(receipt).toMatchObject({ status: "succeeded", script_input: null, script_input_digest: expect.stringMatching(/^sha256:/),
+    output_schema_digest: expect.stringMatching(/^sha256:/), result_markdown: null, renderer_version: null })
+  expect(JSON.stringify(receipt)).not.toContain("private-test-value")
+})
+
+test("MCP live mode exposes only generated runtime with UTC default", async () => {
+  const payload = await rpc(buildApp(), "tools/call", {
+    name: "execute_capability_script", arguments: { mode: "live", code: "return input" },
+  })
+  const value: unknown = JSON.parse(firstText(payload))
+  if (!isRecord(value) || !isRecord(value.runtime)) throw new Error("Missing runtime")
+  expect(Object.keys(value)).toEqual(["runtime"])
+  expect(Object.keys(value.runtime).sort()).toEqual(["dayEnd", "dayStart", "now", "timeZone", "today"])
+  expect(value.runtime.timeZone).toBe("UTC")
+  expect(recordedRows.some((row) => isRecord(row) && row.source === "authoring:live")).toBe(true)
+})
+
+test("MCP rejects forged live input, invalid time zones, and invalid contracts", async () => {
+  for (const args of [
+    { mode: "live", input: null }, { mode: "live", input: { runtime: { today: "forged" } } },
+    { mode: "live", timeZone: "Not/A_Zone" }, { timeZone: "UTC" },
+    { inputSchema: { type: "string" } }, { outputSchema: { type: "string" } },
+  ]) {
+    const payload = await rpc(buildApp(), "tools/call", {
+      name: "execute_capability_script", arguments: { code: "return 2", ...args },
+    })
+    expect(resultRecord(payload).isError).toBe(true)
+  }
 })

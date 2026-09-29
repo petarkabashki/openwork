@@ -19,6 +19,18 @@ const providerAuthModalPath = fileURLToPath(
 );
 
 describe("composer model controls", () => {
+  test("picker inputs keep mobile text readable without timer-driven keyboard reopening", () => {
+    const source = readFileSync(new URL("../src/components/model-select.tsx", import.meta.url), "utf8");
+    expect(source).toContain('autoFocus={false} placeholder="Search models..." className="h-9 text-base sm:text-base md:text-base lg:text-sm"');
+    expect(source).toContain("target?.focus({ preventScroll: true })");
+    expect(source).toContain("setPane(effortReturnPaneRef.current)");
+    expect(source).toContain('effortReturnPaneRef.current = pane === "favorites" ? "favorites" : "model"');
+    expect(source).not.toContain("requestAnimationFrame");
+    const fullPicker = readFileSync(new URL("../src/react-app/domains/session/modals/model-picker-modal.tsx", import.meta.url), "utf8");
+    expect(fullPicker).toContain("text-base lg:text-sm");
+    expect(fullPicker).toContain("initialFocus={() => isMobile ? titleRef.current : searchInputRef.current}");
+    expect(fullPicker).not.toContain("requestAnimationFrame");
+  });
   test("stay enabled during ordinary generation and disable during steering", () => {
     const composerSource = readFileSync(composerPath, "utf8");
     const modelSelectPath = fileURLToPath(
@@ -36,6 +48,17 @@ describe("composer model controls", () => {
     expect(modelSelectSource).not.toContain("setThinkingOpen(true)");
     expect(modelSelectSource).toContain('data-slot="model-thinking-submenu"');
     expect(modelSelectSource).not.toContain("onMouseEnter");
+    const sessionRouteSource = readFileSync(sessionRoutePath, "utf8");
+    const fullPicker = sessionRouteSource.slice(sessionRouteSource.indexOf("<ModelPickerModal"));
+    expect(fullPicker).toContain("currentBehaviorValue={modelPickerSelection");
+    expect(fullPicker).toContain("store.setModel(modelPickerSessionId, model, value)");
+    expect(fullPicker).toContain("store.setVariant(modelPickerSessionId, value)");
+    const behaviorCallback = fullPicker.slice(fullPicker.indexOf("onBehaviorChange="), fullPicker.indexOf("onToggleProvider="));
+    expect(behaviorCallback).toContain("modelVariant: value");
+    expect(behaviorCallback).not.toContain("defaultModel:");
+    const favoriteCycle = sessionRouteSource.slice(sessionRouteSource.indexOf("const cycleFavoriteModel ="), sessionRouteSource.indexOf("const cycleFavoriteModelControlAction"));
+    expect(favoriteCycle).toContain("sanitizeModelBehaviorValue(next.providerID, providerModel, selection ? selection.variant : modelVariantValue)");
+    expect(favoriteCycle).not.toContain("getModelBehaviorSummary");
   });
 
   test("tracks steering until the active run stops streaming", () => {

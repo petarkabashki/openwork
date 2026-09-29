@@ -6,13 +6,11 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { allocateFreePorts } from "@openwork/cdp";
+import { SkipError, ephemeralDatabaseName, localMysqlIsRunning, localRedisIsRunning, trustedOrigins } from "@openwork/env";
 import { freePort, killLocalPid } from "@openwork/hosts";
 import type { ChildProcess } from "node:child_process";
 import type { DenRef } from "@openwork/behaviors";
-import type { DbHandle, Place } from "./place.ts";
-import { SkipError } from "./needs.ts";
-import { ephemeralDatabaseName, localMysqlIsRunning, localRedisIsRunning } from "./place.ts";
-import { trustedOrigins } from "./server.ts";
+import type { DbHandle, Place } from "@openwork/env";
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = fileURLToPath(new URL("../../../..", import.meta.url));
@@ -26,6 +24,7 @@ export interface SelfHostServerOptions {
   slug: string;
   ownerEmails: string[];
   allowPublicSignup?: boolean;
+  bootstrapCode?: string;
 }
 
 export interface SelfHostDen {
@@ -134,7 +133,6 @@ async function runDbPush(databaseUrl: string): Promise<void> {
     const commands = process.env.OPENWORK_EVAL_DEN_RUNTIME_PREPARED === "1"
       ? [
           ["--filter", "@openwork-ee/den-db", "exec", "node", "--import", "tsx", "./node_modules/drizzle-kit/bin.cjs", "push", "--config", "drizzle.config.ts"],
-          ["--filter", "@openwork-ee/den-db", "exec", "node", "--import", "tsx", "scripts/ensure-fulltext-indexes.ts"],
           ["--filter", "@openwork-ee/den-db", "exec", "node", "--import", "tsx", "scripts/ensure-schema-repairs.ts"],
         ]
       : [["--filter", "@openwork-ee/den-db", "db:push"]];
@@ -200,6 +198,7 @@ export async function selfHostServer(options: SelfHostServerOptions): Promise<Se
       DEN_DB_ENCRYPTION_KEY: DATABASE_ENCRYPTION_KEY,
       BETTER_AUTH_SECRET,
       BETTER_AUTH_URL: `http://localhost:${webPort}`,
+      DEN_BASE_URL: `http://localhost:${webPort}`,
       DEN_API_PUBLIC_URL: ref.apiUrl,
       DEN_API_PORT: String(apiPort),
       DEN_WEB_PORT: String(webPort),
@@ -210,6 +209,9 @@ export async function selfHostServer(options: SelfHostServerOptions): Promise<Se
       DEN_SINGLE_ORG_SLUG: options.slug,
       DEN_SINGLE_ORG_OWNER_EMAILS: options.ownerEmails.join(","),
       DEN_SINGLE_ORG_ALLOW_PUBLIC_SIGNUP: String(options.allowPublicSignup ?? false),
+      DEN_INITIAL_ADMIN_BOOTSTRAP_CODE: options.bootstrapCode ?? "",
+      RESEND_API_KEY: "",
+      SMTP_HOST: "",
       DEN_REQUIRE_EMAIL_VERIFICATION: "false",
       DEN_PASSWORD_BREACH_SCREENING_ENABLED: "false",
       OPENWORK_DEV_MODE: "1",
@@ -225,6 +227,7 @@ export async function selfHostServer(options: SelfHostServerOptions): Promise<Se
       DEN_WEB_HOST: "127.0.0.1",
       ...commonEnv,
       DEN_API_BASE: `http://127.0.0.1:${apiPort}`,
+      DEN_BASE_URL: `http://localhost:${webPort}`,
       DEN_AUTH_ORIGIN: `http://localhost:${webPort}`,
       DEN_AUTH_FALLBACK_BASE: `http://127.0.0.1:${apiPort}`,
     }, join(logsDir, "web.log"));

@@ -7,7 +7,7 @@ import { useSearchParams } from "next/navigation";
 import { requestJson } from "../_lib/den-flow";
 import { getInstallConfigErrorMessage } from "../_lib/install-errors";
 import { LINK_STEP, parseGuideStep, type GuideStep } from "../_lib/install-guide";
-import { buildAuthenticatedInstallDownloadHref, buildInstallDownloadHref, type InstallPlatform, installerFileName } from "../_lib/install-download";
+import { buildBrowserInstallDownloadHref, type InstallPlatform, installerFileName } from "../_lib/install-download";
 import { isMobileUserAgent } from "../_lib/platform";
 import { InstallVisual } from "./install-visual";
 import { OnboardingShell } from "./onboarding-shell";
@@ -25,7 +25,7 @@ type InstallConfig = {
   distribution: "cloud" | "enterprise";
 };
 
-const RETURN_TO_OPENWORK_URL = "openwork://open";
+const DESKTOP_SIGN_IN_PATH = "/?mode=sign-in&desktopAuth=1&desktopScheme=openwork";
 const INSTALL_PLATFORMS: InstallPlatform[] = ["mac-arm64", "mac-x64", "win-x64", "linux-x64", "linux-arm64"];
 
 
@@ -174,9 +174,7 @@ async function fetchInstallConfig(token: string | null) {
 }
 
 function installHref(config: InstallConfig, platform: InstallPlatform, token: string | null) {
-  return token
-    ? buildInstallDownloadHref(config.apiUrl, platform, token)
-    : buildAuthenticatedInstallDownloadHref(config.apiUrl, platform);
+  return buildBrowserInstallDownloadHref(config.apiUrl, platform, token);
 }
 
 type StepState = "complete" | "active" | "pending";
@@ -439,7 +437,8 @@ export function InstallScreen() {
             ) : (
               <div className="grid gap-5 text-left">
                 <DownloadPlatformGrid groups={downloadGroups} />
-                <a className="den-button-secondary w-fit" href={RETURN_TO_OPENWORK_URL}>
+                {/* Reload so the auth provider reads the desktop handoff parameters on mount. */}
+                <a className="den-button-secondary w-fit" href={token ? new URL(DESKTOP_SIGN_IN_PATH, config.webUrl).toString() : DESKTOP_SIGN_IN_PATH}>
                   I already installed OpenWork
                 </a>
               </div>
@@ -573,7 +572,7 @@ export function InstallScreen() {
 
                       <div className="flex h-10 w-fit max-w-full items-stretch overflow-hidden rounded-xl border border-slate-200 bg-white shadow-[0_1px_2px_rgba(16,24,40,0.05)]" data-testid="install-workspace-address">
                         <input
-                          className="min-w-0 grow bg-transparent pl-3.5 pr-3 font-mono text-[13px] font-medium text-slate-950 outline-none"
+                          className="min-w-0 grow bg-transparent pl-3.5 pr-3 font-mono text-[13px] font-medium text-slate-950 outline-hidden"
                           value={workspaceAddress}
                           readOnly
                           size={Math.max(workspaceAddress.length, 12)}

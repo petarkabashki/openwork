@@ -143,7 +143,7 @@ describe("cloud provider runtime patch (re-import diff #2346)", () => {
     expect(persistSource).toContain("const config = await readWorkspaceOpenworkConfigRecord();");
     expect(persistSource).toContain("const cloudImports = readWorkspaceCloudImports(config);");
     expect(persistSource).toContain("const nextConfig = withWorkspaceCloudImports(config");
-    expect(persistSource).toContain("const persisted = await writeWorkspaceOpenworkConfigRecord(nextConfig);");
+    expect(persistSource).toContain("const persisted = await writeWorkspaceOpenworkConfigRecord(nextConfig, isCurrent);");
     expect(persistSource).toContain('setStateField("importedCloudProviders", nextProviders);');
     expect(source).not.toContain("refreshDesktop" + "CloudSync");
     expect(source).not.toContain("getResource" + "Snapshot");
@@ -151,13 +151,15 @@ describe("cloud provider runtime patch (re-import diff #2346)", () => {
 
   test("client env mirror includes non-openwork provider credentials", () => {
     const source = readFileSync(providerAuthStoreSourcePath, "utf8");
-    const mirrorStart = source.indexOf("const mirrorOpenWorkModelsVoiceEnv = async");
+    const mirrorStart = source.indexOf("const mirrorCloudProviderEnv = async");
     const mirrorEnd = source.indexOf("const readWorkspaceOpenworkConfigRecord", mirrorStart);
     expect(mirrorStart).toBeGreaterThanOrEqual(0);
     expect(mirrorEnd).toBeGreaterThan(mirrorStart);
 
     const mirrorSource = source.slice(mirrorStart, mirrorEnd);
     expect(mirrorSource).not.toContain('provider.source !== "openwork"');
+    expect(mirrorSource).toContain("resolvedEnvEntries");
+    expect(mirrorSource).toContain("const entries = [...resolvedEnvEntries]");
     expect(mirrorSource).toContain("getCloudProviderEnv(provider.providerConfig)");
     expect(mirrorSource).toContain(".slice(0, 1)");
   });

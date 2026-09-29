@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, realpath } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { renderPrMarkdown } from "./render.ts";
 import { readTestRunDirectory } from "./scan.ts";
+import type { uploadReview } from "@openwork/review/storage";
 
-const BLOB_API_BASE = "https://blob.vercel-storage.com";
 const MARKER = "<!-- test-evidence -->";
 const LEGACY_MARKERS = ["<!-- photo-roll -->", "<!-- fraimz -->"];
 
@@ -20,12 +21,11 @@ export interface CommandResult {
 }
 
 export type CommandRunner = (command: string, args: string[], opts?: CommandOptions) => CommandResult;
-export type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export interface PublishDependencies {
   exec?: CommandRunner;
-  fetch?: Fetcher;
   stdout?: (markdown: string) => void;
+  upload?: typeof uploadReview;
 }
 
 export interface PublishPrOptions {
@@ -40,6 +40,7 @@ export interface PublishPrResult {
   posted: boolean;
   updated: boolean;
   urls: Record<string, string>;
+  evidence?: { gitSha: string; verdict: string; tests: number; passedTests: number; assertions: number; passedAssertions: number };
 }
 
 function commandRunner(command: string, args: string[], opts: CommandOptions = {}): CommandResult {
@@ -72,61 +73,38 @@ function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }
 
-function resolveBlobToken(exec: CommandRunner): string | null {
-  const fromEnv = process.env.BLOB_READ_WRITE_TOKEN;
-  if (fromEnv) return fromEnv;
-  const result = exec(
-    "infisical",
-    ["secrets", "get", "BLOB_READ_WRITE_TOKEN", "--plain", "--silent"],
-  );
-  const token = result.status === 0 && !result.error ? result.stdout.trim() : "";
-  return token.length > 0 ? token : null;
+interface Attachment {
+  fileName: string;
+  absPath: string;
+  caption: string;
 }
 
-async function uploadImages(
+function ghSupportsAttach(exec: CommandRunner): boolean {
+  return exec("gh", ["pr", "comment", "--help"]).stdout.includes("--attach");
+}
+
+function sanitizeCaption(caption: string, fileName: string): string {
+  return caption.replace(/[\r\n#]/g, "").trim() || fileName;
+}
+
+async function resolveAttachments(
   testRunDir: string,
-  testRunId: string,
-  files: string[],
-  token: string,
-  fetcher: Fetcher,
-): Promise<Record<string, string>> {
-  const urls: Record<string, string> = {};
+  fileNames: Array<{ fileName: string; caption: string }>,
+): Promise<Attachment[]> {
+  const attachments: Attachment[] = [];
   const realDir = await realpath(testRunDir);
-  for (const file of files) {
-    if (basename(file) !== file || !file.toLowerCase().endsWith(".png")) {
-      throw new Error(`Refusing to upload invalid test artifact path: ${file}`);
+  for (const { fileName, caption } of fileNames) {
+    if (basename(fileName) !== fileName || !fileName.toLowerCase().endsWith(".png")) {
+      throw new Error(`Refusing to attach invalid test artifact path: ${fileName}`);
     }
-    const filePath = join(realDir, file);
-    const stats = await lstat(filePath).catch(() => null);
+    const absPath = join(realDir, fileName);
+    const stats = await lstat(absPath).catch(() => null);
     if (!stats?.isFile()) {
-      throw new Error(`Refusing to upload non-regular or symlinked test artifact: ${file}`);
+      throw new Error(`Refusing to attach non-regular or symlinked test artifact: ${fileName}`);
     }
-    const pathname = `test-artifacts/${encodeURIComponent(testRunId)}/${encodeURIComponent(file)}`;
-    const response = await fetcher(`${BLOB_API_BASE}/${pathname}`, {
-      method: "PUT",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "x-content-type": "image/png",
-        "x-add-random-suffix": "0",
-      },
-      body: await readFile(filePath),
-    });
-    if (!response.ok) {
-      const detail = (await response.text()).slice(0, 300);
-      throw new Error(`Vercel Blob upload failed (${response.status}) for ${file}: ${detail}`);
-    }
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
-      throw new Error(`Vercel Blob upload for ${file}: response was not JSON`);
-    }
-    if (!isRecord(payload) || typeof payload.url !== "string" || payload.url.length === 0) {
-      throw new Error(`Vercel Blob upload for ${file}: response did not include a url`);
-    }
-    urls[file] = payload.url;
+    attachments.push({ fileName, absPath, caption: sanitizeCaption(caption, fileName) });
   }
-  return urls;
+  return attachments;
 }
 
 function stickyCommentId(raw: string): string | null {
@@ -178,33 +156,34 @@ function resolvePrHeadSha(pr: string, exec: CommandRunner): string {
   return payload.headRefOid;
 }
 
-function postStickyComment(pr: string, markdown: string, exec: CommandRunner): boolean {
+function postStickyComment(pr: string, markdown: string, attachments: Attachment[], exec: CommandRunner): boolean {
   const viewed = exec("gh", ["pr", "view", pr, "--json", "comments"]);
   requireSuccess(viewed, "Reading PR comments");
   const commentId = stickyCommentId(viewed.stdout);
   if (commentId) {
-    const updated = exec(
+    const deleted = exec(
       "gh",
-      ["api", "--method", "PATCH", `repos/{owner}/{repo}/issues/comments/${commentId}`, "--input", "-"],
-      { input: JSON.stringify({ body: markdown }) },
+      ["api", "--method", "DELETE", `repos/{owner}/{repo}/issues/comments/${commentId}`],
     );
-    requireSuccess(updated, "Updating test evidence comment");
-    return true;
+    requireSuccess(deleted, "Deleting previous test evidence comment");
   }
-  const posted = exec("gh", ["pr", "comment", pr, "--body-file", "-"], { input: markdown });
+  const attachmentArgs = attachments.flatMap((attachment) => ["--attach", `${attachment.absPath}#${attachment.caption}`]);
+  const posted = exec("gh", ["pr", "comment", pr, "--body-file", "-", ...attachmentArgs], { input: markdown });
   requireSuccess(posted, "Posting test evidence comment");
-  return false;
+  return commentId !== null;
 }
 
 export async function publishPr(
   options: PublishPrOptions,
   dependencies: PublishDependencies = {},
 ): Promise<PublishPrResult> {
+  if (process.env.OPENWORK_REVIEW_URL && !options.force) {
+    return publishReviewPr({ ...options, testRunDirs: [options.testRunDir] }, dependencies);
+  }
   const stored = await readTestRunDirectory(options.testRunDir);
   if (!stored) throw new Error(`No valid test-run.json or legacy result found in ${options.testRunDir}`);
   const { format, testRun } = stored;
   const exec = dependencies.exec ?? commandRunner;
-  const fetcher = dependencies.fetch ?? globalThis.fetch;
   const testRunId = basename(options.testRunDir);
   const pr = options.pr === undefined ? "<n>" : String(options.pr);
   const reproCommand = `pnpm --dir evals artifacts:publish -- --pr ${pr} --test-run ${testRunId}`;
@@ -216,7 +195,7 @@ export async function publishPr(
     const markdown = renderPrMarkdown(testRun, {}, {
       reproCommand,
       sourcePath,
-      notice: "Dry run: screenshots were not uploaded.",
+      notice: "Dry run: screenshots were not attached.",
     });
     (dependencies.stdout ?? ((body) => process.stdout.write(`${body}\n`)))(markdown);
     return { markdown, posted: false, updated: false, urls: {} };
@@ -235,22 +214,141 @@ export async function publishPr(
     ? `⚠ evidence from ${shortSha(testRun.gitSha)}, PR head is ${shortSha(prHeadSha)}`
     : undefined;
 
-  const token = resolveBlobToken(exec);
-  const urls = token
-    ? await uploadImages(
-      options.testRunDir,
-      testRunId,
-      [...new Set(testRun.artifacts.map((artifact) => artifact.fileName).filter((fileName) => fileName.length > 0))],
-      token,
-      fetcher,
-    )
-    : {};
-  const uploadNotice = token ? undefined : "screenshots not uploaded (no BLOB_READ_WRITE_TOKEN)";
+  const uniqueArtifacts = testRun.artifacts.filter((artifact, index, artifacts) =>
+    artifact.fileName.length > 0 && artifacts.findIndex((candidate) => candidate.fileName === artifact.fileName) === index
+  );
+  const attachments = await resolveAttachments(options.testRunDir, uniqueArtifacts);
+  const supportsAttach = ghSupportsAttach(exec);
+  const postedAttachments = supportsAttach ? attachments : [];
+  const urls = Object.fromEntries(postedAttachments.map((attachment) => [attachment.fileName, attachment.absPath]));
+  const attachmentNotice = supportsAttach ? undefined : "screenshots not attached (gh < 2.99; run `brew upgrade gh`)";
   const markdown = renderPrMarkdown(testRun, urls, {
     reproCommand,
     sourcePath,
-    notice: [staleNotice, uploadNotice].filter((notice) => notice !== undefined).join(" · ") || undefined,
+    notice: [staleNotice, attachmentNotice].filter((notice) => notice !== undefined).join(" · ") || undefined,
   });
-  const updated = postStickyComment(String(options.pr), markdown, exec);
+  const updated = postStickyComment(String(options.pr), markdown, postedAttachments, exec);
   return { markdown, posted: true, updated, urls };
+}
+
+export async function publishReviewPr(
+  options: {
+    pr?: string | number;
+    testRunDirs: string[];
+    docShots?: string[];
+    title?: string;
+    gaps?: string[];
+    reviewUrl?: string;
+    dryRun?: boolean;
+    preserveCurrentReport?: boolean;
+    automatic?: boolean;
+    /** Replace older automatic evidence selections, while still preserving a human-selected report. */
+    replaceAutomatic?: boolean;
+    /** Trusted Actions publishes checks and deployments instead of a comment. */
+    presentation?: "native";
+  },
+  dependencies: PublishDependencies = {},
+): Promise<PublishPrResult> {
+  // Testkit imports this package too. Load the report stack only when publishing.
+  const { assembleReview, renderReviewComment } = await import("./review.ts");
+  const { report, assets } = await assembleReview(options);
+  // Hash complete source records, not just IDs: a partial reread must never erase
+  // evidence. Legacy/unknown provenance is conservatively treated as manual.
+  const fingerprints = report.sources.map((source) => createHash("sha256").update(JSON.stringify({
+    source,
+    receipt: createHash("sha256").update(assets.find((asset) => asset.name === source.asset)?.body ?? "").digest("hex"),
+    sections: report.sections.filter((section) => section.sourceId === source.id),
+    evidence: report.evidence.filter((item) => item.sourceId === source.id),
+  })).digest("hex")).sort();
+  const selectionMarker = options.automatic
+    ? `<!-- test-evidence-selection:auto-v1:${fingerprints.join(",")} -->`
+    : "<!-- test-evidence-selection:manual-v1 -->";
+  if (options.dryRun) {
+    const markdown = renderReviewComment(report);
+    (dependencies.stdout ?? ((body) => process.stdout.write(`${body}\n`)))(
+      markdown,
+    );
+    return { markdown, posted: false, updated: false, urls: {} };
+  }
+  if (options.pr === undefined)
+    throw new Error("Publishing requires --pr <n>.");
+  const pr = String(options.pr);
+  const exec = dependencies.exec ?? commandRunner;
+  const base = options.reviewUrl ?? process.env.OPENWORK_REVIEW_URL;
+  if (!base) throw new Error("Set OPENWORK_REVIEW_URL to the review app URL.");
+  const url = new URL(base);
+  if (
+    url.username ||
+    url.password ||
+    (url.protocol !== "https:" &&
+      !(
+        url.protocol === "http:" &&
+        ["localhost", "127.0.0.1"].includes(url.hostname)
+      ))
+  )
+    throw new Error("Review URL must use HTTPS (or local HTTP).");
+  const requireCurrentHead = () => {
+    if (resolvePrHeadSha(pr, exec).toLowerCase() !== report.gitSha)
+      throw new Error(
+        "Refusing stale evidence: every selected source must match the current PR head.",
+      );
+  };
+  requireCurrentHead();
+  const protectedReport = (raw: string): string | undefined => {
+    if (!options.preserveCurrentReport && !options.automatic) return;
+    const payload: unknown = JSON.parse(raw);
+    if (isRecord(payload) && Array.isArray(payload.comments)) {
+      for (const existing of payload.comments) {
+        if (!isRecord(existing) || typeof existing.body !== "string" || !existing.body.includes(MARKER)
+          || !existing.body.includes(`Commit \`${report.gitSha}\``) || !existing.body.includes("[Open review report](")) continue;
+         const automatic = /<!-- test-evidence-selection:auto-v1:([a-f0-9]{64}(?:,[a-f0-9]{64})*) -->/.exec(existing.body);
+         if (!options.automatic || !automatic || existing.body.includes("<!-- test-evidence-selection:manual-v1 -->")) return existing.body;
+         if (!options.replaceAutomatic && automatic[1].split(",").some((fingerprint) => !fingerprints.includes(fingerprint))) return existing.body;
+      }
+    }
+  };
+  const current = exec("gh", ["pr", "view", pr, "--json", "comments"]);
+  requireSuccess(current, "Reading current evidence");
+  const preserved = protectedReport(current.stdout);
+  if (preserved) return { markdown: preserved, posted: false, updated: false, urls: {} };
+  const upload = dependencies.upload ?? (await import("@openwork/review/storage")).uploadReview;
+  const id = await upload(report, assets);
+  const reportUrl = new URL(`/r/${id}`, url).href;
+  // A push while media was uploading must not replace current evidence with an older report.
+  requireCurrentHead();
+  const markdown = `${renderReviewComment(report, reportUrl)}\n${selectionMarker}`;
+  const viewed = exec("gh", ["pr", "view", pr, "--json", "comments"]);
+  requireSuccess(viewed, "Reading PR comments");
+  const concurrentSelection = protectedReport(viewed.stdout);
+  if (concurrentSelection) return { markdown: concurrentSelection, posted: false, updated: false, urls: {} };
+  requireCurrentHead();
+  if (options.presentation === "native") {
+    const { summarizeReview } = await import("@openwork/review");
+    return { markdown, posted: true, updated: false, urls: { report: reportUrl },
+      evidence: { gitSha: report.gitSha, ...summarizeReview(report) } };
+  }
+  const commentId = stickyCommentId(viewed.stdout);
+  const posted = commentId
+    ? exec(
+        "gh",
+        [
+          "api",
+          "--method",
+          "PATCH",
+          `repos/{owner}/{repo}/issues/comments/${commentId}`,
+          "--input",
+          "-",
+        ],
+        { input: JSON.stringify({ body: markdown }) },
+      )
+    : exec("gh", ["pr", "comment", pr, "--body-file", "-"], {
+        input: markdown,
+      });
+  requireSuccess(posted, "Publishing review link");
+  return {
+    markdown,
+    posted: true,
+    updated: commentId !== null,
+    urls: { report: reportUrl },
+  };
 }

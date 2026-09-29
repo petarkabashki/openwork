@@ -1,6 +1,7 @@
 /** @jsxImportSource react */
 import * as React from "react";
 import {
+  Blocks,
   ArrowLeft,
   ArrowRight,
   Globe,
@@ -14,14 +15,17 @@ import { useDragControls } from "motion/react";
 import type { OpenworkServerClient } from "@/app/lib/openwork-server";
 import { PanelTab, PanelTabClose, PanelTabItem, PanelTabList } from "@/components/panel-tabs";
 import { Button } from "@/components/ui/button";
+import { TaskRecovery } from "@/components/chat/task-recovery";
 import {
   InputGroup,
   InputGroupAddon,
   InputGroupInput,
 } from "@/components/ui/input-group";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 import { ArtifactIcon } from "../artifacts/artifact-icon";
+import { AppArtifact } from "../../apps/app-artifact";
 import { ArtifactPanel } from "../artifacts/artifact-panel";
 import {
   type BrowserPanelTab,
@@ -39,8 +43,9 @@ import {
   getElectronBrowser,
   getNativeMenuPoint,
   hasNativeBrowserOccluder,
-  sameBounds,
 } from "./utils";
+import { LoginSyncCard } from "../../browser-logins/login-sync-card";
+import { createBrowserBoundsSync } from "./browser-bounds-sync";
 
 type SidePanelProps = {
   sessionId: string;
@@ -50,7 +55,6 @@ type SidePanelProps = {
   isRemoteWorkspace?: boolean;
   onClose: () => void;
   onOpenExtensions?: () => void;
-  onOpenVoice?: () => void;
 };
 
 // HMR can remount this module without unmounting BrowserPanelContent, leaving
@@ -68,7 +72,15 @@ The artifact preview keeps **outside-chat Markdown** readable with inline \`surf
 \`\`\`ts
 const surface = "shared markdown primitive";
 console.log(surface);
+\`\`\`
+
+\`\`\`mermaid
+flowchart LR
+  ArtifactStart[Artifact Mermaid Start] --> ArtifactFinish[Artifact Mermaid Finish]
 \`\`\``;
+
+const STANDALONE_MERMAID_ARTIFACT_CONTENT = `flowchart TD
+  StandaloneStart[Standalone Mermaid] --> StandaloneFinish[Rendered artifact]`;
 
 type SidePanelTabProps = {
   tab: PanelTabEntry;
@@ -105,7 +117,7 @@ function SidePanelTab({ tab, active, onSelect, onClose }: SidePanelTabProps) {
         showBrowserTabContextMenu({ clientX: event.clientX, clientY: event.clientY });
       } : undefined}
     >
-      <div ref={tabRef} className="relative">
+      <div ref={tabRef} className="relative" data-browser-shortcut-tab={tab.type === "browser" ? tab.id : undefined}>
         <PanelTab
           active={active}
           onClick={() => onSelect(tab.id)}
@@ -135,7 +147,7 @@ function SidePanelTab({ tab, active, onSelect, onClose }: SidePanelTabProps) {
             ) : (
               <Globe />
             )
-          ) : (
+          ) : tab.type === "app" ? <Blocks /> : (
             <ArtifactIcon type={tab.preview} />
           )}
           <span className="min-w-0 flex-1 truncate text-left">{tab.label}</span>
@@ -151,22 +163,28 @@ function SidePanelTab({ tab, active, onSelect, onClose }: SidePanelTabProps) {
 }
 
 type BrowserPanelContentProps = {
+  sessionId: string;
   tab: BrowserPanelTab;
   onClose: () => void;
 };
 
 function BrowserPanelContent({
+  sessionId,
   tab,
   onClose,
 }: BrowserPanelContentProps) {
   const isAvailable = Boolean(getElectronBrowser());
+  const suspended = tab.status === "suspended";
+  const busy = tab.status === "suspending" || tab.status === "restoring";
   const [urlInput, setUrlInput] = React.useState(tab.url);
   const urlFocusedRef = React.useRef(false);
   const contentRef = React.useRef<HTMLDivElement>(null);
   const urlInputRef = React.useRef<HTMLInputElement>(null);
-  const shownRef = React.useRef(false);
-  const boundsFrameRef = React.useRef<number | null>(null);
-  const lastBoundsRef = React.useRef<{ x: number; y: number; width: number; height: number } | null>(null);
+  const [failure, setFailure] = React.useState<{ owner: string; title: string; details: string } | null>(null);
+  const failureOwner = JSON.stringify([sessionId, tab.id]);
+  const reportFailure = React.useCallback((title: string, error: unknown) => {
+    setFailure({ owner: failureOwner, title, details: error instanceof Error ? error.message : String(error) });
+  }, [failureOwner]);
 
   React.useEffect(() => {
     if (!urlFocusedRef.current) {
@@ -175,20 +193,29 @@ function BrowserPanelContent({
   }, [tab.id, tab.url]);
 
   const navigate = React.useCallback(() => {
-    void getElectronBrowser()?.navigate?.(urlInput);
-  }, [urlInput]);
+    void getElectronBrowser()?.navigate?.(urlInput).catch((error: unknown) => {
+      reportFailure("Could not open this page. Check the address and try again.", error);
+    });
+  }, [urlInput, reportFailure]);
 
   const back = React.useCallback(() => {
-    void getElectronBrowser()?.back?.();
-  }, []);
+    void getElectronBrowser()?.back?.().catch((error: unknown) => {
+      reportFailure("Could not go back. Try again.", error);
+    });
+  }, [reportFailure]);
 
   const forward = React.useCallback(() => {
-    void getElectronBrowser()?.forward?.();
-  }, []);
+    void getElectronBrowser()?.forward?.().catch((error: unknown) => {
+      reportFailure("Could not go forward. Try again.", error);
+    });
+  }, [reportFailure]);
 
   const reload = React.useCallback(() => {
-    void getElectronBrowser()?.reload?.();
-  }, []);
+    const browser = getElectronBrowser();
+    void (suspended ? browser?.selectTab?.(tab.id) : browser?.reload?.())?.catch((error: unknown) => {
+      reportFailure("Could not reload this page. Try again.", error);
+    });
+  }, [suspended, tab.id, reportFailure]);
 
   const handleUrlKeyDown = React.useCallback((event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Enter") {
@@ -201,111 +228,95 @@ function BrowserPanelContent({
   React.useLayoutEffect(() => {
     const browser = getElectronBrowser();
     const content = contentRef.current;
-    if (!browser || !content || !isAvailable) {
-      return;
-    }
-
-    const bounds = computeBounds(content);
-    if (bounds.width < 1 || bounds.height < 1) {
-      return;
-    }
-
-    browser.setBounds?.(bounds);
-    lastBoundsRef.current = bounds;
-  });
-
-  React.useLayoutEffect(() => {
-    const browser = getElectronBrowser();
-    const content = contentRef.current;
 
     if (!browser || !content || !isAvailable) {
       browser?.hide?.();
-      shownRef.current = false;
-      lastBoundsRef.current = null;
-
-      if (boundsFrameRef.current != null) {
-        window.cancelAnimationFrame(boundsFrameRef.current);
-        boundsFrameRef.current = null;
-      }
-
       return;
     }
 
     let disposed = false;
+    let ready = false;
+    let boundsFrame: number | null = null;
+    const boundsSync = createBrowserBoundsSync(browser, sessionId, (error) => {
+      reportFailure("Could not show the browser. Try reopening this tab.", error);
+    });
+
+    const scheduleBounds = () => {
+      if (!disposed && ready && boundsFrame === null) {
+        boundsFrame = window.requestAnimationFrame(watchBounds);
+      }
+    };
 
     const resetNativeView = async () => {
-      await browser.hide?.();
+      // This hide only stages fresh geometry; it is not leaving browser focus.
+      await browser.hide?.({ preserveShortcutFocus: true });
 
       if (disposed) {
         return;
       }
 
-      shownRef.current = false;
-      lastBoundsRef.current = null;
-      boundsFrameRef.current = window.requestAnimationFrame(watchBounds);
+      ready = true;
+      scheduleBounds();
     };
 
     const syncBounds = () => {
-      const bounds = computeBounds(content);
+      if (!ready || disposed) return;
+      boundsSync.sync(computeBounds(content), window.devicePixelRatio, hasNativeBrowserOccluder());
+    };
 
-      if (bounds.width < 1 || bounds.height < 1 || hasNativeBrowserOccluder()) {
-        if (shownRef.current) {
-          browser.hide?.();
-          shownRef.current = false;
-          lastBoundsRef.current = null;
-        }
-
-        return;
-      }
-
-      if (!shownRef.current) {
-        browser.show?.(bounds);
-        shownRef.current = true;
-        lastBoundsRef.current = bounds;
-        return;
-      }
-
-      if (!sameBounds(lastBoundsRef.current, bounds)) {
-        browser.setBounds?.(bounds);
-        lastBoundsRef.current = bounds;
-      }
+    const invalidateBounds = () => {
+      boundsSync.invalidate();
+      scheduleBounds();
     };
 
     const watchBounds = () => {
+      boundsFrame = null;
       syncBounds();
-      boundsFrameRef.current = window.requestAnimationFrame(watchBounds);
+      // Position-only layout changes and dialog occlusion also need tracking.
+      scheduleBounds();
     };
 
     void resetNativeView();
 
+    // Panel constraints can settle in ResizeObserver after this frame's RAF.
     const observer = new ResizeObserver(syncBounds);
-
     observer.observe(content);
-    window.addEventListener("resize", syncBounds);
-    window.addEventListener("scroll", syncBounds, true);
+    window.addEventListener("resize", invalidateBounds);
+    window.addEventListener("openwork:browser:bounds-invalidated", invalidateBounds);
 
     return () => {
       disposed = true;
       observer.disconnect();
-      window.removeEventListener("resize", syncBounds);
-      window.removeEventListener("scroll", syncBounds, true);
+      window.removeEventListener("resize", invalidateBounds);
+      window.removeEventListener("openwork:browser:bounds-invalidated", invalidateBounds);
 
-      if (boundsFrameRef.current != null) {
-        window.cancelAnimationFrame(boundsFrameRef.current);
-        boundsFrameRef.current = null;
+      if (boundsFrame !== null) {
+        window.cancelAnimationFrame(boundsFrame);
       }
 
-      browser.hide?.();
-      shownRef.current = false;
-      lastBoundsRef.current = null;
+      boundsSync.dispose();
     };
-  }, [isAvailable]);
+  }, [isAvailable, sessionId, reportFailure]);
 
   return (
     <>
+      {failure?.owner === failureOwner ? <div className="shrink-0 px-3 py-2"><TaskRecovery compact title={failure.title} technicalDetails={failure.details}
+        actions={<Button variant="ghost" size="xs" onClick={() => setFailure(null)}>Dismiss</Button>} /></div> : null}
+      {isAvailable && tab.browserTask ? (
+        <div data-browser-shortcut-tab={tab.id} className="flex min-h-9 shrink-0 items-center gap-2 border-b border-border px-3 text-xs">
+          <span className="shrink-0 font-medium">Built-in browser</span>
+          <span role="status" className="min-w-0 flex-1 truncate text-muted-foreground">
+            {tab.browserTask?.status === "paused" ? "You have control · resume when finished" : tab.browserTask?.status === "running" ? browserOperationLabels[tab.browserTask.operation ?? ""] ?? "Working on this page" : tab.browserTask?.status === "needs_attention" ? browserOperationLabels[tab.browserTask.operation ?? ""] ?? "Review this page" : "This conversation's tab"}
+          </span>
+          <Button variant="outline" size="sm" className="h-6 px-2 text-xs"
+            onClick={() => { void window.__OPENWORK_ELECTRON__?.browser?.taskControl?.(tab.id, tab.browserTask?.status === "paused" ? "resume" : "pause"); }}>
+            {tab.browserTask?.status === "paused" ? "Resume browser" : "Take over"}
+          </Button>
+        </div>
+      ) : null}
       <div className="flex h-10 shrink-0 items-center gap-1 border-b border-border bg-background px-2 mac:bg-background/80 mac:backdrop-blur-2xl mac:backdrop-saturate-150">
         {isAvailable ? (
-          <>
+          <div data-browser-shortcut-tab={tab.id} className="flex min-w-0 flex-1 items-center gap-1">
             <Tooltip>
               <TooltipTrigger
                 render={(
@@ -313,7 +324,7 @@ function BrowserPanelContent({
                     variant="ghost"
                     size="icon-sm"
                     onClick={back}
-                    disabled={!tab.canGoBack}
+                    disabled={suspended || busy || !tab.canGoBack}
                     aria-label="Go back"
                   >
                     <ArrowLeft />
@@ -329,7 +340,7 @@ function BrowserPanelContent({
                     variant="ghost"
                     size="icon-sm"
                     onClick={forward}
-                    disabled={!tab.canGoForward}
+                    disabled={suspended || busy || !tab.canGoForward}
                     aria-label="Go forward"
                   >
                     <ArrowRight />
@@ -345,9 +356,10 @@ function BrowserPanelContent({
                     variant="ghost"
                     size="icon-sm"
                     onClick={reload}
+                    disabled={busy}
                     aria-label="Reload page"
                   >
-                    {tab.status === "loading" ? <Loader2 className="animate-spin" /> : <RotateCw />}
+                    {tab.status === "loading" || busy ? <Loader2 className="animate-spin" /> : <RotateCw />}
                   </Button>
                 )}
               />
@@ -359,6 +371,7 @@ function BrowserPanelContent({
                 type="text"
                 className="h-7"
                 value={urlInput}
+                disabled={suspended || busy}
                 onChange={(event) => setUrlInput(event.target.value)}
                 onKeyDown={handleUrlKeyDown}
                 onFocus={() => {
@@ -376,7 +389,60 @@ function BrowserPanelContent({
                 <Globe />
               </InputGroupAddon>
             </InputGroup>
-          </>
+            {tab.siteToolCount > 0 ? (
+              <Popover>
+                <PopoverTrigger
+                  render={(
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-6 shrink-0 rounded-md bg-muted/60 px-2 text-[11px] font-medium"
+                      aria-label={`${tab.siteToolCount} site ${tab.siteToolCount === 1 ? "tool" : "tools"} available; inspect site tools and activity`}
+                    >
+                      {tab.siteToolCount} {tab.siteToolCount === 1 ? "tool" : "tools"}
+                    </Button>
+                  )}
+                />
+                <PopoverContent align="end" side="bottom" sideOffset={8} className="w-80 max-w-[calc(100vw-2rem)] gap-0 p-0">
+                  <div className="border-b border-border px-4 py-3">
+                    <p className="text-sm font-semibold">Site tools</p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Actions offered by this page. Review the website and the requested action before allowing it.
+                    </p>
+                  </div>
+                  <div className="max-h-64 overflow-y-auto px-4 py-2">
+                    {(tab.siteTools ?? []).map((tool) => (
+                      <div key={`${tool.origin}:${tool.name}`} className="border-b border-border/60 py-2 last:border-b-0">
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="min-w-0 truncate text-xs font-medium">{tool.title || tool.name}</p>
+                          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                            {tool.readOnly ? "Site says read-only" : "May change data"}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">{tool.name}</p>
+                        <p className="truncate text-[10px] text-muted-foreground">{tool.origin}</p>
+                      </div>
+                    ))}
+                  </div>
+                  {(tab.siteToolActivity ?? []).length > 0 ? (
+                    <div className="border-t border-border px-4 py-3">
+                      <p className="mb-1.5 text-xs font-semibold">Recent activity</p>
+                      {(tab.siteToolActivity ?? []).slice(0, 5).map((activity, index) => (
+                        <div key={`${activity.at}:${activity.name}:${index}`} className="flex items-center justify-between gap-3 py-1 text-[10px]">
+                          <span className="min-w-0 truncate font-mono">{activity.name}</span>
+                          <span className={activity.status === "completed" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"}>
+                            {activity.status === "completed" ? "Returned" : activity.code || "Failed"}
+                          </span>
+                        </div>
+                      ))}
+                      <p className="mt-1 text-[10px] text-muted-foreground">Arguments and results are not retained in this activity view.</p>
+                    </div>
+                  ) : null}
+                </PopoverContent>
+              </Popover>
+            ) : null}
+          </div>
         ) : (
           <p className="px-2 text-sm text-muted-foreground">
             Browser panel is only available in the desktop app.
@@ -392,12 +458,47 @@ function BrowserPanelContent({
           <X />
         </Button>
       </div>
-      <div className="min-h-0 flex-1 overflow-hidden">
-        {isAvailable ? <div ref={contentRef} className="h-full overflow-hidden" /> : null}
+      {tab.loadError ? (
+        <div data-browser-shortcut-tab={tab.id} role="alert" className="shrink-0 border-b border-border bg-muted px-3 py-2 text-xs">
+          {tab.loadError.message}
+        </div>
+      ) : null}
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        {isAvailable ? (
+          <div ref={contentRef} data-browser-shortcut-tab={tab.id} className="h-full overflow-hidden">
+            {suspended ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
+                <p className="text-sm font-medium">Tab suspended</p>
+                <p className="text-sm text-muted-foreground">Reload opens the saved URL, not the previous page state.</p>
+                <Button variant="outline" size="sm" onClick={reload}>Reload</Button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {tab.browserApproval ? (
+          <div className="absolute inset-0 z-10 flex flex-col justify-center gap-3 overflow-y-auto bg-background p-5 text-sm" role="region" aria-label="Browser permission request">
+            <h3 className="font-semibold">{tab.browserApproval.title}</h3>
+            <p className="font-medium">{tab.browserApproval.message}</p>
+            <p className="max-h-[60vh] overflow-y-auto whitespace-pre-wrap break-words text-muted-foreground">{tab.browserApproval.detail}</p>
+            <div className="flex gap-2">
+              <Button size="sm" onClick={() => { if (tab.browserApproval) void window.__OPENWORK_ELECTRON__?.browser?.approve?.(tab.id, tab.browserApproval.id, true); }}>{tab.browserApproval.approveLabel ?? "Allow once"}</Button>
+              <Button size="sm" variant="outline" onClick={() => { if (tab.browserApproval) void window.__OPENWORK_ELECTRON__?.browser?.approve?.(tab.id, tab.browserApproval.id, false); }}>Deny</Button>
+            </div>
+          </div>
+        ) : null}
       </div>
     </>
   );
 }
+
+const browserOperationLabels: Record<string, string> = {
+  observe: "Reading this page", site_tools: "Finding website tools", site_tool: "Using a website tool",
+  navigate: "Opening a page", click: "Clicking a control", fill: "Entering text", key: "Using the keyboard", scroll: "Scrolling",
+  "Browser control": "Allow control for this thread", website_blocked: "This website is blocked", browser_disabled: "Browser control is disabled",
+  stale_observation: "A fresh page view is needed", stale_tool: "Website tools have changed", user_denied: "The action was declined",
+  needs_attention: "Review this page", sign_in_required: "Sign in directly in this browser", timeout: "Check the page before continuing",
+  result_withheld: "Website result was kept private",
+};
 
 export function SidePanel({
   sessionId,
@@ -407,7 +508,6 @@ export function SidePanel({
   isRemoteWorkspace = false,
   onClose,
   onOpenExtensions,
-  onOpenVoice,
 }: SidePanelProps) {
   const { tabs } = useSessionPanelState(sessionId);
   const activeTab = useActivePanelTab(sessionId);
@@ -491,13 +591,16 @@ export function SidePanel({
       description: "Create a deterministic markdown artifact and open it in the preview panel.",
       sideEffect: "mutation",
       disabled: !client || !workspaceId,
-      execute: async () => {
+      execute: async (args) => {
         if (!client || !workspaceId) return { ok: false, error: "Workspace client is not ready." };
 
-        const value = "artifacts/markdown-primitive-proof.md";
+        const standalone = Boolean(args && typeof args === "object" && "standalone" in args && args.standalone);
+        const value = standalone ? "artifacts/standalone-mermaid-proof.mmd" : "artifacts/markdown-primitive-proof.md";
+        const name = standalone ? "standalone-mermaid-proof.mmd" : "markdown-primitive-proof.md";
+        const content = standalone ? STANDALONE_MERMAID_ARTIFACT_CONTENT : MARKDOWN_PRIMITIVE_ARTIFACT_CONTENT;
         await client.writeWorkspaceFile(workspaceId, {
           path: value,
-          content: MARKDOWN_PRIMITIVE_ARTIFACT_CONTENT,
+          content,
           baseUpdatedAt: null,
         });
 
@@ -505,12 +608,12 @@ export function SidePanel({
           id: `file:${value}`,
           kind: "file",
           value,
-          name: "markdown-primitive-proof.md",
+          name,
           preview: "markdown",
           confidence: 100,
           reason: "eval",
           exists: true,
-          size: MARKDOWN_PRIMITIVE_ARTIFACT_CONTENT.length,
+          size: content.length,
         };
 
         const store = usePanelTabStore.getState();
@@ -650,11 +753,15 @@ export function SidePanel({
           <PanelEmpty
             onOpenBrowser={isBrowserAvailable ? createTab : undefined}
             onOpenExtensions={onOpenExtensions}
-            onOpenVoice={onOpenVoice}
           />
         ) : null}
         {activeTab?.type === "browser" ? (
-          <BrowserPanelContent tab={activeTab} onClose={onClose} />
+          <>
+            <LoginSyncCard />
+            <BrowserPanelContent sessionId={sessionId} tab={activeTab} onClose={onClose} />
+          </>
+        ) : activeTab?.type === "app" ? (
+          <div className="min-h-0 flex-1 overflow-hidden"><AppArtifact key={activeTab.id} appId={activeTab.appId} revisionId={activeTab.revisionId} receiptId={activeTab.receiptId} onClose={onClose} /></div>
         ) : activeTab?.type === "artifact" ? (
           <div className="min-h-0 flex-1 overflow-hidden">
             <ArtifactPanel

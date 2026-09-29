@@ -134,13 +134,14 @@ export async function setSessionArchived(
   sessionID: string,
   archived: boolean,
   directory?: string,
+  options?: { signal?: AbortSignal },
 ): Promise<void> {
   unwrap(
     await client.session.update({
       sessionID,
       directory,
       time: { archived: archived ? Date.now() : 0 },
-    }),
+    }, options),
   );
 }
 
@@ -195,9 +196,9 @@ export async function shellInSession(
   client: Client,
   sessionID: string,
   command: string,
-  options?: { model?: { providerID: string; modelID: string }; agent?: string; variant?: string },
+  options?: { model?: { providerID: string; modelID: string }; agent?: string; variant?: string; messageID?: string },
 ): Promise<void> {
-  const result = await client.session.shell({ sessionID, command });
+  const result = await client.session.shell({ sessionID, command, messageID: options?.messageID });
   assertNoClientError(result);
 }
 

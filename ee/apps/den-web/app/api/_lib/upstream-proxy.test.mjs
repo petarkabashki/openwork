@@ -5,24 +5,29 @@ import { NextRequest } from "next/server";
 import { setStructuredLogSink, useJsonStdoutStructuredLogSink } from "../../../observability/runtime-logger.ts";
 
 const previousDenApiBase = process.env.DEN_API_BASE;
+const previousDenBaseUrl = process.env.DEN_BASE_URL;
 const previousDenWebPublicOrigin = process.env.DEN_WEB_PUBLIC_ORIGIN;
 
 describe("Den upstream proxy", () => {
   let server;
   let observed = null;
+  let upstreamRequestCount = 0;
   let logs = [];
 
   beforeAll(() => {
     server = Bun.serve({
       port: 0,
       async fetch(request) {
+        upstreamRequestCount += 1;
         const url = new URL(request.url);
         observed = {
           method: request.method,
           path: `${url.pathname}${url.search}`,
           body: await request.text(),
+          contentType: request.headers.get("content-type"),
           cookie: request.headers.get("cookie"),
           authorization: request.headers.get("authorization"),
+          organization: request.headers.get("x-openwork-org-id"),
           custom: request.headers.get("x-custom-proxy-test"),
           forwarded: request.headers.get("forwarded"),
           forwardedHost: request.headers.get("x-forwarded-host"),
@@ -31,6 +36,14 @@ describe("Den upstream proxy", () => {
           traceparent: request.headers.get("traceparent"),
           tracestate: request.headers.get("tracestate"),
         };
+
+        if (url.pathname === "/v1/browser-session-witness") {
+          const member = request.headers.get("cookie")?.match(/openwork-den\.session_token=(member-[12])/)?.[1];
+          return Response.json(member ? { user: { id: member } } : { error: "unauthorized" }, {
+            status: member ? 200 : 401,
+            headers: { "cache-control": "public, max-age=300", "access-control-allow-origin": "https://api-portal.example.test" },
+          });
+        }
 
         if (url.pathname === "/v1/compressed") {
           return new Response(Bun.gzipSync(JSON.stringify({ ok: true, source: "gzip" })), {
@@ -43,6 +56,17 @@ describe("Den upstream proxy", () => {
 
         if (url.pathname === "/v1/error") {
           return new Response("upstream unavailable", { status: 502 });
+        }
+
+        if (url.pathname === "/v1/audit/export") {
+          return new Response('{"schemaVersion":1}\n', { headers: {
+            "content-type": "application/x-ndjson",
+            "x-audit-next-cursor": "signed-next-page",
+            "x-audit-snapshot-sequence": "42",
+            "x-audit-resource-scope": "first_event",
+            "x-request-id": "internal-request",
+            "access-control-expose-headers": "X-Audit-Next-Cursor, X-Audit-Snapshot-Sequence, X-Request-Id",
+          } });
         }
 
         if (url.pathname === "/v1/internal-headers") {
@@ -67,6 +91,19 @@ describe("Den upstream proxy", () => {
           });
         }
 
+        if (url.pathname === "/api/auth/callback/google") {
+          const headers = new Headers({ "content-type": "text/plain" });
+          headers.append(
+            "set-cookie",
+            "__Secure-better-auth.session_token=abc; Path=/; Domain=api.app.example.com; Secure; HttpOnly; SameSite=Lax",
+          );
+          headers.append(
+            "set-cookie",
+            "better-auth.session_data=def; Path=/; Secure; HttpOnly; SameSite=Lax",
+          );
+          return new Response("signed in", { headers });
+        }
+
         return new Response("proxied", {
           status: 207,
           headers: {
@@ -81,6 +118,10 @@ describe("Den upstream proxy", () => {
   });
 
   beforeEach(() => {
+    delete process.env.DEN_BASE_URL;
+    delete process.env.DEN_WEB_PUBLIC_ORIGIN;
+    observed = null;
+    upstreamRequestCount = 0;
     logs = [];
     setStructuredLogSink({
       log(level, message, fields) {
@@ -102,9 +143,218 @@ describe("Den upstream proxy", () => {
     } else {
       process.env.DEN_WEB_PUBLIC_ORIGIN = previousDenWebPublicOrigin;
     }
+    if (previousDenBaseUrl === undefined) {
+      delete process.env.DEN_BASE_URL;
+    } else {
+      process.env.DEN_BASE_URL = previousDenBaseUrl;
+    }
+  });
+
+  test("the browser route forwards web-only session cookies without sharing identities or caching responses", async () => {
+    const { GET, POST, maxDuration } = await import("../browser/v1/[...path]/route.ts");
+    process.env.DEN_BASE_URL = "https://portal.example.test";
+    const path = "http://den-web:3005/api/browser/v1/browser-session-witness?include=org";
+    for (const member of ["member-1", "member-2", null]) {
+      const response = await GET(new NextRequest(path, {
+        headers: {
+          cookie: member ? `analytics=private; openwork-den.session_token=${member}` : "analytics=private",
+          "sec-fetch-site": "same-origin",
+        },
+      }));
+      expect(response.status).toBe(member ? 200 : 401);
+      expect(await response.json()).toEqual(member ? { user: { id: member } } : { error: "unauthorized" });
+      expect(observed.cookie).toBe(member ? `openwork-den.session_token=${member}` : null);
+      expect(observed.authorization).toBeNull();
+      expect(observed.path).toBe("/v1/browser-session-witness?include=org");
+      expect(observed.forwardedHost).toBe("portal.example.test");
+      expect(response.headers.get("location")).toBeNull();
+      expect(response.headers.get("set-cookie")).toBeNull();
+      expect(response.headers.get("cache-control")).toBe("private, no-store");
+      expect(response.headers.get("access-control-allow-origin")).toBeNull();
+    }
+    const response = await POST(new NextRequest(path, {
+      method: "POST",
+      headers: {
+        origin: "https://portal.example.test", "content-type": "application/json",
+        cookie: "openwork-den.session_token=member-1", authorization: "Bearer existing-password-token",
+        "x-openwork-org-id": "org-1",
+      },
+      body: JSON.stringify({ organizationId: "org-1" }),
+    }));
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(observed.method).toBe("POST");
+    expect(observed.body).toBe(JSON.stringify({ organizationId: "org-1" }));
+    expect(observed.authorization).toBe("Bearer existing-password-token");
+    expect(observed.organization).toBe("org-1");
+    expect(maxDuration).toBeGreaterThanOrEqual(180);
+  });
+
+  test.each([
+    { method: "POST", headers: { origin: "https://sibling.example.test" } },
+    { method: "POST", headers: { origin: "null" } },
+    { method: "POST", headers: {} },
+    { method: "GET", headers: { origin: "https://sibling.example.test" } },
+    { method: "GET", headers: { "sec-fetch-site": "same-site" } },
+    { method: "GET", headers: { "sec-fetch-site": "cross-site" } },
+    { method: "OPTIONS", headers: { origin: "https://instance.daytonaproxy01.net" } },
+  ])("the browser route rejects foreign or unverified $method requests before forwarding cookies", async ({ method, headers }) => {
+    const { GET } = await import("../browser/v1/[...path]/route.ts");
+    process.env.DEN_BASE_URL = "https://portal.example.test";
+    const response = await GET(new NextRequest("http://den-web:3005/api/browser/v1/browser-session-witness", {
+      method, headers: { ...headers, cookie: "openwork-den.session_token=member-1" },
+    }));
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "forbidden_origin" });
+    expect(upstreamRequestCount).toBe(0);
+    expect(response.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  test.each(["%2e%2e/api/auth", "%2e%2e%2fapi/auth", "me%5c..%5capi", "me%00", "%"])("the browser proxy rejects an escaping or malformed API path: %s", async (path) => {
+    const { GET } = await import("../browser/v1/[...path]/route.ts");
+    const response = await GET(new NextRequest(`https://portal.example.test/api/browser/v1/${path}`));
+    expect(response.status).toBe(400);
+    expect(upstreamRequestCount).toBe(0);
   });
 
   const INSTANCE_ORIGIN = "https://8787-2bnptanfwxs5j8vu.daytonaproxy01.net";
+  const TEST_BODY_LIMIT = 12;
+  const limitedProxyOptions = { routePrefix: "/api/den", maxRequestBodyBytes: TEST_BODY_LIMIT };
+
+  test("rejects an oversized declared body before contacting Den", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/den/v1/me", {
+      method: "POST",
+      headers: {
+        "content-length": String(TEST_BODY_LIMIT + 1),
+        "content-type": "application/json",
+        "x-request-id": "declared-limit-request",
+        authorization: "Bearer must-not-log",
+        origin: INSTANCE_ORIGIN,
+      },
+      body: "{}",
+    });
+
+    const response = await proxyUpstream(request, [], limitedProxyOptions);
+
+    expect(response.status).toBe(413);
+    expect(response.headers.get("x-request-id")).toBe("declared-limit-request");
+    expect(response.headers.get("access-control-allow-origin")).toBe(INSTANCE_ORIGIN);
+    expect(await response.json()).toEqual({
+      error: "request_too_large",
+      requestId: "declared-limit-request",
+      maxBytes: TEST_BODY_LIMIT,
+      declaredBytes: TEST_BODY_LIMIT + 1,
+    });
+    expect(upstreamRequestCount).toBe(0);
+    expect(observed).toBeNull();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      level: "warn",
+      message: "den-web upstream proxy rejected request body",
+      fields: {
+        route_prefix: "/api/den",
+        method: "POST",
+        status: 413,
+        max_bytes: TEST_BODY_LIMIT,
+        declared_bytes: TEST_BODY_LIMIT + 1,
+      },
+    });
+    expect(JSON.stringify(logs[0])).not.toContain("must-not-log");
+  });
+
+  test("stops an oversized chunked body and does not contact Den", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode("12345678"));
+        controller.enqueue(encoder.encode("90123"));
+        controller.enqueue(encoder.encode("secret multipart filename.png"));
+      },
+      cancel() {
+        cancelled = true;
+        // A producer can acknowledge cancellation without ever settling it.
+        return new Promise(() => {});
+      },
+    });
+    const request = new NextRequest("https://app.example.com/api/den/v1/me", {
+      method: "POST",
+      headers: { "x-request-id": "chunked-limit-request" },
+      body,
+      duplex: "half",
+    });
+    expect(request.headers.get("content-length")).toBeNull();
+
+    const response = await proxyUpstream(request, [], limitedProxyOptions);
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({
+      error: "request_too_large",
+      requestId: "chunked-limit-request",
+      maxBytes: TEST_BODY_LIMIT,
+      observedBytes: TEST_BODY_LIMIT + 1,
+    });
+    expect(cancelled).toBe(true);
+    expect(upstreamRequestCount).toBe(0);
+    expect(observed).toBeNull();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      level: "warn",
+      message: "den-web upstream proxy rejected request body",
+      fields: {
+        route_prefix: "/api/den",
+        method: "POST",
+        status: 413,
+        max_bytes: TEST_BODY_LIMIT,
+        observed_bytes: TEST_BODY_LIMIT + 1,
+      },
+    });
+    const serializedLog = JSON.stringify(logs[0]);
+    expect(serializedLog).not.toContain("secret");
+    expect(serializedLog).not.toContain("filename.png");
+  });
+
+  test("accepts request bodies exactly at and immediately below the limit", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+
+    for (const size of [TEST_BODY_LIMIT - 1, TEST_BODY_LIMIT]) {
+      const body = "x".repeat(size);
+      const request = new NextRequest("https://app.example.com/api/den/v1/me", {
+        method: "POST",
+        headers: { "content-length": String(size) },
+        body,
+      });
+
+      const response = await proxyUpstream(request, [], limitedProxyOptions);
+
+      expect(response.status).toBe(207);
+      expect(observed.body).toBe(body);
+    }
+    expect(upstreamRequestCount).toBe(2);
+  });
+
+  test("continues to proxy ordinary multipart requests without logging their contents", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const body = new FormData();
+    body.set("logo", new File(["multipart-private-content"], "private-brand-name.png", { type: "image/png" }));
+    const request = new NextRequest("https://app.example.com/api/den/v1/org/brand-assets", {
+      method: "POST",
+      body,
+    });
+
+    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(response.status).toBe(207);
+    expect(observed.contentType).toStartWith("multipart/form-data; boundary=");
+    expect(observed.body).toContain("private-brand-name.png");
+    expect(observed.body).toContain("multipart-private-content");
+    expect(upstreamRequestCount).toBe(1);
+    const serializedLog = JSON.stringify(logs[0]);
+    expect(serializedLog).not.toContain("private-brand-name.png");
+    expect(serializedLog).not.toContain("multipart-private-content");
+  });
 
   test("answers the preflight for a rotating Cloud instance origin", async () => {
     const { proxyUpstream } = await import("./upstream-proxy.ts");
@@ -166,13 +416,121 @@ describe("Den upstream proxy", () => {
     const { proxyUpstream } = await import("./upstream-proxy.ts");
     const request = new NextRequest("https://app.example.com/api/auth/session", {
       method: "GET",
-      headers: { origin: INSTANCE_ORIGIN, cookie: "ow_session=sess_test" },
+      headers: { origin: INSTANCE_ORIGIN, cookie: "better-auth.session_token=sess_test" },
     });
 
     const response = await proxyUpstream(request, [], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
 
     expect(response.headers.get("access-control-allow-origin")).toBeNull();
-    expect(observed.cookie).toBe("ow_session=sess_test");
+    expect(observed.cookie).toBe("better-auth.session_token=sess_test");
+  });
+
+  test("forwards only OpenWork Den and legacy Better Auth cookies through the auth proxy", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/auth/sign-in/social", {
+      method: "POST",
+      headers: {
+        cookie: "ph_posthog=analytics; __Secure-openwork-den.state=oauth-state; openwork-den.session_token=session; better-auth.state=legacy-oauth-state; __Secure-better-auth.session_token=legacy-session; other=value",
+      },
+    });
+
+    await proxyUpstream(request, [], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
+
+    expect(observed.cookie).toBe("__Secure-openwork-den.state=oauth-state; openwork-den.session_token=session; better-auth.state=legacy-oauth-state; __Secure-better-auth.session_token=legacy-session");
+  });
+
+  test("rewrites auth Set-Cookie domains to the browser origin", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const originalFetch = globalThis.fetch;
+    process.env.DEN_API_BASE = "https://api.app.example.com";
+    globalThis.fetch = async () => {
+      const headers = new Headers({ "content-type": "text/plain" });
+      headers.append(
+        "set-cookie",
+        "__Secure-better-auth.session_token=abc; Path=/; Domain=api.app.example.com; Secure; HttpOnly; SameSite=Lax",
+      );
+      headers.append(
+        "set-cookie",
+        "better-auth.session_data=def; Path=/; Secure; HttpOnly; SameSite=Lax",
+      );
+      return new Response("signed in", { headers });
+    };
+    const request = new NextRequest("https://app.example.com/api/auth/callback/google", {
+      method: "GET",
+    });
+
+    let response;
+    try {
+      response = await proxyUpstream(request, ["callback", "google"], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.DEN_API_BASE = `http://127.0.0.1:${server.port}`;
+    }
+
+    expect(response.headers.getSetCookie()).toEqual([
+      "__Secure-better-auth.session_token=abc; Path=/; Domain=app.example.com; Secure; HttpOnly; SameSite=Lax",
+      "better-auth.session_data=def; Path=/; Secure; HttpOnly; SameSite=Lax; Domain=app.example.com",
+    ]);
+  });
+
+  test("preserves auth Set-Cookie parent domains shared by sibling web and API hosts", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const originalFetch = globalThis.fetch;
+    process.env.DEN_API_BASE = "https://api.openworklabs.com";
+    globalThis.fetch = async () => {
+      const headers = new Headers({ "content-type": "text/plain" });
+      headers.append(
+        "set-cookie",
+        "__Secure-better-auth.session_token=abc; Path=/; Domain=openworklabs.com; Secure; HttpOnly; SameSite=Lax",
+      );
+      return new Response("signed in", { headers });
+    };
+    const request = new NextRequest("https://app.openworklabs.com/api/auth/callback/google", {
+      method: "GET",
+    });
+
+    let response;
+    try {
+      response = await proxyUpstream(request, ["callback", "google"], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.DEN_API_BASE = `http://127.0.0.1:${server.port}`;
+    }
+
+    expect(response.headers.getSetCookie()).toEqual([
+      "__Secure-better-auth.session_token=abc; Path=/; Domain=openworklabs.com; Secure; HttpOnly; SameSite=Lax",
+    ]);
+  });
+
+  test("copies auth Set-Cookie from runtimes that only expose the combined header", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const originalFetch = globalThis.fetch;
+    process.env.DEN_API_BASE = "https://api.app.example.com";
+    globalThis.fetch = async () => {
+      const response = new Response("signed in", {
+        headers: {
+          "set-cookie": "better-auth.session_token=abc; Path=/; Secure; HttpOnly; SameSite=Lax, better-auth.session_data=def; Path=/; Expires=Tue, 25 Aug 2026 23:54:00 GMT; Secure; HttpOnly; SameSite=Lax",
+        },
+      });
+      Object.defineProperty(response.headers, "getSetCookie", { value: () => [] });
+      return response;
+    };
+    const request = new NextRequest("https://app.example.com/api/auth/callback/google", {
+      method: "GET",
+    });
+
+    let response;
+    try {
+      response = await proxyUpstream(request, ["callback", "google"], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.DEN_API_BASE = `http://127.0.0.1:${server.port}`;
+    }
+
+    expect(response.headers.getSetCookie()).toEqual([
+      "better-auth.session_token=abc; Path=/; Secure; HttpOnly; SameSite=Lax; Domain=app.example.com",
+      "better-auth.session_data=def; Path=/; Expires=Tue, 25 Aug 2026 23:54:00 GMT; Secure; HttpOnly; SameSite=Lax; Domain=app.example.com",
+    ]);
   });
 
   test("rejects http and lookalike hostnames", async () => {
@@ -206,8 +564,10 @@ describe("Den upstream proxy", () => {
       method: "POST",
       path: "/v1/me?include=org",
       body: JSON.stringify({ ok: true }),
+      contentType: "application/json",
       cookie: "ow_session=sess_test",
       authorization: "Bearer tok_test",
+      organization: null,
       custom: "kept",
       forwarded: null,
       forwardedHost: "app.example.com",
@@ -237,6 +597,19 @@ describe("Den upstream proxy", () => {
     expect(serializedLog).not.toContain("tok_test");
     expect(serializedLog).not.toContain("sess_test");
     expect(serializedLog).not.toContain(JSON.stringify({ ok: true }));
+  });
+
+  test("preserves audit export continuation through the browser proxy", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/browser/v1/audit/export");
+    const response = await proxyUpstream(request, [], { routePrefix: "/api/browser/v1", upstreamPathPrefix: "/v1" });
+    expect(response.headers.get("x-audit-next-cursor")).toBe("signed-next-page");
+    expect(response.headers.get("x-audit-snapshot-sequence")).toBe("42");
+    expect(response.headers.get("x-audit-resource-scope")).toBe("first_event");
+    expect(response.headers.get("x-request-id")).toBeNull();
+    expect(response.headers.get("access-control-expose-headers")).toBe("X-Audit-Next-Cursor, X-Audit-Snapshot-Sequence");
+    expect(response.headers.get("content-type")).toBe("application/x-ndjson");
+    await response.text();
   });
 
   test("strips internal upstream response headers and rewrites upstream URLs", async () => {
@@ -335,6 +708,29 @@ describe("Den upstream proxy", () => {
     expect(observed.forwardedPrefix).toBe("/api/den");
     expect(observed.forwardedProto).toBe("https");
     expect(observed.forwarded).toBeNull();
+  });
+
+  test("uses DEN_BASE_URL for forwarded public origin headers", async () => {
+    process.env.DEN_BASE_URL = "http://cloud.example.test:3005";
+    process.env.DEN_WEB_PUBLIC_ORIGIN = "https://migration.example.test";
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://request.example.com/api/den/v1/me");
+
+    await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(observed.forwardedHost).toBe("cloud.example.test:3005");
+    expect(observed.forwardedProto).toBe("http");
+  });
+
+  test("keeps DEN_WEB_PUBLIC_ORIGIN as the forwarded origin migration fallback", async () => {
+    process.env.DEN_WEB_PUBLIC_ORIGIN = "https://migration.example.test";
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://request.example.com/api/den/v1/me");
+
+    await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(observed.forwardedHost).toBe("migration.example.test");
+    expect(observed.forwardedProto).toBe("https");
   });
 
   test("preserves a rotating public ingress origin when the server request URL is internal", async () => {

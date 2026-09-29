@@ -5,14 +5,15 @@ import type { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
 import {
   readOpenworkCloudMcpHealth,
   type CloudMcpHealth,
+  type CloudMcpNativeEngineResolver,
   type CloudMcpLiveStatusObserver,
   type CloudMcpProviderModelContext,
   type CloudMcpServerMetadata,
 } from "./cloud-mcp-health.js";
-import { googleWorkspaceLegacyConfigured } from "./extensions/google-workspace.js";
 import { readBoundedRegularTextFile } from "./jsonc.js";
 import { runtimeStorageDir } from "./runtime-db.js";
 import {
+  ENGINE_GLOBAL_RUNTIME_CONFIG_ID,
   inspectRuntimeOpencodeConfigState,
   runtimeMcpMap,
 } from "./runtime-opencode-config-store.js";
@@ -56,12 +57,10 @@ export type ConnectSnapshot = {
     directory: string | null;
     reason?: string;
   };
-  googleWorkspace: {
-    legacyConfigured: boolean;
-  };
 };
 
 export type ConnectSnapshotOptions = {
+  nativeEngineForWorkspace?: CloudMcpNativeEngineResolver;
   workspaceId?: string;
   directory?: string;
   providerModel?: CloudMcpProviderModelContext;
@@ -111,17 +110,18 @@ function normalizeConnectState(value: Record<string, unknown>): PersistedConnect
   };
 }
 
-export function googleWorkspaceConnectGuidance(cloudHealthOrReady: CloudMcpHealth | boolean | null): string {
-  const usable = typeof cloudHealthOrReady === "boolean" ? cloudHealthOrReady : cloudHealthOrReady?.usable === true;
-  if (usable) {
-    return "Google Workspace is available through the OpenWork Cloud connection: call search_capabilities to find the capability, then execute_capability to run it. Do not tell the user to reconfigure extensions; the relevant settings surface is Settings > Connect.";
-  }
-  if (cloudHealthOrReady && typeof cloudHealthOrReady !== "boolean" && cloudHealthOrReady.desired.present) {
-    const failure = cloudHealthOrReady.firstFailure;
-    const suffix = failure ? ` Current health check: ${failure.code}.` : "";
-    return `Google Workspace is connected through OpenWork Connect, but agent access needs attention for this workspace. Direct the user to Settings > Connect.${suffix}`;
-  }
-  return "Google Workspace is not connected on this device. Direct the user to Settings > Connect to connect their account. Do not direct them to Settings > Extensions.";
+export function googleWorkspaceCloudRequired(cloudHealth: CloudMcpHealth | null) {
+  const failure = cloudHealth?.firstFailure;
+  return {
+    ok: false,
+    error: "use_openwork_cloud",
+    message: "Local Google Workspace actions are retired. Use Google Workspace through OpenWork Cloud Connect only. Discover the capability with search_capabilities, then call execute_capability with the exact returned name. If Cloud reports a connection or authorization requirement, relay its exact next action; local credentials cannot be used.",
+    nextAction: cloudHealth?.usable
+      ? { tool: "search_capabilities", arguments: { query: "Google Workspace" } }
+      : failure
+        ? { code: failure.code, stage: failure.stage, recommendedAction: failure.recommendedAction }
+        : { recommendedAction: "Open Settings > Library > Connections to check your Cloud connections, or Settings > Debug to diagnose OpenWork Cloud agent access for this workspace." },
+  };
 }
 
 export async function readConnectState(config: ServerConfig): Promise<PersistedConnectState> {
@@ -197,7 +197,10 @@ export async function writeConnectCloudMcp(
 }
 
 function normalizeDirectory(directory: string): string {
-  return directory.trim().replace(/[\/]+$/, "");
+  const trimmed = directory.trim();
+  let end = trimmed.length;
+  while (end > 0 && trimmed[end - 1] === "/") end -= 1;
+  return end === trimmed.length ? trimmed : trimmed.slice(0, end);
 }
 
 function workspaceDirectory(workspace: WorkspaceInfo, resolveOpencodeDirectory?: (workspace: WorkspaceInfo) => string | null): string | null {
@@ -270,6 +273,7 @@ async function resolveCloudHealth(config: ServerConfig, options: ConnectSnapshot
     serverMetadata: options.serverMetadata,
     probe: false,
     createWorkspaceOpencodeClient: options.createWorkspaceOpencodeClient,
+    nativeEngineForWorkspace: options.nativeEngineForWorkspace,
     refreshRegistrationFromLiveStatus: options.refreshRegistrationFromLiveStatus,
   });
   return {
@@ -294,9 +298,6 @@ export async function getConnectSnapshot(config: ServerConfig, options: ConnectS
     cloudMcpPresent: cloudHealth?.usable === true,
     cloudHealth,
     workspace,
-    googleWorkspace: {
-      legacyConfigured: googleWorkspaceLegacyConfigured(),
-    },
   };
 }
 
@@ -330,7 +331,6 @@ export async function inspectConnectSnapshot(
         directory: null,
         reason: "Passive diagnostics inspection does not probe OpenCode health",
       },
-      googleWorkspace: { legacyConfigured: googleWorkspaceLegacyConfigured() },
     },
   };
 }
@@ -339,8 +339,16 @@ async function inspectConnectRuntime(
   config: ServerConfig,
   options?: ConnectStateInspectionOptions,
 ): Promise<{ cloudMcpPresent: boolean; complete: boolean }> {
-  const serverCloudMcp = await readConnectCloudMcp(config);
-  if (serverCloudMcp) return { cloudMcpPresent: true, complete: true };
+  const globalInspection = await inspectRuntimeOpencodeConfigState(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID, {
+    maxBytes: options?.runtimeConfigMaxBytes,
+    signal: options?.signal,
+  });
+  if (globalInspection.status === "unreadable" || globalInspection.status === "invalid-row") {
+    return { cloudMcpPresent: false, complete: false };
+  }
+  if (Object.hasOwn(runtimeMcpMap(globalInspection.config), OPENWORK_CLOUD_MCP_NAME)) {
+    return { cloudMcpPresent: true, complete: true };
+  }
 
   const configuredMaxRows = options?.maxRuntimeRows;
   const maxRuntimeRows = typeof configuredMaxRows === "number"
@@ -374,19 +382,4 @@ async function inspectConnectRuntime(
   }
 
   return { cloudMcpPresent: false, complete: true };
-}
-
-export function shouldGateLegacyGoogleWorkspace(snapshot: ConnectSnapshot): boolean {
-  return snapshot.connectCatalogEnabled && !snapshot.googleWorkspace.legacyConfigured;
-}
-
-export function googleWorkspaceStatusConnectExtra(snapshot: ConnectSnapshot): Record<string, unknown> {
-  if (!shouldGateLegacyGoogleWorkspace(snapshot)) return {};
-  return {
-    connect: {
-      enabled: true,
-      cloudMcpPresent: snapshot.cloudMcpPresent,
-      guidance: googleWorkspaceConnectGuidance(snapshot.cloudHealth),
-    },
-  };
 }

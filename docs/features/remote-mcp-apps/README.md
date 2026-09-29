@@ -10,8 +10,8 @@ This unit of value does **not** include installing a standalone App from an
 HTML URL. URL-imported MCP Apps are deferred future work with a separate
 product, security, lifecycle, and rollout contract.
 
-Programs remain executable `script` config objects. A Program's generated
-views can be MCP resources, but that does not turn Program execution into
+Workflows remain executable `workflow` config objects. A Workflow's generated
+views can be MCP resources, but that does not turn Workflow execution into
 resource loading or a standalone URL-App installation path.
 
 ## Standard MCP server path
@@ -71,19 +71,19 @@ the proxy boundary. The App-host credential authorizes only this bounded proxy
 surface; it is not a provider credential and grants no direct cross-server
 access.
 
-## Rollout isolation
+## Rollout
 
-Native MCP Apps fail closed behind two existing gates:
-
-1. the deployment gate `DEN_REMOTE_MCP_APPS_ENABLED=true`; and
-2. the organization capability **Native MCP Apps (preview)**.
-
-Both default off. No additional user-facing flag controls standalone URL Apps.
-When either native-App gate is off, ordinary connected MCP tools remain
-available through `search_capabilities` and `execute_capability`, but OpenWork
-removes MCP App classification and launch metadata, publishes no provider App
-endpoint in the member index, clears the private App-host catalog, and renders
-no App UI. Reconciliation also removes and disconnects stale
+Native MCP Apps are enabled for every deployment and organization. The former
+deployment gate (`DEN_REMOTE_MCP_APPS_ENABLED`) and the per-organization
+**Native MCP Apps (preview)** capability were removed once the feature
+stabilized; stale stored organization overrides are ignored. App launch
+metadata (`kind: mcp_app`, `mcpApp.resourceUri`, `openwork/mcpApp` meta) is an
+opaque binding published on every bounded search/execute result; clients that
+do not host Apps ignore it and keep the normal tool result. The private
+App-host index and per-connection provider proxy remain gated on the
+client-advertised App-host capability header, so older Desktop clients keep
+their bounded search/execute surface. Reconciliation also removes and
+disconnects stale
 `openwork-connect-*` OpenCode entries while preserving user-authored MCPs and
 all durable Connect records.
 

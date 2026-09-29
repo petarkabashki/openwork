@@ -4,13 +4,14 @@
 // factory (createRuntimeManager pattern); the NATIVE_MENU_* channels are
 // consumed by the preload bridge.
 import { BrowserWindow, Menu, shell } from "electron";
+import { runDetachedTask } from "./process-resilience.mjs";
 
 const NATIVE_MENU_OPEN_SETTINGS_EVENT = "openwork:native-menu:open-settings";
 const NATIVE_MENU_TOGGLE_SIDEBAR_EVENT = "openwork:native-menu:toggle-sidebar";
 const NATIVE_MENU_CHECK_UPDATES_EVENT = "openwork:native-menu:check-updates";
 const NATIVE_MENU_ZOOM_EVENT = "openwork:native-menu:zoom";
 
-export function createApplicationMenu({ appName, docsUrl, getWindow }) {
+export function createApplicationMenu({ appName, docsUrl, getWindow, closeBrowserTab }) {
   let applicationMenuVisible = process.platform === "darwin";
   let currentAppName = appName;
 
@@ -46,6 +47,14 @@ export function createApplicationMenu({ appName, docsUrl, getWindow }) {
 
   function install() {
     const isMac = process.platform === "darwin";
+    const closeItem = {
+      label: "Close",
+      accelerator: "CommandOrControl+W",
+      click: (_item, focusedWindow) => {
+        const host = focusedWindow ?? BrowserWindow.getFocusedWindow();
+        if (host && !closeBrowserTab?.(host)) host.close();
+      },
+    };
     const template = /** @type {import("electron").MenuItemConstructorOptions[]} */ ([
       ...(isMac
         ? [
@@ -56,7 +65,7 @@ export function createApplicationMenu({ appName, docsUrl, getWindow }) {
                 {
                   label: "Check for Updates...",
                   click: () => {
-                    void checkForUpdatesFromNativeMenu();
+                    runDetachedTask("check for updates from menu", checkForUpdatesFromNativeMenu);
                   },
                 },
                 { type: "separator" },
@@ -64,7 +73,7 @@ export function createApplicationMenu({ appName, docsUrl, getWindow }) {
                   label: "Settings...",
                   accelerator: "Command+,",
                   click: () => {
-                    void openSettingsFromNativeMenu();
+                    runDetachedTask("open settings from menu", openSettingsFromNativeMenu);
                   },
                 },
                 { type: "separator" },
@@ -89,12 +98,12 @@ export function createApplicationMenu({ appName, docsUrl, getWindow }) {
                   label: "Settings",
                   accelerator: "Control+,",
                   click: () => {
-                    void openSettingsFromNativeMenu();
+                    runDetachedTask("open settings from menu", openSettingsFromNativeMenu);
                   },
                 },
                 { type: "separator" },
               ]),
-          { role: "close" },
+          closeItem,
         ],
       },
       {
@@ -123,7 +132,7 @@ export function createApplicationMenu({ appName, docsUrl, getWindow }) {
                 {
                   label: "Settings...",
                   click: () => {
-                    void openSettingsFromNativeMenu();
+                    runDetachedTask("open settings from menu", openSettingsFromNativeMenu);
                   },
                 },
               ]
@@ -141,7 +150,7 @@ export function createApplicationMenu({ appName, docsUrl, getWindow }) {
             label: "Toggle Sidebar",
             accelerator: "CommandOrControl+B",
             click: () => {
-              void toggleSidebarFromNativeMenu();
+              runDetachedTask("toggle sidebar from menu", toggleSidebarFromNativeMenu);
             },
           },
           { type: "separator" },
@@ -153,21 +162,21 @@ export function createApplicationMenu({ appName, docsUrl, getWindow }) {
             label: "Actual Size",
             accelerator: "CommandOrControl+0",
             click: () => {
-              void zoomFromNativeMenu("reset");
+              runDetachedTask("reset zoom from menu", () => zoomFromNativeMenu("reset"));
             },
           },
           {
             label: "Zoom In",
             accelerator: "CommandOrControl+Plus",
             click: () => {
-              void zoomFromNativeMenu("in");
+              runDetachedTask("zoom in from menu", () => zoomFromNativeMenu("in"));
             },
           },
           {
             label: "Zoom Out",
             accelerator: "CommandOrControl+-",
             click: () => {
-              void zoomFromNativeMenu("out");
+              runDetachedTask("zoom out from menu", () => zoomFromNativeMenu("out"));
             },
           },
           { type: "separator" },
@@ -187,7 +196,7 @@ export function createApplicationMenu({ appName, docsUrl, getWindow }) {
                 { role: "window" },
               ]
             : [
-                { role: "close" },
+                closeItem,
               ]),
         ],
       },
@@ -200,15 +209,15 @@ export function createApplicationMenu({ appName, docsUrl, getWindow }) {
                 {
                   label: "Check for Updates...",
                   click: () => {
-                    void checkForUpdatesFromNativeMenu();
+                    runDetachedTask("check for updates from menu", checkForUpdatesFromNativeMenu);
                   },
                 },
                 { type: "separator" },
               ]),
           {
             label: "Docs",
-            click: async () => {
-              await shell.openExternal(docsUrl);
+            click: () => {
+              runDetachedTask("open documentation from menu", () => shell.openExternal(docsUrl));
             },
           },
         ],

@@ -41,8 +41,8 @@ import {
 } from "./external-mcp-tool-arguments.js"
 import { compareCapabilityMatches, tokenize } from "./search.js"
 import type { CapabilityMatch } from "./search.js"
+import { DEN_MCP_WRITE_SCOPE } from "./scopes.js"
 import {
-  CODEMODE_EXTERNAL_MCP_CONNECTION_LIMIT,
   codemodeScriptPath,
   resolveCodemodeConnectionNamespaceContext,
   type CodemodeConnectionNamespaceContext,
@@ -72,7 +72,7 @@ import {
  */
 
 const EXTERNAL_CAPABILITY_PREFIX = "mcp:"
-export const EXTERNAL_MCP_SEARCH_CONNECTION_LIMIT = CODEMODE_EXTERNAL_MCP_CONNECTION_LIMIT
+export const EXTERNAL_MCP_SEARCH_CONNECTION_LIMIT = 16
 export const EXTERNAL_MCP_SEARCH_CONCURRENCY = 8
 export const EXTERNAL_MCP_SEARCH_MATCH_LIMIT = 20
 const EXTERNAL_MCP_SEARCH_REQUEST_TIMEOUT_MS = 5_000
@@ -647,6 +647,8 @@ export function externalMcpSearchCoverageHint(coverage: ExternalMcpSearchCoverag
   return `External MCP search inspected ${coverage.probedConnections} of ${coverage.eligibleConnections} eligible connections. Results may be incomplete; narrow the query using a connection name and search again.`
 }
 
+const CONNECTION_CARD_HINT = "Execute this exact capability name once: it returns the live status, renders an actionable connection card for the member in compatible hosts, and includes the action to relay in text."
+
 async function probeExternalMcpConnection(input: {
   connection: ExternalMcpConnectionRow
   member: McpMemberIdentity
@@ -655,7 +657,6 @@ async function probeExternalMcpConnection(input: {
   limit: number
   deadline: ExternalMcpLifecycleDeadline
   scriptNamespace?: string
-  mcpAppsEnabled: boolean
 }): Promise<ExternalCapabilityMatch[]> {
   const matches: ExternalCapabilityMatch[] = []
   const add = (match: ExternalCapabilityMatch) => {
@@ -673,7 +674,7 @@ async function probeExternalMcpConnection(input: {
         score,
         summary: `[${connection.name}] OAuth provider settings changed and require administrator review.`,
         status: "error",
-        hint: `Ask an org admin to open OpenWork Cloud -> Connectors, review the live OAuth issuer for "${connection.name}", and reconnect if requested.`,
+        hint: `Ask an org admin to open OpenWork Cloud -> Connectors, review the live OAuth issuer for "${connection.name}", and reconnect if requested. ${CONNECTION_CARD_HINT}`,
         connectionStatus: buildExternalConnectionStatus({
           connection,
           state: "reauth_required",
@@ -704,7 +705,7 @@ async function probeExternalMcpConnection(input: {
           score,
           summary: `[${connection.name}] Available to you, but you haven't connected your ${connection.name} account yet.`,
           status: "needs_connection",
-          hint: `Ask the user to open OpenWork Cloud -> Your Connections and click Connect on "${connection.name}", then search again.`,
+          hint: `Ask the user to click Connect on the "${connection.name}" card in OpenWork desktop, then search again. In clients without inline connection controls, use OpenWork Cloud -> Your Connections. ${CONNECTION_CARD_HINT}`,
           connectionStatus: buildExternalConnectionStatus({ connection, state: "needs_connection", errorCode: "not_connected", message }),
         }))
       }
@@ -720,7 +721,7 @@ async function probeExternalMcpConnection(input: {
         score,
         summary: `[${connection.name}] Available to your organization, but an admin hasn't connected it yet.`,
         status: "needs_connection",
-        hint: `Ask an org admin to open the OpenWork Cloud dashboard -> Connections and connect "${connection.name}", then search again.`,
+        hint: `Ask an org admin to open the OpenWork Cloud dashboard -> Connections and connect "${connection.name}", then search again. ${CONNECTION_CARD_HINT}`,
         connectionStatus: buildExternalConnectionStatus({ connection, state: "needs_connection", errorCode: "not_connected", message }),
       }))
     }
@@ -776,7 +777,7 @@ async function probeExternalMcpConnection(input: {
         score,
         summary: `[${connection.name}] This connection is set up but returned an error (${message}).`,
         status: "error",
-        hint: externalConnectionErrorHint(connection.name, error, message, connection.credentialMode),
+        hint: `${externalConnectionErrorHint(connection.name, error, message, connection.credentialMode)} ${CONNECTION_CARD_HINT}`,
         connectionStatus: buildExternalConnectionStatus({
           connection,
           state,
@@ -796,7 +797,7 @@ async function probeExternalMcpConnection(input: {
     const summaryTokens = tokenize(summary)
     const score = scoreText(nameTokens, summaryTokens, input.queryTokens)
     if (score <= 0) continue
-    const resourceUri = input.mcpAppsEnabled ? externalMcpAppResourceUri(tool) : null
+    const resourceUri = externalMcpAppResourceUri(tool)
     add({
       name: buildExternalCapabilityName(connection.id, tool.name),
       method: "MCP",
@@ -828,10 +829,8 @@ export async function searchExternalCapabilities(input: {
   query: string
   redirectUriBase: string
   limit?: number
-  includeScriptPaths?: boolean
   namespaceContext?: CodemodeConnectionNamespaceContext
   reportCoverage?: (coverage: ExternalMcpSearchCoverage) => void
-  mcpAppsEnabled?: boolean
 }): Promise<ExternalCapabilityMatch[]> {
   if (!input.member) return []
   const queryTokens = tokenize(input.query)
@@ -840,18 +839,16 @@ export async function searchExternalCapabilities(input: {
   if (!Number.isFinite(requestedLimit) || requestedLimit <= 0) return []
   const limit = Math.min(Math.max(1, Math.trunc(requestedLimit)), EXTERNAL_MCP_SEARCH_MATCH_LIMIT)
   const deadline = createExternalMcpLifecycleDeadline(EXTERNAL_MCP_SEARCH_LIFECYCLE_TIMEOUT_MS)
-  const namespaceContext = input.includeScriptPaths
-    ? input.namespaceContext ?? await resolveCodemodeConnectionNamespaceContext({
-      organizationId: input.organizationId,
-      member: input.member,
-    })
-    : input.namespaceContext
+  const namespaceContext = input.namespaceContext ?? await resolveCodemodeConnectionNamespaceContext({
+    organizationId: input.organizationId,
+    member: input.member,
+  })
   const connections = namespaceContext?.externalMcpConnections ?? await listUsableExternalMcpConnections({
     organizationId: normalizeDenTypeId("organization", input.organizationId),
     orgMembershipId: input.member.orgMembershipId,
     teamIds: input.member.teamIds,
   })
-  const scriptNamespaces = input.includeScriptPaths ? namespaceContext?.namespaces.externalMcp : undefined
+  const scriptNamespaces = namespaceContext?.namespaces.externalMcp
   const selectedConnections = selectExternalMcpSearchConnections(connections, queryTokens)
   input.reportCoverage?.({
     eligibleConnections: connections.length,
@@ -870,7 +867,6 @@ export async function searchExternalCapabilities(input: {
       limit,
       deadline: sharedDeadline,
       scriptNamespace: scriptNamespaces?.get(connection.id),
-      mcpAppsEnabled: input.mcpAppsEnabled === true,
     }),
   })
 }
@@ -920,7 +916,9 @@ export type ExternalCapabilityExecuteResult =
         | "provider_error"
         | "invalid_capability_arguments"
         | "policy_blocked"
+        | "insufficient_mcp_scope"
       message: string
+      requiredScope?: "mcp:read" | "mcp:write"
       referenceId?: string
       retryable?: boolean
       providerError?: ExternalMcpProviderError
@@ -1007,6 +1005,87 @@ function advisorySchemaGuidance(
   }
 }
 
+export type ExternalConnectionProbe =
+  | { ok: true; connected: true; connection: { id: string; name: string } }
+  | { ok: true; connected: false; status: ExternalConnectionStatus }
+  | { ok: false; error: "forbidden" | "unknown_capability"; message: string }
+
+/**
+ * Probes one connection's live credential state without calling provider
+ * tools. Backs the connection_status capability execution and the app-only
+ * connection_action tool, so the same check renders the connection card and
+ * refreshes it after the member fixes the connection.
+ */
+export async function probeExternalConnectionStatus(input: {
+  organizationId: string
+  member: McpMemberIdentity | null
+  connectionId: string
+}): Promise<ExternalConnectionProbe> {
+  if (!input.member) {
+    return { ok: false, error: "forbidden", message: "No active org membership for this token." }
+  }
+  let connection: Awaited<ReturnType<typeof getExternalMcpConnection>>
+  let connectionId: DenTypeId<"externalMcpConnection">
+  try {
+    connectionId = normalizeDenTypeId("externalMcpConnection", input.connectionId)
+    connection = await getExternalMcpConnection({
+      organizationId: normalizeDenTypeId("organization", input.organizationId),
+      connectionId,
+    })
+  } catch {
+    connection = null
+    connectionId = input.connectionId as DenTypeId<"externalMcpConnection">
+  }
+  if (!connection || connection.kind !== "external_mcp") {
+    return { ok: false, error: "unknown_capability", message: `No external MCP connection "${input.connectionId}" in this organization.` }
+  }
+  const canUse = await memberCanUseExternalMcpConnection({
+    connectionId,
+    orgMembershipId: input.member.orgMembershipId,
+    teamIds: input.member.teamIds,
+  })
+  if (!canUse) {
+    return { ok: false, error: "forbidden", message: `You have not been granted access to "${connection.name}".` }
+  }
+  if (connection.oauthIssuerReviewRequiredAt) {
+    const message = `"${connection.name}" is blocked until an organization admin reviews its changed OAuth issuer.`
+    return {
+      ok: true,
+      connected: false,
+      status: buildExternalConnectionStatus({
+        connection,
+        state: "reauth_required",
+        errorCode: "unauthorized",
+        message,
+        actionOwner: "organization_admin",
+      }),
+    }
+  }
+  if (connection.credentialMode === "per_member") {
+    const account = await getConnectedAccount({
+      organizationId: connection.organizationId,
+      orgMembershipId: input.member.orgMembershipId,
+      providerId: connection.id,
+    })
+    if (!account?.accessToken) {
+      const message = `You haven't connected your ${connection.name} account yet.`
+      return {
+        ok: true,
+        connected: false,
+        status: buildExternalConnectionStatus({ connection, state: "needs_connection", errorCode: "not_connected", message }),
+      }
+    }
+  } else if (!hasSharedCredential(connection)) {
+    const message = `"${connection.name}" is not connected yet.`
+    return {
+      ok: true,
+      connected: false,
+      status: buildExternalConnectionStatus({ connection, state: "needs_connection", errorCode: "not_connected", message }),
+    }
+  }
+  return { ok: true, connected: true, connection: { id: connection.id, name: connection.name } }
+}
+
 /**
  * Executes a namespaced external capability, scoped to the calling
  * principal's org AND member: the member must hold a grant (org-wide,
@@ -1016,16 +1095,16 @@ function advisorySchemaGuidance(
 export async function executeExternalCapability(input: {
   organizationId: string
   member: McpMemberIdentity | null
+  scopes: ReadonlySet<string>
   connectionId: string
   toolName: string
   args: unknown
   schemaDigest?: string
   redirectUriBase: string
-  /** Fail closed unless the live provider catalog still marks this exact tool read-only. */
+  /** Additional provider-hint restriction; never replaces write-scope authorization. */
   requireReadOnly?: boolean
   /** Fail closed when the live input schema no longer matches schemaDigest. */
   requireSchemaMatch?: boolean
-  mcpAppsEnabled?: boolean
 }): Promise<ExternalCapabilityExecuteResult> {
   if (!input.member) {
     return { ok: false, error: "forbidden", message: "No active org membership for this token." }
@@ -1149,6 +1228,17 @@ export async function executeExternalCapability(input: {
       }
     }
 
+    // Provider-controlled hints cannot prove a tool will not mutate through its credential.
+    const requiredScope = DEN_MCP_WRITE_SCOPE
+    if (!input.scopes.has(requiredScope)) {
+      return {
+        ok: false,
+        error: "insufficient_mcp_scope",
+        requiredScope,
+        message: `${input.toolName} requires the ${requiredScope} scope.`,
+      }
+    }
+
     if (input.requireReadOnly && (tool.annotations?.readOnlyHint !== true || tool.annotations?.destructiveHint === true)) {
       return {
         ok: false,
@@ -1214,7 +1304,7 @@ export async function executeExternalCapability(input: {
 
     schemaGuidance = advisorySchemaGuidance(schemaWarnings)
     const result = await providerCall
-    const resourceUri = input.mcpAppsEnabled === true ? externalMcpAppResourceUri(tool) : null
+    const resourceUri = externalMcpAppResourceUri(tool)
     return {
       ok: true,
       result,

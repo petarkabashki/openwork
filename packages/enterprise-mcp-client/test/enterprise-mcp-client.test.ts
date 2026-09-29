@@ -17,6 +17,8 @@ import {
   type EnterpriseMcpOAuthClientRegistration,
   type EnterpriseMcpOAuthCredential,
   type EnterpriseMcpOAuthPersistence,
+  type StoredOAuthClientInformation,
+  type StoredOAuthTokens,
 } from "../src/index.js"
 import { EnterpriseMcpOAuthProvider } from "../src/oauth-provider.js"
 import { createEnterpriseMcpRequestObserver } from "../src/request-observer.js"
@@ -25,8 +27,8 @@ import {
   assertEnterpriseMcpResourceResult,
   collectEnterpriseMcpResources,
 } from "../src/resource-catalog.js"
-import type { OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js"
-import { selectClientAuthMethod, type OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js"
+import { InsufficientScopeError, selectClientAuthMethod, UnauthorizedError } from "@modelcontextprotocol/client"
+import type { OAuthDiscoveryState } from "@modelcontextprotocol/client"
 
 const rpcRequestSchema = z.object({
   id: z.union([z.string(), z.number()]).optional(),
@@ -167,6 +169,11 @@ function sendJson(response: ServerResponse, status: number, body: unknown, heade
 }
 
 async function sendMcpResponse(request: IncomingMessage, response: ServerResponse, options: { rejectToolsList?: boolean } = {}): Promise<void> {
+  if (request.method === "GET") {
+    response.writeHead(200, { "content-type": "text/event-stream" })
+    response.end()
+    return
+  }
   const parsed: unknown = JSON.parse(await requestBody(request))
   const rpc = rpcRequestSchema.parse(parsed)
   if (rpc.method === "notifications/initialized") {
@@ -206,8 +213,12 @@ async function sendMcpResponse(request: IncomingMessage, response: ServerRespons
 async function startOAuthMcpServer(options: {
   rejectAuthenticatedMcp?: boolean
   rejectAuthenticatedToolsList?: boolean
+  omitRefreshToken?: boolean
   clientMetadataSupported?: boolean
   scopeLessChallenge?: boolean
+  advertisedScopes?: string[]
+  resourceAdvertisedScopes?: string[]
+  authorizationAdvertisedScopes?: string[]
 } = {}) {
   let origin = ""
   let capturedRegistration: Record<string, unknown> | null = null
@@ -218,7 +229,7 @@ async function startOAuthMcpServer(options: {
         sendJson(response, 200, {
           resource: `${origin}/mcp`,
           authorization_servers: [origin],
-          scopes_supported: ["tools.read"],
+          scopes_supported: options.resourceAdvertisedScopes ?? options.advertisedScopes ?? ["tools.read"],
           bearer_methods_supported: ["header"],
         })
         return
@@ -233,7 +244,7 @@ async function startOAuthMcpServer(options: {
           grant_types_supported: ["authorization_code", "refresh_token"],
           token_endpoint_auth_methods_supported: ["none"],
           code_challenge_methods_supported: ["S256"],
-          scopes_supported: ["tools.read"],
+          scopes_supported: options.authorizationAdvertisedScopes ?? options.advertisedScopes ?? ["tools.read"],
           ...(options.clientMetadataSupported ? { client_id_metadata_document_supported: true } : {}),
         })
         return
@@ -265,7 +276,7 @@ async function startOAuthMcpServer(options: {
         }
         sendJson(response, 200, {
           access_token: "enterprise-access-token",
-          refresh_token: "enterprise-refresh-token",
+          ...(options.omitRefreshToken ? {} : { refresh_token: "enterprise-refresh-token" }),
           token_type: "Bearer",
           expires_in: 3600,
           scope: "tools.read",
@@ -290,8 +301,8 @@ async function startOAuthMcpServer(options: {
         return
       }
       sendJson(response, 404, { error: "not_found" })
-    } catch (error) {
-      sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+    } catch {
+      sendJson(response, 500, { error: "oauth_test_server_error" })
     }
   })
 
@@ -387,8 +398,8 @@ async function startProgressMcpServer(options: {
         clearInterval(progressTimer)
         clearTimeout(resultTimer)
       })
-    } catch (error) {
-      sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+    } catch {
+      sendJson(response, 500, { error: "progress_test_server_error" })
     }
   })
 
@@ -552,7 +563,7 @@ describe("enterprise MCP client", () => {
         assert.ok(error instanceof EnterpriseMcpClientError)
         assert.equal(error.code, "MCP_CONNECTION_HANDSHAKE_FAILED")
         assert.equal(error.operationPhase, "connection-handshake")
-        assert.equal(error.requestPhase, "mcp-initialize")
+        assert.equal(error.requestPhase, "mcp-discovery")
         assert.match(error.message, /MCP connection handshake/)
         return true
       },
@@ -586,12 +597,12 @@ describe("enterprise MCP client", () => {
   })
 
   it("honors an injected lifecycle longer than the per-request timeout while progress streams", async () => {
-    const server = await startProgressMcpServer({ resultDelayMs: 70, progressIntervalMs: 10 })
+    const server = await startProgressMcpServer({ resultDelayMs: 500, progressIntervalMs: 40 })
     try {
       const client = createEnterpriseMcpClient({
         fetch,
-        operationTimeoutMs: 25,
-        lifecycle: { expiresAt: Date.now() + 120, signal: new AbortController().signal },
+        operationTimeoutMs: 150,
+        lifecycle: { expiresAt: Date.now() + 1_200, signal: new AbortController().signal },
       })
       const result = await client.callTool({
         connection: {
@@ -611,12 +622,12 @@ describe("enterprise MCP client", () => {
   })
 
   it("still stops a progressing provider at the injected absolute lifecycle", async () => {
-    const server = await startProgressMcpServer({ resultDelayMs: 160, progressIntervalMs: 10 })
+    const server = await startProgressMcpServer({ resultDelayMs: 1_500, progressIntervalMs: 40 })
     try {
       const client = createEnterpriseMcpClient({
         fetch,
-        operationTimeoutMs: 25,
-        lifecycle: { expiresAt: Date.now() + 80, signal: new AbortController().signal },
+        operationTimeoutMs: 150,
+        lifecycle: { expiresAt: Date.now() + 700, signal: new AbortController().signal },
       })
       const startedAt = Date.now()
       await assert.rejects(
@@ -634,8 +645,8 @@ describe("enterprise MCP client", () => {
           && error.operationPhase === "tool-execution",
       )
       const elapsedMs = Date.now() - startedAt
-      assert.ok(elapsedMs >= 60, `expected lifecycle timeout to outlast per-request timeout, got ${elapsedMs}ms`)
-      assert.ok(elapsedMs < 500, `expected lifecycle timeout before the provider result, got ${elapsedMs}ms`)
+      assert.ok(elapsedMs >= 500, `expected lifecycle timeout to outlast per-request timeout, got ${elapsedMs}ms`)
+      assert.ok(elapsedMs < 2_000, `expected lifecycle timeout before the provider result, got ${elapsedMs}ms`)
     } finally {
       await server.close()
     }
@@ -770,7 +781,7 @@ class MemoryOAuthPersistence implements EnterpriseMcpOAuthPersistence {
     load: async () => this.registration,
     save: async (input: {
       context: { commitExpiresAt: number; signal: AbortSignal }
-      clientInformation: OAuthClientInformationMixed
+      clientInformation: StoredOAuthClientInformation
       expiresAt?: number
       source: "client-metadata" | "dynamic"
     }) => {
@@ -829,7 +840,7 @@ class MemoryOAuthPersistence implements EnterpriseMcpOAuthPersistence {
     load: async () => this.credential,
     save: async (input: {
       context: { commitExpiresAt: number; signal: AbortSignal }
-      tokens: OAuthTokens
+      tokens: StoredOAuthTokens
       expiresAt?: number
       source: "authorization-code" | "refresh"
       authorization?: EnterpriseMcpOAuthAuthorizationHandle
@@ -866,7 +877,7 @@ class MemoryOAuthPersistence implements EnterpriseMcpOAuthPersistence {
     },
   }
 
-  seedRegistration(clientInformation: OAuthClientInformationMixed, expiresAt?: number): void {
+  seedRegistration(clientInformation: StoredOAuthClientInformation, expiresAt?: number): void {
     this.registration = {
       clientInformation,
       revision: this.nextRevision(),
@@ -875,8 +886,30 @@ class MemoryOAuthPersistence implements EnterpriseMcpOAuthPersistence {
     }
   }
 
-  seedCredential(tokens: OAuthTokens, expiresAt?: number): void {
+  seedCredential(tokens: StoredOAuthTokens, expiresAt?: number): void {
     this.credential = { tokens, expiresAt, revision: this.nextRevision() }
+  }
+}
+
+function oauthMetadataFetch(issuer: string): EnterpriseMcpFetch {
+  const canonical = new URL(issuer)
+  return async (url) => {
+    const target = new URL(url)
+    if (
+      target.origin === canonical.origin
+      && (
+        target.pathname.startsWith("/.well-known/oauth-authorization-server")
+        || target.pathname.startsWith("/.well-known/openid-configuration")
+      )
+    ) {
+      return Response.json({
+        issuer,
+        authorization_endpoint: `${canonical.origin}/authorize`,
+        token_endpoint: `${canonical.origin}/token`,
+        response_types_supported: ["code"],
+      })
+    }
+    return new Response(null, { status: 404 })
   }
 }
 
@@ -899,6 +932,7 @@ function oauthProvider(input: {
     lifecycle: { expiresAt: now() + 30_000, signal: controller.signal },
     authorizationTransactionTtlMs: input.authorizationTransactionTtlMs ?? 600_000,
     expirationSkewMs: input.expirationSkewMs ?? 0,
+    fetch: async () => new Response(null, { status: 404 }),
   })
 }
 
@@ -1072,15 +1106,15 @@ describe("enterprise MCP OAuth persistence contract", () => {
       && error.code === "MCP_OAUTH_ISSUER_MISMATCH")
   })
 
-  it("binds a resource-scoped discovery alias to its canonical callback issuer", async () => {
+  it("replaces resource-alias endpoints with strictly discovered canonical metadata", async () => {
     const alias = "https://api.salesforce.example:443/platform/mcp/v1/platform/sobject-all"
     const canonicalIssuer = "https://login.salesforce.example"
     const discoveryState: OAuthDiscoveryState = {
       authorizationServerUrl: alias,
       authorizationServerMetadata: {
         issuer: canonicalIssuer,
-        authorization_endpoint: `${canonicalIssuer}/services/oauth2/authorize`,
-        token_endpoint: `${canonicalIssuer}/services/oauth2/token`,
+        authorization_endpoint: "https://attacker.example.test/authorize",
+        token_endpoint: "https://attacker.example.test/token",
         response_types_supported: ["code"],
       },
       resourceMetadata: {
@@ -1099,6 +1133,7 @@ describe("enterprise MCP OAuth persistence contract", () => {
       lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
       authorizationTransactionTtlMs: 600_000,
       expirationSkewMs: 0,
+      fetch: oauthMetadataFetch(canonicalIssuer),
       oauthConfiguration: {
         applicationType: "web",
         authorizationServerIssuer: canonicalIssuer,
@@ -1106,6 +1141,28 @@ describe("enterprise MCP OAuth persistence contract", () => {
     })
 
     await assert.doesNotReject(provider.saveDiscoveryState(discoveryState))
+    assert.equal(persistence.discoveryState?.authorizationServerUrl, canonicalIssuer)
+    assert.equal(persistence.discoveryState?.authorizationServerMetadata?.authorization_endpoint, `${canonicalIssuer}/authorize`)
+    assert.equal(persistence.discoveryState?.authorizationServerMetadata?.token_endpoint, `${canonicalIssuer}/token`)
+    const reloadedProvider = new EnterpriseMcpOAuthProvider({
+      redirectUri: "https://den.example.test/v1/mcp-connections/oauth/callback",
+      connectionId: "connection-1",
+      persistence,
+      flow: { kind: "runtime" },
+      clientName: "OpenWork",
+      clock: { now: () => Date.now() },
+      lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
+      authorizationTransactionTtlMs: 600_000,
+      expirationSkewMs: 0,
+      fetch: async () => {
+        throw new Error("verified cached metadata must not be rediscovered")
+      },
+      oauthConfiguration: {
+        applicationType: "web",
+        authorizationServerIssuer: canonicalIssuer,
+      },
+    })
+    assert.equal((await reloadedProvider.discoveryState())?.authorizationServerUrl, canonicalIssuer)
     assert.doesNotThrow(() => validateMcpAuthorizationResponseIssuer({
       expectedIssuer: canonicalIssuer,
       discoveryState,
@@ -1139,6 +1196,7 @@ describe("enterprise MCP OAuth persistence contract", () => {
       lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
       authorizationTransactionTtlMs: 600_000,
       expirationSkewMs: 0,
+      fetch: oauthMetadataFetch(canonicalIssuer),
       oauthConfiguration: {
         applicationType: "web",
         authorizationServerIssuer: canonicalIssuer,
@@ -1185,6 +1243,7 @@ describe("enterprise MCP OAuth persistence contract", () => {
       lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
       authorizationTransactionTtlMs: 600_000,
       expirationSkewMs: 0,
+      fetch: oauthMetadataFetch(canonicalIssuer),
       oauthConfiguration: {
         applicationType: "web",
         authorizationServerIssuer: canonicalIssuer,
@@ -1218,6 +1277,7 @@ describe("enterprise MCP OAuth persistence contract", () => {
       lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
       authorizationTransactionTtlMs: 600_000,
       expirationSkewMs: 0,
+      fetch: oauthMetadataFetch(canonicalIssuer),
       oauthConfiguration: {
         applicationType: "web",
         authorizationServerIssuer: canonicalIssuer,
@@ -1280,6 +1340,7 @@ describe("enterprise MCP OAuth persistence contract", () => {
       lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
       authorizationTransactionTtlMs: 600_000,
       expirationSkewMs: 0,
+      fetch: async () => new Response(null, { status: 404 }),
       oauthConfiguration: {
         applicationType: "web",
         clientMetadataUrl: "https://den.example.test/oauth/client-metadata.json",
@@ -1306,6 +1367,7 @@ describe("enterprise MCP OAuth persistence contract", () => {
       lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
       authorizationTransactionTtlMs: 600_000,
       expirationSkewMs: 0,
+      fetch: oauthMetadataFetch("https://identity.example.test/tenant-a"),
       oauthConfiguration: {
         applicationType: "web",
         authorizationServerIssuer: "https://identity.example.test/tenant-a",
@@ -1330,6 +1392,52 @@ describe("enterprise MCP OAuth persistence contract", () => {
         && error.code === "MCP_OAUTH_ISSUER_MISMATCH",
     )
     assert.equal(persistence.discoveryState, undefined)
+  })
+
+  it("preserves a cached issuer mismatch through the modern discovery probe", async () => {
+    const selectedIssuer = "https://mcp.example.test"
+    const canonicalIssuer = "https://identity.example.test"
+    const persistence = new MemoryOAuthPersistence()
+    persistence.discoveryState = {
+      authorizationServerUrl: canonicalIssuer,
+      authorizationServerMetadata: {
+        issuer: canonicalIssuer,
+        authorization_endpoint: `${canonicalIssuer}/authorize`,
+        token_endpoint: `${canonicalIssuer}/token`,
+        response_types_supported: ["code"],
+      },
+      resourceMetadata: {
+        resource: selectedIssuer,
+        authorization_servers: [selectedIssuer],
+      },
+    }
+    const client = createEnterpriseMcpClient({
+      fetch: async () => new Response(null, {
+        status: 401,
+        headers: {
+          "www-authenticate": `Bearer resource_metadata="${selectedIssuer}/.well-known/oauth-protected-resource"`,
+        },
+      }),
+    })
+
+    await assert.rejects(client.connect({
+      connection: {
+        id: "issuer-mismatch-probe",
+        serverUrl: selectedIssuer,
+        authorization: {
+          type: "oauth",
+          persistence,
+          configuration: {
+            applicationType: "web",
+            authorizationServerIssuer: selectedIssuer,
+          },
+        },
+      },
+      redirectUri: "https://den.example.test/v1/mcp-connections/oauth/callback",
+      authorizationId: "signed-state",
+    }), (error: unknown) => error instanceof EnterpriseMcpClientError
+      && error.cause instanceof EnterpriseMcpOAuthContractError
+      && error.cause.code === "MCP_OAUTH_ISSUER_MISMATCH")
   })
 
   it("returns a typed configuration requirement when neither CIMD nor DCR is advertised", async () => {
@@ -1369,6 +1477,7 @@ describe("enterprise MCP OAuth persistence contract", () => {
       lifecycle: { expiresAt: Date.now() + 30_000, signal: controller.signal },
       authorizationTransactionTtlMs: 600_000,
       expirationSkewMs: 0,
+      fetch: async () => new Response(null, { status: 404 }),
     })
 
     assert.equal(provider.state(), "signed-state")
@@ -1410,7 +1519,9 @@ describe("enterprise MCP OAuth persistence contract", () => {
         code: "approved-code",
         authorizationId: "signed-den-state",
       })
+      assert.equal(persistence.registration?.clientInformation.issuer, server.origin)
       assert.equal(persistence.credential?.tokens.access_token, "enterprise-access-token")
+      assert.equal(persistence.credential?.tokens.issuer, server.origin)
       assert.equal(persistence.authorizationRecords.size, 0)
       assert.deepEqual(await client.connect({
         connection,
@@ -1432,6 +1543,117 @@ describe("enterprise MCP OAuth persistence contract", () => {
     } finally {
       await server.close()
     }
+  })
+
+  it("rejects stored OAuth clients and tokens stamped for another issuer", async () => {
+    const selectedIssuer = "https://identity.example.test"
+    const persistence = new MemoryOAuthPersistence()
+    persistence.seedRegistration({
+      client_id: "wrong-issuer-client",
+      issuer: "https://attacker.example.test",
+    })
+    persistence.seedCredential({
+      access_token: "wrong-issuer-token",
+      token_type: "Bearer",
+      issuer: "https://attacker.example.test",
+    })
+    const provider = new EnterpriseMcpOAuthProvider({
+      redirectUri: "https://den.example.test/v1/mcp-connections/oauth/callback",
+      connectionId: "connection-1",
+      persistence,
+      flow: { kind: "runtime" },
+      clientName: "OpenWork",
+      clock: { now: () => Date.now() },
+      lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
+      authorizationTransactionTtlMs: 600_000,
+      expirationSkewMs: 0,
+      fetch: oauthMetadataFetch(selectedIssuer),
+      oauthConfiguration: {
+        applicationType: "web",
+        authorizationServerIssuer: selectedIssuer,
+      },
+    })
+
+    await assert.rejects(provider.clientInformation({ issuer: selectedIssuer }), (error: unknown) => (
+      error instanceof EnterpriseMcpOAuthContractError
+      && error.code === "MCP_OAUTH_ISSUER_MISMATCH"
+    ))
+    await assert.rejects(provider.tokens({ issuer: selectedIssuer }), (error: unknown) => (
+      error instanceof EnterpriseMcpOAuthContractError
+      && error.code === "MCP_OAUTH_ISSUER_MISMATCH"
+    ))
+  })
+
+  it("accepts stored credentials whose issuer is the root trailing-slash alias of the selected issuer", async () => {
+    const selectedIssuer = "https://identity.example.test/"
+    const canonicalIssuer = "https://identity.example.test"
+    const persistence = new MemoryOAuthPersistence()
+    persistence.seedRegistration({
+      client_id: "canonical-issuer-client",
+      issuer: canonicalIssuer,
+    })
+    persistence.seedCredential({
+      access_token: "canonical-issuer-token",
+      token_type: "Bearer",
+      issuer: canonicalIssuer,
+    })
+    const provider = new EnterpriseMcpOAuthProvider({
+      redirectUri: "https://den.example.test/v1/mcp-connections/oauth/callback",
+      connectionId: "connection-1",
+      persistence,
+      flow: { kind: "runtime" },
+      clientName: "OpenWork",
+      clock: { now: () => Date.now() },
+      lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
+      authorizationTransactionTtlMs: 600_000,
+      expirationSkewMs: 0,
+      fetch: oauthMetadataFetch(canonicalIssuer),
+      oauthConfiguration: {
+        applicationType: "web",
+        authorizationServerIssuer: selectedIssuer,
+      },
+    })
+
+    assert.equal((await provider.clientInformation({ issuer: canonicalIssuer }))?.client_id, "canonical-issuer-client")
+    assert.equal((await provider.tokens({ issuer: canonicalIssuer }))?.access_token, "canonical-issuer-token")
+  })
+
+  it("keeps persisted discovery state when canonical metadata is temporarily unavailable", async () => {
+    const selectedIssuer = "https://identity.example.test"
+    const persistence = new MemoryOAuthPersistence()
+    const state: OAuthDiscoveryState = {
+      authorizationServerUrl: selectedIssuer,
+      authorizationServerMetadata: {
+        issuer: selectedIssuer,
+        authorization_endpoint: `${selectedIssuer}/authorize`,
+        token_endpoint: `${selectedIssuer}/token`,
+        response_types_supported: ["code"],
+      },
+    }
+    persistence.discoveryState = state
+    const provider = new EnterpriseMcpOAuthProvider({
+      redirectUri: "https://den.example.test/v1/mcp-connections/oauth/callback",
+      connectionId: "connection-1",
+      persistence,
+      flow: { kind: "runtime" },
+      clientName: "OpenWork",
+      clock: { now: () => Date.now() },
+      lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
+      authorizationTransactionTtlMs: 600_000,
+      expirationSkewMs: 0,
+      fetch: async () => {
+        throw new TypeError("fetch failed")
+      },
+      oauthConfiguration: {
+        applicationType: "web",
+        authorizationServerIssuer: selectedIssuer,
+      },
+    })
+
+    await assert.rejects(provider.saveDiscoveryState(state), (error: unknown) => (
+      error instanceof TypeError && error.message === "fetch failed"
+    ))
+    assert.deepEqual(persistence.discoveryState, state)
   })
 
   it("falls back to advertised scopes when the challenge and requested scopes are empty", async () => {
@@ -1457,6 +1679,98 @@ describe("enterprise MCP OAuth persistence contract", () => {
       if (started.status !== "needs_auth") throw new Error("Expected OAuth authorization to be required.")
       assert.equal(new URL(started.authorizeUrl).searchParams.get("scope"), "tools.read")
       assert.equal(server.registration()?.scope, "tools.read")
+    } finally {
+      await server.close()
+    }
+  })
+
+  it("prefers protected-resource scopes over unrelated authorization-server scopes", async () => {
+    const server = await startOAuthMcpServer({
+      scopeLessChallenge: true,
+      resourceAdvertisedScopes: ["tools.read"],
+      authorizationAdvertisedScopes: ["openid", "profile"],
+    })
+    try {
+      const client = createEnterpriseMcpClient({ fetch })
+      const connection: EnterpriseMcpConnection = {
+        id: "oauth-resource-scope-fallback",
+        serverUrl: `${server.origin}/mcp`,
+        authorization: {
+          type: "oauth",
+          persistence: new MemoryOAuthPersistence(),
+          configuration: { applicationType: "web", requestedScopes: [] },
+        },
+      }
+      const started = await client.connect({
+        connection,
+        redirectUri: "https://den.example.test/v1/mcp-connections/oauth/callback",
+        authorizationId: "signed-resource-scope-state",
+      })
+      assert.equal(started.status, "needs_auth")
+      if (started.status !== "needs_auth") throw new Error("Expected OAuth authorization to be required.")
+      assert.equal(new URL(started.authorizeUrl).searchParams.get("scope"), "tools.read")
+      assert.equal(server.registration()?.scope, "tools.read")
+    } finally {
+      await server.close()
+    }
+  })
+
+  it("keeps an administrator's selected scopes narrower than a scope-less provider advertisement", async () => {
+    const server = await startOAuthMcpServer({
+      scopeLessChallenge: true,
+      resourceAdvertisedScopes: ["tools.read", "tools.write"],
+      authorizationAdvertisedScopes: ["openid", "profile"],
+    })
+    try {
+      const client = createEnterpriseMcpClient({ fetch })
+      const connection: EnterpriseMcpConnection = {
+        id: "oauth-selected-scope",
+        serverUrl: `${server.origin}/mcp`,
+        authorization: {
+          type: "oauth",
+          persistence: new MemoryOAuthPersistence(),
+          configuration: { applicationType: "web", requestedScopes: ["tools.read"] },
+        },
+      }
+      const started = await client.connect({
+        connection,
+        redirectUri: "https://den.example.test/v1/mcp-connections/oauth/callback",
+        authorizationId: "signed-selected-scope-state",
+      })
+      assert.equal(started.status, "needs_auth")
+      if (started.status !== "needs_auth") throw new Error("Expected OAuth authorization to be required.")
+      assert.equal(new URL(started.authorizeUrl).searchParams.get("scope"), "tools.read")
+      assert.equal(server.registration()?.scope, "tools.read")
+    } finally {
+      await server.close()
+    }
+  })
+
+  it("rejects selected scopes that neither the resource nor authorization server advertises", async () => {
+    const server = await startOAuthMcpServer({
+      scopeLessChallenge: true,
+      resourceAdvertisedScopes: ["tools.read"],
+      authorizationAdvertisedScopes: ["openid", "profile"],
+    })
+    try {
+      const client = createEnterpriseMcpClient({ fetch })
+      const connection: EnterpriseMcpConnection = {
+        id: "oauth-unsupported-selected-scope",
+        serverUrl: `${server.origin}/mcp`,
+        authorization: {
+          type: "oauth",
+          persistence: new MemoryOAuthPersistence(),
+          configuration: { applicationType: "web", requestedScopes: ["admin.write"] },
+        },
+      }
+      await assert.rejects(client.connect({
+        connection,
+        redirectUri: "https://den.example.test/v1/mcp-connections/oauth/callback",
+        authorizationId: "signed-unsupported-scope-state",
+      }), (error: unknown) => error instanceof EnterpriseMcpClientError
+        && error.cause instanceof Error
+        && error.cause.message.includes("selected OAuth scope is not advertised"))
+      assert.equal(server.registration(), null)
     } finally {
       await server.close()
     }
@@ -1812,12 +2126,62 @@ describe("enterprise MCP OAuth persistence contract", () => {
     assert.equal(persistence.invalidationCount, 1)
   })
 
+  for (const preload of [true, false]) {
+    it(`preserves omitted refresh scope without expanding grants (preloaded: ${preload})`, async () => {
+      const persistence = new MemoryOAuthPersistence()
+      const scope = Array.from({ length: 128 }, (_, index) => `https://scope.example.test/resource/${index}/Read`).join(" ")
+      persistence.seedCredential({ access_token: "old-access", refresh_token: "old-refresh", token_type: "Bearer", scope })
+      const provider = oauthProvider({ persistence, flow: { kind: "runtime" } })
+      if (preload) await provider.tokens()
+      await provider.saveTokens({ access_token: "new-access", token_type: "Bearer" })
+      assert.equal((await provider.tokens())?.scope, scope)
+      assert.equal(persistence.credential?.tokens.refresh_token, "old-refresh")
+
+      await provider.saveTokens({ access_token: "narrow-access", token_type: "Bearer", scope: "Records.Read" })
+      assert.equal((await provider.tokens())?.scope, "Records.Read")
+      await provider.saveTokens({ access_token: "empty-access", token_type: "Bearer", scope: "" })
+      assert.equal((await provider.tokens())?.scope, "")
+      await provider.saveTokens({ access_token: "empty-refreshed", token_type: "Bearer" })
+      assert.equal((await provider.tokens())?.scope, "")
+    })
+  }
+
+  it("does not turn requested scopes or a previous grant into a new authorization's granted scope", async () => {
+    const persistence = new MemoryOAuthPersistence()
+    persistence.seedCredential({ access_token: "previous-access", token_type: "Bearer", scope: "previous.write" })
+    const started = oauthProvider({ persistence, flow: { kind: "connect", authorizationId: "scope-state" } })
+    await started.saveCodeVerifier("s".repeat(43))
+    const provider = new EnterpriseMcpOAuthProvider({
+      redirectUri: "https://den.example.test/callback",
+      connectionId: "connection-1",
+      persistence,
+      flow: { kind: "callback", authorizationId: "scope-state" },
+      clientName: "OpenWork",
+      clock: { now: Date.now },
+      lifecycle: { expiresAt: Date.now() + 30_000, signal: new AbortController().signal },
+      authorizationTransactionTtlMs: 600_000,
+      expirationSkewMs: 0,
+      fetch: async () => { throw new Error("No network expected") },
+      oauthConfiguration: { applicationType: "web", requestedScopes: ["requested.read", "requested.write"] },
+    })
+    await provider.codeVerifier()
+    await provider.saveTokens({ access_token: "new-access", token_type: "Bearer" })
+    assert.equal((await provider.tokens())?.scope, undefined)
+    await provider.commitPendingAuthorizationCodeCredential()
+    assert.equal((await provider.tokens())?.scope, undefined)
+    const runtime = oauthProvider({ persistence, flow: { kind: "runtime" } })
+    await runtime.saveTokens({ access_token: "refreshed-access", token_type: "Bearer" })
+    assert.equal((await runtime.tokens())?.scope, undefined)
+    assert.equal(provider.clientMetadata.scope, "requested.read requested.write")
+  })
+
   it("rejects a stale concurrent refresh response instead of overwriting newer credentials", async () => {
     const persistence = new MemoryOAuthPersistence()
     persistence.seedCredential({
       access_token: "original-access-token",
       refresh_token: "original-refresh-token",
       token_type: "Bearer",
+      scope: "records.read records.write",
     }, Date.now() + 60_000)
     const first = oauthProvider({ persistence, flow: { kind: "runtime" } })
     const second = oauthProvider({ persistence, flow: { kind: "runtime" } })
@@ -1828,6 +2192,7 @@ describe("enterprise MCP OAuth persistence contract", () => {
       access_token: "first-refreshed-access-token",
       refresh_token: "first-rotated-refresh-token",
       token_type: "Bearer",
+      scope: "records.read",
     })
     await assert.rejects(second.saveTokens({
       access_token: "stale-refreshed-access-token",
@@ -1837,7 +2202,107 @@ describe("enterprise MCP OAuth persistence contract", () => {
       && error.code === "MCP_OAUTH_CREDENTIAL_CHANGED")
     assert.equal(persistence.credential?.tokens.access_token, "first-refreshed-access-token")
     assert.equal(persistence.credential?.tokens.refresh_token, "first-rotated-refresh-token")
+    assert.equal(persistence.credential?.tokens.scope, "records.read")
   })
+
+  for (const method of ["server/discover", "tools/list"]) {
+    for (const status of [401, 403]) {
+      it(`preserves a ${status} ${method} rejection after exchange without restarting OAuth`, async (t) => {
+        const server = await startOAuthMcpServer({ omitRefreshToken: status === 401 })
+        try {
+          const persistence = new MemoryOAuthPersistence()
+          const saveCredential = t.mock.method(persistence.credentials, "save")
+          const state = t.mock.method(EnterpriseMcpOAuthProvider.prototype, "state")
+          const saveCodeVerifier = t.mock.method(EnterpriseMcpOAuthProvider.prototype, "saveCodeVerifier")
+          const redirect = t.mock.method(EnterpriseMcpOAuthProvider.prototype, "redirectToAuthorization")
+          const events: EnterpriseMcpDiagnosticEvent[] = []
+          let rejectedRequests = 0
+          const client = createEnterpriseMcpClient({
+            operationTimeoutMs: 5_000,
+            diagnosticSink: (event) => events.push(event),
+            fetch: async (url, init) => {
+              if (new URL(url).pathname === "/mcp"
+                && new Headers(init?.headers).get("authorization") === "Bearer enterprise-access-token"
+                && requestText(init?.body)) {
+                const request = rpcRequestSchema.parse(JSON.parse(requestText(init?.body)))
+                if (request.method === method) {
+                  rejectedRequests += 1
+                  return Response.json({ error: status === 401 ? "invalid_token" : "insufficient_scope" }, {
+                    status,
+                    headers: {
+                      "www-authenticate": status === 401
+                        ? `Bearer resource_metadata="${server.origin}/.well-known/oauth-protected-resource/mcp"`
+                        : 'Bearer error="insufficient_scope", scope="tools.read tools.write"',
+                    },
+                  })
+                }
+              }
+              return fetch(url, init)
+            },
+          })
+          const connection: EnterpriseMcpConnection = {
+            id: "oauth-candidate-rejection",
+            serverUrl: `${server.origin}/mcp`,
+            authorization: { type: "oauth", persistence },
+          }
+          const redirectUri = "https://den.example.test/oauth-candidate-rejection"
+          const authorizationId = "signed-candidate-state"
+          const started = await client.connect({ connection, redirectUri, authorizationId })
+          assert.equal(started.status, "needs_auth")
+          if (started.status !== "needs_auth") throw new Error("Expected OAuth authorization to be required.")
+          assert.equal(new URL(started.authorizeUrl).searchParams.get("state"), authorizationId)
+          const transaction = persistence.authorizationRecords.get(authorizationId)
+          assert.ok(transaction)
+          const registration = persistence.registration
+          const requestPhase = method === "server/discover" ? "mcp-discovery" : "mcp-tool-discovery"
+
+          await assert.rejects(client.completeAuthorization({
+            connection,
+            redirectUri,
+            code: "approved-code",
+            authorizationId,
+          }), (error: unknown) => {
+            assert.ok(error instanceof EnterpriseMcpClientError)
+            assert.equal(error.code, "MCP_AUTHORIZATION_CALLBACK_FAILED")
+            assert.equal(error.operationPhase, "authorization-callback")
+            assert.ok(!(error.cause instanceof EnterpriseMcpOAuthContractError))
+            if (status === 401) {
+              assert.ok(error.cause instanceof UnauthorizedError)
+            } else {
+              assert.ok(error.cause instanceof InsufficientScopeError)
+              assert.equal(error.cause.requiredScope, "tools.read tools.write")
+            }
+            assert.equal(error.requestPhase, requestPhase)
+            return true
+          })
+
+          assert.equal(rejectedRequests, 1)
+          assert.equal(state.mock.callCount(), 1)
+          assert.equal(saveCodeVerifier.mock.callCount(), 1)
+          assert.equal(redirect.mock.callCount(), 1)
+          assert.equal(saveCredential.mock.callCount(), 0)
+          assert.equal(persistence.invalidationCount, 1)
+          assert.equal(persistence.credential, undefined)
+          assert.equal(persistence.registration, registration)
+          assert.equal(persistence.authorizationRecords.get(authorizationId), transaction)
+          const callbackRequests = events.filter((event) => event.kind === "request"
+            && event.operationPhase === "authorization-callback")
+          assert.deepEqual(callbackRequests.filter((event) => event.kind === "request"
+            && event.outcome === "started" && event.requestPhase?.startsWith("oauth-"))
+            .map((event) => event.requestPhase), ["oauth-token-exchange"])
+          assert.ok(callbackRequests.some((event) => event.kind === "request"
+            && event.requestPhase === "oauth-token-exchange" && event.outcome === "succeeded"))
+          assert.ok(callbackRequests.some((event) => event.kind === "request"
+            && event.requestPhase === requestPhase && event.outcome === "failed" && event.httpStatus === status))
+          assert.ok(events.some((event) => event.kind === "operation"
+            && event.operationPhase === "authorization-callback" && event.outcome === "failed"
+            && event.requestPhase === requestPhase))
+        } finally {
+          await server.close()
+        }
+      })
+    }
+  }
 
   it("invalidates exchanged tokens when callback validation cannot initialize MCP", async () => {
     const server = await startOAuthMcpServer({ rejectAuthenticatedMcp: true })

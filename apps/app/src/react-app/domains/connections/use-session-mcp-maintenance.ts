@@ -1,12 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   mintCloudControlMcpToken,
   readDenSettings,
+  DenApiError,
   type DenMcpToken,
   type DenSettings,
 } from "../../../app/lib/den";
 import { recordInspectorEvent } from "../../../app/lib/app-inspector";
+import { denSettingsChangedEvent } from "../../../app/lib/den-session-events";
+import type { DenAuthStatus } from "../cloud/den-auth-provider";
 import {
   OpenworkServerError,
   type OpenworkCloudMcpFailure,
@@ -26,11 +29,14 @@ import {
   runOpenworkCloudMcpReconciler,
   type CloudMcpClient,
 } from "./cloud-mcp-reconciler";
+import { CLOUD_INVENTORY_CHANGED_EVENT } from "./cloud-inventory-cache";
 
 export const SESSION_MCP_MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
 export const SESSION_MCP_MAINTENANCE_TIMEOUT_MS = 2 * 60 * 1000;
 export const CLOUD_MCP_REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000;
-export const CLOUD_MCP_MAINTENANCE_RETRY_DELAYS_MS = [1_000, 3_000];
+// Keep the quick warmup retries, then cover a short startup outage without
+// waiting for navigation or the ordinary five-minute maintenance interval.
+export const CLOUD_MCP_MAINTENANCE_RETRY_DELAYS_MS = [1_000, 3_000, 10_000, 30_000, 60_000];
 
 type CloudMcpMaintenanceClient = CloudMcpClient & Pick<OpenworkServerClient, "listMcp">;
 
@@ -102,6 +108,37 @@ function failedCloudMcpBackgroundSync(input: {
   };
 }
 
+function cloudMcpMaintenanceFailure(error: unknown): CloudMcpBackgroundSyncResult {
+  return failedCloudMcpBackgroundSync({
+    health: null,
+    issue: error instanceof OpenworkServerError || error instanceof DenApiError
+      ? genericCloudMcpMaintenanceIssue({
+          code: error.code,
+          message: error.message,
+          // policy_unavailable is verification failure, not a policy denial.
+          retryable: error.code === "policy_unavailable" || error.status === 408
+            || error.status === 429 || error.status >= 500,
+        })
+      : undefined,
+  });
+}
+
+export function waitForCloudMcpRetry(delayMs: number, signal?: AbortSignal, onlineTarget?: EventTarget): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      onlineTarget?.removeEventListener("online", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, delayMs);
+    // Wake on cancellation; the retry loop checks the signal before attempting.
+    signal?.addEventListener("abort", finish, { once: true });
+    onlineTarget?.addEventListener("online", finish, { once: true });
+  });
+}
+
 export function getSessionMcpMaintenanceTargetKey(input: {
   client: Pick<OpenworkServerClient, "baseUrl">;
   cloudSignedIn: boolean;
@@ -131,12 +168,15 @@ function maintenanceErrorDetail(error: unknown): string {
 
 export async function runSessionMcpMaintenanceTask(input: {
   targetKey: string;
-  task: () => Promise<void>;
+  task: (signal: AbortSignal) => Promise<void>;
+  signal?: AbortSignal;
   timeoutMs?: number;
 }): Promise<boolean> {
   if (maintenanceInFlight.has(input.targetKey)) return false;
   const runToken = Symbol("session-mcp-maintenance-run");
   maintenanceInFlight.set(input.targetKey, runToken);
+  const controller = new AbortController();
+  const signal = input.signal ? AbortSignal.any([input.signal, controller.signal]) : controller.signal;
   // A hung await inside one tick must not wedge every future tick for this
   // target (field incident: maintenance stayed blocked until app restart).
   // The run token keeps a late-settling task from releasing a newer run's
@@ -148,11 +188,14 @@ export async function runSessionMcpMaintenanceTask(input: {
   };
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<MaintenanceTaskSettled>((resolve) => {
-    timer = setTimeout(() => resolve({ kind: "timed_out" }), input.timeoutMs ?? SESSION_MCP_MAINTENANCE_TIMEOUT_MS);
+    timer = setTimeout(() => {
+      resolve({ kind: "timed_out" });
+      controller.abort();
+    }, input.timeoutMs ?? SESSION_MCP_MAINTENANCE_TIMEOUT_MS);
   });
   try {
     const settled = await Promise.race([
-      input.task().then(
+      input.task(signal).then(
         (): MaintenanceTaskSettled => ({ kind: "ok" }),
         (error: unknown): MaintenanceTaskSettled => ({ kind: "error", detail: maintenanceErrorDetail(error) }),
       ),
@@ -180,7 +223,19 @@ export async function syncCloudControlMcpInBackground(input: {
   settings?: DenSettings;
   mintToken?: () => Promise<DenMcpToken | null>;
   providerModel?: OpenworkCloudMcpProviderModelContext;
+  isCurrent?: () => boolean;
 }): Promise<CloudMcpBackgroundSyncResult> {
+  // Fence every asynchronous boundary, not just React state updates. A late
+  // probe or token mint must not register credentials for an obsolete target.
+  const guarded = async <T,>(operation: () => Promise<T>): Promise<T> => {
+    const check = () => {
+      if (input.isCurrent?.() === false) throw new DOMException("MCP maintenance context changed", "AbortError");
+    };
+    check();
+    const result = await operation();
+    check();
+    return result;
+  };
   const workspaceId = input.workspaceId.trim();
   const settings = input.settings ?? readDenSettings();
   const orgId = settings.activeOrgId?.trim() ?? "";
@@ -203,12 +258,10 @@ export async function syncCloudControlMcpInBackground(input: {
   // its own message instead of collapsing into the generic maintenance banner.
   let listed: Awaited<ReturnType<CloudMcpMaintenanceClient["listMcp"]>>;
   try {
-    listed = await input.client.listMcp(workspaceId);
+    listed = await guarded(() => input.client.listMcp(workspaceId));
   } catch (error) {
-    if (error instanceof OpenworkServerError) {
-      return failedCloudMcpBackgroundSync({ health: null, code: error.code, message: error.message });
-    }
-    throw error;
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    return cloudMcpMaintenanceFailure(error);
   }
   const configured = listed.items.find((entry) => entry.name === CLOUD_MCP_SERVER_NAME);
   if (configured?.config.enabled === false) {
@@ -225,9 +278,15 @@ export async function syncCloudControlMcpInBackground(input: {
   }
   const configuredUrl = typeof configured?.config.url === "string" ? configured.config.url : null;
 
+  const refreshCatalog = input.client.refreshOpenworkCloudMcpCatalog;
   const result = await runOpenworkCloudMcpReconciler({
     mode: "repair",
-    client: input.client,
+    client: {
+      baseUrl: input.client.baseUrl,
+      getOpenworkCloudMcpHealth: (...args) => guarded(() => input.client.getOpenworkCloudMcpHealth(...args)),
+      reconcileOpenworkCloudMcp: (...args) => guarded(() => input.client.reconcileOpenworkCloudMcp(...args)),
+      ...(refreshCatalog ? { refreshOpenworkCloudMcpCatalog: (...args: Parameters<typeof refreshCatalog>) => guarded(() => refreshCatalog(...args)) } : {}),
+    },
     context: {
       ...scope,
       denAuthToken: settings.authToken,
@@ -237,10 +296,16 @@ export async function syncCloudControlMcpInBackground(input: {
       providerModel: input.providerModel,
       trigger: input.force ? "desktop-background-forced" : "desktop-background",
     },
-    mintToken: input.mintToken
-      ? async () => input.mintToken?.() ?? null
-      : mintCloudControlMcpToken,
+    mintToken: (context) => guarded(() => input.mintToken ? input.mintToken() : mintCloudControlMcpToken(context)),
     force: input.force,
+    // Session maintenance is the automatic upgrade path for already-signed-in
+    // desktops. OpenCode can keep reporting a stale Cloud MCP entry as
+    // connected even after the hosted API moved origins, while actual tool
+    // calls fail at the remote endpoint with `missing_mcp_token` when the
+    // persisted Authorization header is no longer delivered. Include the
+    // server-side direct probe here so those auth failures trigger a silent
+    // re-mint instead of waiting for the user to open Settings → Repair.
+    probe: true,
     refreshMarginMs: CLOUD_MCP_REFRESH_MARGIN_MS,
     now: input.now,
     configuredEnabled: configured === undefined ? null : configured.config.enabled !== false,
@@ -248,7 +313,7 @@ export async function syncCloudControlMcpInBackground(input: {
   if (result.health?.usable) {
     return {
       outcome: "ready",
-      status: result.status === "unchanged" || result.status === "ready" ? "unchanged" : "synced",
+      status: result.status === "repaired" ? "synced" : "unchanged",
       health: result.health,
     };
   }
@@ -283,6 +348,7 @@ export async function runCloudMcpMaintenanceWithRetry(input: {
   attempt: () => Promise<CloudMcpBackgroundSyncResult>;
   retryDelaysMs?: number[];
   wait?: (delayMs: number) => Promise<void>;
+  signal?: AbortSignal;
   onAttempt?: (input: {
     result: CloudMcpBackgroundSyncResult;
     attempt: number;
@@ -291,17 +357,24 @@ export async function runCloudMcpMaintenanceWithRetry(input: {
   }) => void;
 }): Promise<CloudMcpBackgroundSyncResult> {
   const retryDelaysMs = input.retryDelaysMs ?? CLOUD_MCP_MAINTENANCE_RETRY_DELAYS_MS;
-  const wait = input.wait ?? ((delayMs: number) => new Promise((resolve) => setTimeout(resolve, delayMs)));
+  const wait = input.wait ?? ((delayMs: number) => waitForCloudMcpRetry(delayMs, input.signal));
   const maxAttempts = 1 + retryDelaysMs.length;
   let lastResult: CloudMcpBackgroundSyncResult | null = null;
 
   for (let index = 0; index < maxAttempts; index += 1) {
+    input.signal?.throwIfAborted();
     if (index > 0) await wait(retryDelaysMs[index - 1] ?? 0);
+    input.signal?.throwIfAborted();
     try {
       lastResult = await input.attempt();
-    } catch {
-      lastResult = failedCloudMcpBackgroundSync({ health: null });
+    } catch (error) {
+      // A different target can share the reconciler's in-flight promise. If
+      // that owner was superseded, only its own retry loop is cancelled; the
+      // current target retries after the shared operation has settled.
+      input.signal?.throwIfAborted();
+      lastResult = cloudMcpMaintenanceFailure(error);
     }
+    input.signal?.throwIfAborted();
     const willRetry = lastResult.outcome === "failed"
       && lastResult.issue.retryable
       && index < maxAttempts - 1;
@@ -340,6 +413,7 @@ export async function healWorkspaceMcpInBackground(input: {
 
 export function useSessionMcpMaintenance(input: {
   cloudSignedIn: boolean;
+  cloudAuthStatus?: DenAuthStatus;
   client: OpenworkServerClient | null;
   workspaceId: string | null;
   opencodeClient: Client | null;
@@ -350,6 +424,13 @@ export function useSessionMcpMaintenance(input: {
   const [cloudMcpState, setCloudMcpState] = useState<SessionCloudMcpMaintenanceState>(
     IDLE_CLOUD_MCP_MAINTENANCE_STATE,
   );
+  const [settingsVersion, setSettingsVersion] = useState(0);
+  const settings = useMemo(() => readDenSettings(), [input.cloudSignedIn, settingsVersion]);
+  useEffect(() => {
+    const refresh = () => setSettingsVersion((version) => version + 1);
+    window.addEventListener(denSettingsChangedEvent, refresh);
+    return () => window.removeEventListener(denSettingsChangedEvent, refresh);
+  }, []);
 
   useEffect(() => {
     if (input.engineReloadBusy) {
@@ -366,7 +447,6 @@ export function useSessionMcpMaintenance(input: {
       setCloudMcpState(IDLE_CLOUD_MCP_MAINTENANCE_STATE);
       return;
     }
-    const settings = readDenSettings();
     const targetKey = getSessionMcpMaintenanceTargetKey({
       client,
       cloudSignedIn: input.cloudSignedIn,
@@ -377,7 +457,15 @@ export function useSessionMcpMaintenance(input: {
     });
 
     let cancelled = false;
+    let running = false;
+    const controller = new AbortController();
+    const isCurrent = () => {
+      const current = readDenSettings();
+      return !cancelled && current.baseUrl === settings.baseUrl
+        && current.authToken === settings.authToken && current.activeOrgId === settings.activeOrgId;
+    };
     let busyRetryTimer: number | null = null;
+    let rerunRequested = false;
     setCloudMcpState(input.cloudSignedIn
       ? { ...IDLE_CLOUD_MCP_MAINTENANCE_STATE, status: "checking" }
       : IDLE_CLOUD_MCP_MAINTENANCE_STATE);
@@ -400,7 +488,7 @@ export function useSessionMcpMaintenance(input: {
         stage: issue?.stage ?? null,
         retryable: issue?.retryable ?? null,
       });
-      if (cancelled) return;
+      if (!isCurrent()) return;
       setCloudMcpState({
         status: attemptInput.result.outcome === "ready"
           ? "ready"
@@ -424,20 +512,29 @@ export function useSessionMcpMaintenance(input: {
     };
 
     const tick = async () => {
-      if (cancelled) return;
+      if (!isCurrent() || running) return;
+      running = true;
       const started = await runSessionMcpMaintenanceTask({
         targetKey,
-        task: async () => {
+        signal: controller.signal,
+        // Backoff time must not consume the existing work watchdog budget.
+        timeoutMs: SESSION_MCP_MAINTENANCE_TIMEOUT_MS + CLOUD_MCP_MAINTENANCE_RETRY_DELAYS_MS.reduce((sum, delay) => sum + delay, 0),
+        task: async (signal) => {
           if (input.cloudSignedIn) {
             await runCloudMcpMaintenanceWithRetry({
+              signal,
+              wait: (delay) => waitForCloudMcpRetry(delay, signal, window),
               attempt: () => syncCloudControlMcpInBackground({
                 client,
                 workspaceId,
+                settings,
+                isCurrent: () => !signal.aborted && isCurrent(),
                 providerModel: input.providerModel,
               }),
               onAttempt: recordCloudAttempt,
             });
           }
+          if (signal.aborted || !isCurrent()) return;
           await healWorkspaceMcpInBackground({
             client,
             workspaceId,
@@ -449,7 +546,11 @@ export function useSessionMcpMaintenance(input: {
           });
         },
       });
-      if (!started) scheduleBusyRetry();
+      running = false;
+      if (!started || rerunRequested) {
+        rerunRequested = false;
+        scheduleBusyRetry();
+      }
     };
 
     void tick();
@@ -457,25 +558,40 @@ export function useSessionMcpMaintenance(input: {
     const handleFocus = () => {
       if (document.visibilityState === "visible") void tick();
     };
+    // Archiving, restoring or creating a Library plugin changes which org
+    // connections this member gets; refresh the direct MCP catalog right away.
+    // A change made while a run is in flight must not be dropped: that run may
+    // have read the catalog before the change.
+    const handleCloudInventoryChanged = () => {
+      if (running) rerunRequested = true;
+      else void tick();
+    };
     window.addEventListener("online", handleOnline);
     window.addEventListener("focus", handleFocus);
+    window.addEventListener(CLOUD_INVENTORY_CHANGED_EVENT, handleCloudInventoryChanged);
     const interval = window.setInterval(() => void tick(), SESSION_MCP_MAINTENANCE_INTERVAL_MS);
     return () => {
       cancelled = true;
+      controller.abort();
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("focus", handleFocus);
+      window.removeEventListener(CLOUD_INVENTORY_CHANGED_EVENT, handleCloudInventoryChanged);
       window.clearInterval(interval);
       if (busyRetryTimer !== null) window.clearTimeout(busyRetryTimer);
     };
   }, [
     input.client,
     input.cloudSignedIn,
+    input.cloudAuthStatus,
     input.directory,
     input.engineReloadBusy,
     input.opencodeClient,
     input.providerModel?.model,
     input.providerModel?.provider,
     input.workspaceId,
+    settings.baseUrl,
+    settings.authToken,
+    settings.activeOrgId,
   ]);
 
   return cloudMcpState;

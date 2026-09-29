@@ -1,3 +1,7 @@
+import { runInNewContext } from "node:vm";
+import { browserScript, browserSource, browserLiteral } from "../src/browser-script.ts";
+import { addInitScript } from "../src/cdp.ts";
+import type { CdpClient } from "../src/cdp.ts";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
@@ -5,12 +9,16 @@ import test from "node:test";
 import type { Server } from "node:http";
 import type { Duplex } from "node:stream";
 
-import { connect, evaluate } from "../src/cdp.ts";
+import { callFunction, connect, evaluate } from "../src/cdp.ts";
 import { evaluateOnSurface } from "../src/surface.ts";
 import type { Surface } from "../src/surface.ts";
 
 const TARGET_ID = "page-1";
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function portFromServer(server: Server): number {
   const address = server.address();
@@ -47,10 +55,19 @@ function handleClientFrames(socket: Duplex): void {
       }
       buffered = buffered.subarray(headerLength + payloadLength);
       const message: unknown = JSON.parse(payload.toString());
-      if (typeof message !== "object" || message === null || !("id" in message) || typeof message.id !== "number") continue;
-      const result = "method" in message && message.method === "Runtime.evaluate"
-        ? { result: { value: "recovered" } }
-        : {};
+      if (!isRecord(message) || typeof message.id !== "number") continue;
+      let result = {};
+      if (message.method === "Runtime.evaluate") {
+        const params = isRecord(message.params) ? message.params : {};
+        result = params.expression === "globalThis"
+          ? { result: { objectId: "global-object" } }
+          : { result: { value: "recovered" } };
+      } else if (message.method === "Runtime.callFunctionOn") {
+        const params = isRecord(message.params) ? message.params : {};
+        const args = Array.isArray(params.arguments) ? params.arguments : [];
+        const first = args[0];
+        result = { result: { value: isRecord(first) ? first.value : undefined } };
+      }
       socket.write(websocketFrame(JSON.stringify({ id: message.id, result })));
     }
   });
@@ -125,16 +142,29 @@ test("a stalled websocket can be condemned without awaiting close", async () => 
   const server = await startCdpServer(1);
   try {
     const client = await connect(server.websocketUrl, { connectTimeoutMs: 500, sendTimeoutMs: 500 });
-    await assert.rejects(evaluate(client, "1", { timeoutMs: 30 }), /CDP call Runtime\.evaluate timed out/);
+    await assert.rejects(evaluate(client, () => (1), { timeoutMs: 30 }), /CDP call Runtime\.evaluate timed out/);
 
-    const pending = evaluate(client, "2", { timeoutMs: 500 });
+    const pending = evaluate(client, () => (2), { timeoutMs: 500 });
     if (!client.abort) throw new Error("Connected CDP client did not expose abort().");
     const startedAt = Date.now();
     client.abort(new Error("probe timed out"));
     assert.ok(Date.now() - startedAt < 100, "abort() waited for the peer to complete websocket close");
     await assert.rejects(pending, /CDP transport stalled: probe timed out/);
-    await assert.rejects(evaluate(client, "3", { timeoutMs: 500 }), /CDP socket is not open/);
+    await assert.rejects(evaluate(client, () => (3), { timeoutMs: 500 }), /CDP socket is not open/);
   } finally {
+    await server.close();
+  }
+});
+
+test("function calls pass dynamic values as structured CDP arguments", async () => {
+  const server = await startCdpServer(0);
+  const client = await connect(server.websocketUrl, { connectTimeoutMs: 500, sendTimeoutMs: 500 });
+  try {
+    const dynamicValue = `"); throw new Error("must stay data"); //`;
+    const value = await callFunction(client, (value) => value, [dynamicValue]);
+    assert.equal(value, dynamicValue);
+  } finally {
+    client.close();
     await server.close();
   }
 });
@@ -148,7 +178,7 @@ test("surface evaluation heals after the first websocket consumes its budget", a
       client: firstClient,
     };
 
-    const value = await evaluateOnSurface(surface, "42", { timeoutMs: 30 });
+    const value = await evaluateOnSurface(surface, () => (42), { timeoutMs: 30 });
 
     assert.equal(value, "recovered");
     assert.notEqual(surface.client, firstClient);
@@ -156,4 +186,79 @@ test("surface evaluation heals after the first websocket consumes its budget", a
   } finally {
     await server.close();
   }
+});
+
+
+test("browser callbacks preserve argument values without interpolating executable input", async () => {
+  const input = { text: '\"; throw new Error("injection"); //', nested: [undefined, -0, NaN, Infinity], missing: undefined };
+  const result = await runInNewContext(browserSource(browserScript(async (data) => ({
+    text: data.text,
+    sameUndefined: data.nested[0] === undefined && Object.hasOwn(data, "missing"),
+    negativeZero: Object.is(data.nested[1], -0),
+    nan: Number.isNaN(data.nested[2]),
+    infinity: data.nested[3] === Infinity,
+  }), [input])));
+  assert.equal(result.text, input.text);
+  assert.equal(result.sameUndefined, true);
+  assert.equal(result.negativeZero, true);
+  assert.equal(result.nan, true);
+  assert.equal(result.infinity, true);
+  const dangerousKey = JSON.parse('{"__proto__":{"polluted":true}}');
+  const roundTrip = runInNewContext(browserSource(browserScript(data => data, [dangerousKey])));
+  assert.equal(Object.hasOwn(roundTrip, "__proto__"), true);
+  assert.equal(roundTrip.polluted, undefined);
+});
+
+test("browser serialization rejects functions, cycles, getters and class instances before transport", () => {
+  let getterCalls = 0;
+  const cyclic: { self?: unknown } = {};
+  cyclic.self = cyclic;
+  for (const value of [() => 1, cyclic, new Date(), { get secret() { getterCalls++; return "hidden"; } }]) {
+    assert.throws(() => browserLiteral(value), /Browser arguments/);
+  }
+  assert.equal(getterCalls, 0);
+});
+
+test("typed evaluation awaits promises and surfaces browser exceptions", async () => {
+  const client: CdpClient = {
+    async send(method, params = {}) {
+      assert.equal(method, "Runtime.evaluate");
+      assert.equal(params.awaitPromise, true);
+      if (typeof params.expression !== "string") throw new Error("Expected browser source");
+      try { return { result: { value: await runInNewContext(params.expression) } }; }
+      catch (error) { return { exceptionDetails: { text: String(error) } }; }
+    },
+    close() {},
+  };
+  const result: number = await evaluate(client, browserScript(async (value) => value + 1, [41]));
+  assert.equal(result, 42);
+  await assert.rejects(evaluate(client, () => { throw new Error("browser failure"); }), /browser failure/);
+});
+
+test("init callbacks run in each fresh document and dispose only once", async () => {
+  let source = "";
+  let removals = 0;
+  const client: CdpClient = {
+    async send(method, params = {}) {
+      if (method === "Page.addScriptToEvaluateOnNewDocument") {
+        if (typeof params.source !== "string") throw new Error("Missing init source");
+        source = params.source;
+        return { identifier: "init-1" };
+      }
+      assert.equal(method, "Page.removeScriptToEvaluateOnNewDocument");
+      assert.equal(params.identifier, "init-1");
+      removals++;
+      return {};
+    },
+    close() {},
+  };
+  const script = await addInitScript(client, browserScript((title) => { document.title = title; }, ['quoted " title']));
+  for (let navigation = 0; navigation < 2; navigation++) {
+    const page = { document: { title: "before" } };
+    runInNewContext(source, page);
+    assert.equal(page.document.title, 'quoted " title');
+  }
+  await script.dispose();
+  await script[Symbol.asyncDispose]();
+  assert.equal(removals, 1);
 });

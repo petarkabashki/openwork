@@ -10,37 +10,40 @@ function readDashboardComponent(name: string) {
 }
 
 describe("connector and marketplace polish", () => {
-  test("labels Sources alpha and keeps Collections first with Connectors as MCPs", () => {
-    const shell = readDashboardComponent("org-dashboard-shell.tsx");
-    const marketplaceIndex = shell.indexOf('getMarketplacesRoute(activeOrg.slug),\n          label: "Collections"');
-    const pluginsIndex = shell.indexOf('getPluginsRoute(activeOrg.slug),\n          label: "Plugin Directory"');
-    const connectorsIndex = shell.indexOf('getMcpConnectionsRoute(activeOrg.slug),\n          label: "Connectors"');
-    const sourcesIndex = shell.indexOf('getIntegrationsRoute(activeOrg.slug),\n          label: "Sources"');
+  test("keeps Plugins before Connectors and removes the Sources sidebar item", () => {
+    const navigation = readFileSync(new URL("../app/(den)/dashboard/_lib/dashboard-navigation.ts", import.meta.url), "utf8");
+    const pluginsIndex = navigation.indexOf('label: "Plugins"');
+    const connectorsIndex = navigation.indexOf('label: "Connectors"');
 
-    expect(marketplaceIndex).toBeGreaterThan(-1);
-    expect(marketplaceIndex).toBeLessThan(pluginsIndex);
+    expect(pluginsIndex).toBeGreaterThan(-1);
     expect(pluginsIndex).toBeLessThan(connectorsIndex);
-    expect(connectorsIndex).toBeLessThan(sourcesIndex);
-    expect(shell).toContain('badge: "MCPs"');
-    expect(shell).toContain('badge: "Alpha"');
+    expect(navigation).toContain('badge: "MCPs"');
+    expect(navigation).not.toContain('label: "Sources"');
+    expect(navigation).not.toContain('badge: "Alpha"');
   });
 
-  test("keeps the Sources page title free of maturity badges", () => {
-    const screen = readDashboardComponent("integrations-screen.tsx");
+  test("renders Sources as the last Plugin Directory tab", () => {
+    const integrationsScreen = readDashboardComponent("integrations-screen.tsx");
+    const pluginsScreen = readDashboardComponent("plugins-screen.tsx");
 
-    expect(screen).toContain('title="Sources"');
-    expect(screen).not.toContain("badgeLabel");
+    expect(integrationsScreen).toContain("export function IntegrationsPanel()");
+    expect(integrationsScreen).not.toContain("DashboardPageTemplate");
+    expect(pluginsScreen).toContain('label: "Sources"');
+    expect(pluginsScreen).toContain('searchParams.get("view")');
   });
 
-  test("uses the smart connector bar and the approved connector copy", () => {
-    const screen = readDashboardComponent("mcp-connections-screen.tsx");
+  test("adds connectors on the full-page catalog, with Add any MCP inline and no editor fallback", () => {
+    const catalog = readDashboardComponent("connector-catalog-screen.tsx");
+    const picker = readDashboardComponent("connector-picker.tsx");
 
-    expect(screen).toContain('title="Connectors"');
-    expect(screen).not.toContain("badgeLabel");
-    expect(screen).toContain('description="Connectors is where you can add MCP servers that your whole team can use."');
-    expect(screen).toContain('data-testid="connector-smart-bar"');
-    expect(screen).not.toMatch(/>\s*Add MCP\s*</);
-    expect(screen).not.toContain("<ImportPluginConnectionDialog");
+    expect(catalog).toContain('data-testid="add-any-mcp"');
+    expect(catalog).toContain('variant="secondary"');
+    expect(catalog).not.toContain("Advanced setup");
+    expect(catalog).not.toContain("addMcp");
+    expect(catalog).not.toContain("quickAdd");
+    expect(picker).toContain('"Filter by name, or paste an MCP URL"');
+    expect(picker).toContain("No catalog connectors match this address.");
+    expect(picker).toContain(">Add MCP</DenButton>");
   });
 
   test("adds plugins from a marketplace and carries that marketplace into the editor", () => {
@@ -52,14 +55,13 @@ describe("connector and marketplace polish", () => {
     expect(editor).toContain('searchParams.get("marketplaceId")');
   });
 
-  test("reuses Quick add on the admin dashboard and opens the selected connector flow", () => {
+  test("reuses Quick add on the admin dashboard and opens the selected connector's setup page", () => {
     const home = readDashboardComponent("dashboard-home-screen.tsx");
     const overview = readDashboardComponent("dashboard-overview-screen.tsx");
-    const connectorScreen = readDashboardComponent("mcp-connections-screen.tsx");
 
     expect(home).toContain("return access.isAdmin ? <DashboardOverviewScreen /> : <MemberDashboardScreen />");
     expect(overview).toContain("<ConnectorQuickAddGrid");
-    expect(overview).toContain("?quickAdd=${encodeURIComponent(id)}");
-    expect(connectorScreen).toContain('searchParams.get("quickAdd")');
+    expect(overview).toContain("router.push(getAddConnectorRoute(activeOrg?.slug, id))");
+    expect(overview).not.toContain("quickAdd=");
   });
 });

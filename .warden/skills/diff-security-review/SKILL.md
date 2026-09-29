@@ -1,6 +1,6 @@
 ---
 name: diff-security-review
-description: Flag only new security issues introduced by this diff. Gates Warden security clearance.
+description: Flag only new security issues introduced by this diff. Reported in the Warden security summary.
 allowed-tools: Read Grep Glob
 ---
 
@@ -23,6 +23,10 @@ Only report an issue when ALL of these hold:
 - There is a plausible attack path: attacker-controlled input reaches the
   sink, or a secret is actually exposed to an untrusted party.
 
+CI, workflow, and review-policy edits are not vulnerabilities by themselves.
+Apply the same concrete attack-path requirement to them. GitHub admin-team
+approval is the authorization boundary; do not demand an extra Warden approval.
+
 Do NOT report:
 
 - Style, performance, correctness, or maintainability issues.
@@ -32,14 +36,25 @@ Do NOT report:
 - Test fixtures, mocks, or intentionally fake credentials that never grant
   real access.
 
+Test code is not a production attack surface merely because it uses browser
+JavaScript evaluation, direct API calls, relaxed local authentication, or
+fixture shortcuts. For tests and test harnesses, report only when the diff
+creates a concrete path to real credentials, untrusted CI input, shared or
+production services, or shipped runtime code. Explain that path; do not
+apply production hardening standards to isolated test behavior. Test files
+are not exempt when such a path exists.
+
 For each finding, report:
 
-- The exact file and changed lines that introduce the issue.
-- The attack path: who controls the input and what they gain.
-- Severity: `critical` (RCE, auth bypass, real secret leak), `high`
-  (injection, XSS, SSRF, traversal), `medium` (info disclosure, weak crypto),
+- One finding per root cause, grouping all related locations and identifying
+  the exact changed lines that cause it.
+- The reachable attack path: who controls the input, the concrete failure,
+  and what they gain. Check and address contrary evidence before reporting.
+- Severity: `high` (RCE, auth bypass, real secret leak, injection, XSS,
+  SSRF, traversal), `medium` (info disclosure, weak crypto),
   `low` (defense-in-depth regression introduced by this diff).
-- A concrete fix in the changed code.
+- The smallest concrete fix in the changed code.
+- `Clear when:` followed by the observable condition that resolves the finding.
 
 If the diff introduces no new security issues, report nothing. Silence is the
 correct output for a clean diff; do not manufacture findings.

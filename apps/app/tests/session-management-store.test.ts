@@ -36,6 +36,13 @@ describe("session group management", () => {
     ]);
   });
 
+  test("reordering pins keeps unloaded pins and cannot pin another session or change workspace order", () => {
+    useSessionManagementStore.setState({ pinnedIds: ["a", "unloaded", "b"], orderByWorkspace: { [workspaceId]: ["a", "b"] } });
+    useSessionManagementStore.getState().reorderPins(["b", "a", "b", "not-pinned"]);
+    expect(useSessionManagementStore.getState().pinnedIds).toEqual(["b", "a", "unloaded"]);
+    expect(useSessionManagementStore.getState().orderByWorkspace[workspaceId]).toEqual(["a", "b"]);
+  });
+
   test("moves sessions to the selected destination before removing a group", () => {
     useSessionManagementStore.getState().removeGroup(workspaceId, "group-a", "group-b");
 
@@ -54,5 +61,22 @@ describe("session group management", () => {
     expect(useSessionManagementStore.getState().groupsByWorkspace[workspaceId]?.assignments).toEqual({
       "session-3": "group-b",
     });
+  });
+
+  test("does not publish an equivalent server group snapshot", () => {
+    const before = useSessionManagementStore.getState().groupsByWorkspace[workspaceId];
+    let notifications = 0;
+    const unsubscribe = useSessionManagementStore.subscribe(() => {
+      notifications += 1;
+    });
+
+    useSessionManagementStore.getState().replaceWorkspaceGroups(workspaceId, {
+      groups: before.groups.map((group) => ({ ...group })),
+      assignments: { ...before.assignments },
+    });
+
+    unsubscribe();
+    expect(useSessionManagementStore.getState().groupsByWorkspace[workspaceId]).toBe(before);
+    expect(notifications).toBe(0);
   });
 });

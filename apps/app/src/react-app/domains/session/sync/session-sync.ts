@@ -1,14 +1,24 @@
 import type { UIMessage } from "ai";
+import { create } from "zustand";
 import type { FilePart, Part, PermissionRequest, PermissionV2Request, QuestionRequest, Session, SessionStatus, Todo } from "@opencode-ai/sdk/v2/client";
 
 import { getReactQueryClient } from "../../../infra/query-client";
+import { readGatewayUsageScope } from "@/app/lib/gateway-usage-scope";
+import { refreshGatewayUsageAfterCompletion } from "../../cloud/gateway-usage-refresh";
+import { gatewayUsageQueryPrefix } from "../../cloud/gateway-usage-state";
+import { closeSessionBrowserTabs } from "@/app/lib/desktop";
 import { captureAnalyticsEvent, takeTaskRunStart } from "@/app/lib/analytics";
 import { trackTaskCompleted, trackTaskFailed } from "@/app/lib/den-telemetry";
+import { observeModelsTaskEvent } from "@/app/lib/models-task-analytics";
 import { createClient, unwrap } from "@/app/lib/opencode";
+import { createClientV2, isOpencodeV2BaseUrl } from "@/app/lib/opencode-v2-adapter";
+import { perfNow, recordPerfLog } from "@/app/lib/perf-log";
 import { isGeneratedSessionTitle } from "@/app/lib/session-title";
 import { normalizeEvent } from "@/app/utils";
 import { SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX, type OpencodeEvent, type PendingPermission, type PendingQuestion } from "@/app/types";
 import {
+  attachmentNoteToUIParts,
+  textPartToUIPart,
   createSessionErrorUIMessage,
   snapshotToUIMessages,
 } from "./usechat-adapter";
@@ -21,11 +31,15 @@ import {
   parseStructuredOutputUIPart,
   STRUCTURED_OUTPUT_TOOL,
 } from "./parse-tool-parts";
-import type { OpenworkSessionSnapshot } from "@/app/lib/openwork-server";
+import type { OpenworkSessionHistory, OpenworkSessionSnapshot } from "@/app/lib/openwork-server";
+import type { LatestSessionHistory } from "../surface/session-render-state";
 import { applyRevertCursor, reconcileTranscriptMessages } from "./transcript-reconcile";
+import { upsertMessageByChronology } from "./message-merge";
+import { isOrphanedInteraction, isTerminalToolPart, terminalToolCallIds, terminalTranscriptToolCallIds } from "./orphaned-interactions";
 import {
   useSessionActivityStore,
 } from "../status/session-activity-store";
+import { useWorkbenchStore } from "../chat/workbench-store";
 import { notifyDesktopEvent } from "../../../shell/desktop-notifications";
 import { notifyAlert } from "../../../shell/notifications";
 import { t } from "@/i18n";
@@ -33,54 +47,152 @@ import {
   createSessionTitleRecovery,
   type SessionTitleRecovery,
 } from "./session-title-recovery";
+import {
+  applyPendingDeltasToTranscript,
+  coalescePendingDeltas,
+  getPartMetadataId,
+  inferStubRole,
+  partitionPendingDeltasByLane,
+  partitionPendingDeltasBySession,
+  selectDeltaFlushLane,
+  type DeltaFlushLane,
+  type PendingDelta,
+} from "./session-transcript-deltas";
+import { startSyncStreamLifecycle, type SyncStreamPhase } from "./sync-stream-lifecycle";
+
+export { type SyncStreamPhase } from "./sync-stream-lifecycle";
+export {
+  applyPendingDeltasToTranscript,
+  coalescePendingDeltas,
+  type DeltaFlushLane,
+  type PendingDelta,
+} from "./session-transcript-deltas";
 
 type SyncOptions = {
   workspaceId: string;
   baseUrl: string;
   openworkToken: string;
+  visibleSessionId?: string | null;
   onSessionCreated?: (session: Session) => void;
   onSessionUpdated?: (update: { sessionId: string; info: Record<string, unknown> }) => void;
   onSessionDeleted?: (sessionId: string) => void;
   onSessionStatus?: (update: { sessionId: string; status: SessionStatus }) => void;
 };
 
-type PendingDelta = {
-  sessionId: string;
-  messageId: string;
-  partId: string;
-  reasoning: boolean;
-  delta: string;
-};
+type ListenerRegistry<Listener> = Map<Listener, number>;
 
 type SyncEntry = {
   input: SyncOptions;
   openworkToken: string;
+  // Reattachment can rotate the token after the stream already failed. This
+  // hook advances the stream lifecycle's connection generation so a stream
+  // parked in auth backoff restarts immediately with the new credential.
+  notifyStreamGenerationChanged: (() => void) | null;
   refs: number;
   dispose: () => void;
   disposeTimer: ReturnType<typeof setTimeout> | null;
   trackedSessionRefs: Map<string, number>;
-  retainedSessionTimers: Map<string, ReturnType<typeof setTimeout>>;
-  sessionCreatedListeners: Set<NonNullable<SyncOptions["onSessionCreated"]>>;
-  sessionUpdatedListeners: Set<NonNullable<SyncOptions["onSessionUpdated"]>>;
-  sessionDeletedListeners: Set<NonNullable<SyncOptions["onSessionDeleted"]>>;
-  sessionStatusListeners: Set<NonNullable<SyncOptions["onSessionStatus"]>>;
-  pendingDeltas: Map<string, { messageId: string; reasoning: boolean; text: string }>;
-  // Coalesce rapid-fire delta events from the SSE stream into one cache
-  // commit per animation frame. Without this, a long response produces a
-  // setQueryData per token; each triggers a full transcript re-render
-  // (~27ms on large sessions) which starves the main thread and looks to
-  // the user like the app "freezes after 2 words."
+  retainedSessionTimers: Map<string, { timer: ReturnType<typeof setTimeout>; releaseAt: number }>;
+  sessionCreatedListeners: ListenerRegistry<NonNullable<SyncOptions["onSessionCreated"]>>;
+  sessionUpdatedListeners: ListenerRegistry<NonNullable<SyncOptions["onSessionUpdated"]>>;
+  sessionDeletedListeners: ListenerRegistry<NonNullable<SyncOptions["onSessionDeleted"]>>;
+  sessionStatusListeners: ListenerRegistry<NonNullable<SyncOptions["onSessionStatus"]>>;
+  pendingDeltas: Map<string, { sessionId: string; messageId: string; reasoning: boolean; text: string }>;
+  // Coalesce rapid-fire delta events from the SSE stream into one visible
+  // cache commit per animation frame. Background transcripts use a slower
+  // lane because they have no renderer waiting on token-sized updates.
   deltaFlushBuffer: PendingDelta[];
-  deltaFlushScheduled: boolean;
+  deltaFlushLane: DeltaFlushLane | null;
+  cancelDeltaFlush: (() => void) | null;
+  liveSessionIds: Set<string>;
+  statusReconcileTimer: ReturnType<typeof setTimeout> | null;
+  statusReconcileAbort: AbortController | null;
+  runActiveObservedAt: Map<string, number>;
+  assistantMessageCompletedAt: Map<string, number>;
+  gatewayUsageRuns: Map<string, { scope: number; key: string; providerId: string | null; completed: boolean }>;
+  nativeSequenceBySession: Map<string, { sequence: number; revision: number }>;
+  nativeSequenceRevision: number;
+  nativeTerminalSessions: Set<string>;
+  permissionReconciles: Map<string, AbortController>;
   titleRecovery: SessionTitleRecovery | null;
 };
 
+type DeltaFlushScheduler = (
+  lane: DeltaFlushLane,
+  run: () => void,
+) => () => void;
+
+let gatewayUsageRunSequence = 0;
+function newGatewayUsageRun(key: string): { scope: number; key: string; providerId: string | null; completed: boolean } {
+  return { scope: readGatewayUsageScope().generation, key, providerId: null, completed: false };
+}
+
+function gatewayUsageProviderId(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  if ("providerID" in value && typeof value.providerID === "string") return value.providerID;
+  if ("model" in value && value.model && typeof value.model === "object" && "providerID" in value.model && typeof value.model.providerID === "string") return value.model.providerID;
+  return null;
+}
+
 const idleStatus: SessionStatus = { type: "idle" };
 const syncs = new Map<string, SyncEntry>();
-const sessionSnapshotFetchStarts = new WeakMap<OpenworkSessionSnapshot, number>();
+const sessionSnapshotFetchStarts = new WeakMap<OpenworkSessionHistory, number>();
+const todoSnapshotFirstSeen = new WeakMap<OpenworkSessionHistory, number>();
 const workspaceSyncDisposeGraceMs = 2_000;
 const retainedSessionTtlMs = 10 * 60_000;
 const idleRetainedSessionTtlMs = 10_000;
+const backgroundDeltaFlushMs = 100;
+// OpenCode's own run client polls the authoritative status level every 250ms
+// because a transport can keep delivering message events after losing a
+// terminal status edge. This is a reconciliation cadence, not a completion
+// timeout: elapsed time never marks a task done.
+const activeSessionStatusReconcileIntervalMs = 250;
+
+type SessionStatusSource = "stream" | "connect-reconcile" | "active-reconcile" | "snapshot";
+
+function developerDiagnosticsEnabled() {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem("openwork.developerMode") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function recordSessionCompletionMark(
+  event: string,
+  payload: Record<string, unknown>,
+) {
+  recordPerfLog(developerDiagnosticsEnabled(), "session.completion", event, {
+    monotonicMs: Math.round(perfNow() * 100) / 100,
+    ...payload,
+  });
+}
+
+function createListenerRegistry<Listener>(listener?: Listener) {
+  const registry: ListenerRegistry<Listener> = new Map();
+  if (listener !== undefined) registry.set(listener, 1);
+  return registry;
+}
+
+// Listener identity is not attachment identity: overlapping route lifecycles
+// can reuse one stable callback. Count each owner so an older cleanup cannot
+// detach a newer observer from the workspace-scoped task stream.
+function retainListener<Listener>(registry: ListenerRegistry<Listener>, listener?: Listener) {
+  if (listener === undefined) return;
+  registry.set(listener, (registry.get(listener) ?? 0) + 1);
+}
+
+function releaseListener<Listener>(registry: ListenerRegistry<Listener>, listener?: Listener) {
+  if (listener === undefined) return;
+  const owners = registry.get(listener);
+  if (owners === undefined) return;
+  if (owners <= 1) {
+    registry.delete(listener);
+    return;
+  }
+  registry.set(listener, owners - 1);
+}
 
 type SyncSubscriptionFactory = (
   baseUrl: string,
@@ -94,14 +206,20 @@ type SessionStatusFetcher = (
   signal: AbortSignal,
 ) => Promise<Record<string, SessionStatus>>;
 
+function createSyncClient(baseUrl: string, openworkToken: string) {
+  return isOpencodeV2BaseUrl(baseUrl)
+    ? createClientV2(baseUrl, undefined, { token: openworkToken })
+    : createClient(baseUrl, undefined, { token: openworkToken, mode: "openwork" });
+}
+
 const defaultSyncSubscriptionFactory: SyncSubscriptionFactory = async (baseUrl, openworkToken, signal) => {
-  const client = createClient(baseUrl, undefined, { token: openworkToken, mode: "openwork" });
+  const client = createSyncClient(baseUrl, openworkToken);
   const subscription = await client.event.subscribe(undefined, { signal });
   return subscription.stream;
 };
 
 const defaultSessionStatusFetcher: SessionStatusFetcher = async (baseUrl, openworkToken, signal) => {
-  const client = createClient(baseUrl, undefined, { token: openworkToken, mode: "openwork" });
+  const client = createSyncClient(baseUrl, openworkToken);
   const result = await client.session.status(undefined, { signal });
   if (result.data !== undefined) return result.data;
   throw result.error;
@@ -109,10 +227,55 @@ const defaultSessionStatusFetcher: SessionStatusFetcher = async (baseUrl, openwo
 
 let syncSubscriptionFactory = defaultSyncSubscriptionFactory;
 let sessionStatusFetcher = defaultSessionStatusFetcher;
+const defaultSessionPermissionFetcher = async (baseUrl: string, token: string, sessionID: string, signal: AbortSignal) =>
+  unwrap(await createSyncClient(baseUrl, token).v2.session.permission.list({ sessionID }, { signal })).data;
+let sessionPermissionFetcher = defaultSessionPermissionFetcher;
 
-export function markSessionSnapshotFetchStart(snapshot: OpenworkSessionSnapshot, startedAt: number) {
+const defaultDeltaFlushScheduler: DeltaFlushScheduler = (lane, run) => {
+  if (
+    lane === "foreground" &&
+    typeof window !== "undefined" &&
+    typeof window.requestAnimationFrame === "function" &&
+    (typeof document === "undefined" || document.visibilityState === "visible")
+  ) {
+    const frame = window.requestAnimationFrame(run);
+    return () => window.cancelAnimationFrame(frame);
+  }
+  if (typeof window !== "undefined") {
+    const timer = window.setTimeout(run, lane === "foreground" ? 50 : backgroundDeltaFlushMs);
+    return () => window.clearTimeout(timer);
+  }
+  let cancelled = false;
+  queueMicrotask(() => {
+    if (!cancelled) run();
+  });
+  return () => {
+    cancelled = true;
+  };
+};
+
+let deltaFlushScheduler = defaultDeltaFlushScheduler;
+
+export function markSessionSnapshotFetchStart(snapshot: OpenworkSessionHistory, startedAt: number) {
   sessionSnapshotFetchStarts.set(snapshot, startedAt);
 }
+
+const historyCredentials = new Map<string | null, number>();
+let nextHistoryCredential = 0;
+
+export function sessionHistoryCredential(token?: string | null) {
+  const key = token ?? null;
+  let credential = historyCredentials.get(key);
+  if (credential === undefined) {
+    credential = ++nextHistoryCredential;
+    historyCredentials.set(key, credential);
+    if (historyCredentials.size > 32) historyCredentials.delete(historyCredentials.keys().next().value ?? null);
+  }
+  return credential;
+}
+
+export const sessionMetadataKey = (input: Pick<SyncOptions, "workspaceId" | "baseUrl" | "openworkToken">, sessionId: string) =>
+  ["react-session-metadata", input.workspaceId, input.baseUrl, sessionHistoryCredential(input.openworkToken), sessionId] as const;
 
 export const snapshotKey = (workspaceId: string, sessionId: string) =>
   ["react-session-snapshot", workspaceId, sessionId] as const;
@@ -127,8 +290,113 @@ export const permissionKey = (workspaceId: string, sessionId: string) =>
 export const questionKey = (workspaceId: string, sessionId: string) =>
   ["react-session-questions", workspaceId, sessionId] as const;
 
-function syncKey(input: SyncOptions) {
+function syncKey(input: Pick<SyncOptions, "workspaceId" | "baseUrl">) {
   return `${input.workspaceId}:${input.baseUrl}`;
+}
+
+/**
+ * Freshness of the `/session/status` reconcile loop for one workspace stream.
+ * While any session is believed live that loop polls continuously, so it is
+ * the strongest liveness signal the renderer has: a run status is only as
+ * trustworthy as its latest successful validation. `lastSuccessAt` freezes at
+ * the moment validation started failing so surfaces can say when the run was
+ * last confirmed.
+ */
+export type WorkspaceSyncReconcileHealth = {
+  consecutiveFailures: number;
+  lastSuccessAt: number | null;
+};
+
+/**
+ * A busy status whose validation keeps failing must stop being presented as
+ * confident progress. Three consecutive failures tolerate a single transient
+ * blip while flagging a refused connection within about a second and a
+ * blackholed one within roughly three request timeouts (~30s).
+ */
+export const reconcileFailureDegradedThreshold = 3;
+
+// Cap the stored counter so an extended outage stops producing store updates
+// (and re-renders) once the degraded threshold is long past.
+const reconcileFailureCountCap = 99;
+
+// Non-reactive success times: healthy reconciles land every 250ms while a
+// run is live, and publishing each one through the store would notify
+// subscribers at that cadence for no visible change. The store is only
+// stamped on health transitions.
+const lastReconcileSuccessAtByKey = new Map<string, number>();
+
+type WorkspaceSyncStreamStore = {
+  phasesByKey: Record<string, SyncStreamPhase>;
+  reconcileHealthByKey: Record<string, WorkspaceSyncReconcileHealth>;
+  publishPhase: (key: string, phase: SyncStreamPhase) => void;
+  publishReconcileSuccess: (key: string, at: number) => void;
+  publishReconcileFailure: (key: string) => void;
+  removePhase: (key: string) => void;
+};
+
+/**
+ * Live health of each workspace event stream so surfaces can tell a live
+ * stream from one that is reconnecting, blocked on authentication, or stale.
+ * The lifecycle only publishes actual transitions, so subscribers do not see
+ * duplicate notifications.
+ */
+export const useWorkspaceSyncStreamStore = create<WorkspaceSyncStreamStore>((set) => ({
+  phasesByKey: {},
+  reconcileHealthByKey: {},
+  publishPhase: (key, phase) => set((state) => ({
+    phasesByKey: { ...state.phasesByKey, [key]: phase },
+  })),
+  publishReconcileSuccess: (key, at) => {
+    lastReconcileSuccessAtByKey.set(key, at);
+    set((state) => {
+      const current = state.reconcileHealthByKey[key];
+      if (!current || current.consecutiveFailures === 0) return state;
+      return {
+        reconcileHealthByKey: {
+          ...state.reconcileHealthByKey,
+          [key]: { consecutiveFailures: 0, lastSuccessAt: at },
+        },
+      };
+    });
+  },
+  publishReconcileFailure: (key) => set((state) => {
+    const current = state.reconcileHealthByKey[key] ?? { consecutiveFailures: 0, lastSuccessAt: null };
+    if (current.consecutiveFailures >= reconcileFailureCountCap) return state;
+    return {
+      reconcileHealthByKey: {
+        ...state.reconcileHealthByKey,
+        [key]: {
+          consecutiveFailures: current.consecutiveFailures + 1,
+          lastSuccessAt: current.consecutiveFailures === 0
+            ? lastReconcileSuccessAtByKey.get(key) ?? current.lastSuccessAt
+            : current.lastSuccessAt,
+        },
+      },
+    };
+  }),
+  removePhase: (key) => {
+    lastReconcileSuccessAtByKey.delete(key);
+    set((state) => {
+      if (!(key in state.phasesByKey) && !(key in state.reconcileHealthByKey)) return state;
+      const nextPhases = { ...state.phasesByKey };
+      delete nextPhases[key];
+      const nextHealth = { ...state.reconcileHealthByKey };
+      delete nextHealth[key];
+      return { phasesByKey: nextPhases, reconcileHealthByKey: nextHealth };
+    });
+  },
+}));
+
+export function workspaceSyncStreamKey(
+  input: Pick<SyncOptions, "workspaceId" | "baseUrl">,
+): string {
+  return `${input.workspaceId}:${input.baseUrl}`;
+}
+
+export function getWorkspaceSessionSyncStreamPhase(
+  input: Pick<SyncOptions, "workspaceId" | "baseUrl">,
+): SyncStreamPhase | null {
+  return useWorkspaceSyncStreamStore.getState().phasesByKey[workspaceSyncStreamKey(input)] ?? null;
 }
 
 function getErrorStatus(error: unknown) {
@@ -142,9 +410,14 @@ function getErrorStatus(error: unknown) {
   return typeof status === "number" ? status : null;
 }
 
-function shouldRetrySyncSubscribe(error: unknown) {
+// 401/403/404 can mean a permanently invalid token, but the same statuses
+// occur transiently while the local server restarts or the runtime generation
+// rotates. They select the slower bounded auth backoff lane instead of
+// terminating the stream: the task may still be running on the server, and a
+// dead stream would silently stop delivering its events.
+function isAuthBlockedSubscribeError(error: unknown) {
   const status = getErrorStatus(error);
-  return status !== 401 && status !== 403 && status !== 404;
+  return status === 401 || status === 403 || status === 404;
 }
 
 function isTrackedSession(entry: SyncEntry, sessionId: string) {
@@ -180,25 +453,6 @@ function getSessionCreatedInfo(event: OpencodeEvent): Session | null {
 
 function isLiveStatus(status: SessionStatus | null | undefined) {
   return status?.type === "busy" || status?.type === "retry";
-}
-
-function messageHasVisibleAssistantOutput(message: UIMessage) {
-  if (message.role !== "assistant") return false;
-  return message.parts.some((part) => {
-    if ("text" in part && typeof part.text === "string") return part.text.trim().length > 0;
-    return part.type === "dynamic-tool" || part.type === "file";
-  });
-}
-
-function assistantOutputAfterLatestUser(messages: UIMessage[]) {
-  let lastUserIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === "user") {
-      lastUserIndex = index;
-      break;
-    }
-  }
-  return messages.slice(lastUserIndex + 1).some(messageHasVisibleAssistantOutput);
 }
 
 function sessionIdFromProperties(properties: unknown) {
@@ -247,15 +501,57 @@ function partHasVisibleAssistantOutput(part: Part) {
 }
 
 function clearTrackedSession(input: SyncOptions, entry: SyncEntry, sessionId: string) {
-  entry.trackedSessionRefs.delete(sessionId);
-  const retainedTimer = entry.retainedSessionTimers.get(sessionId);
-  if (retainedTimer) clearTimeout(retainedTimer);
+  if ((entry.trackedSessionRefs.get(sessionId) ?? 0) > 0) return;
+  const queryClient = getReactQueryClient();
+  const record = useSessionActivityStore.getState().recordsByWorkspaceId[input.workspaceId]?.[sessionId];
+  // Leaving Settings or switching workspaces must not turn retention into a
+  // run timeout, or discard an interaction that is still awaiting a reply.
+  if (
+    entry.liveSessionIds.has(sessionId)
+    || record?.runActive
+    || record?.compacting
+    || record?.waitingPermissionIds.length
+    || record?.waitingQuestionIds.length
+    || queryClient.getQueryData<PendingPermission[]>(permissionKey(input.workspaceId, sessionId))?.length
+    || queryClient.getQueryData<PendingQuestion[]>(questionKey(input.workspaceId, sessionId))?.length
+    || entry.permissionReconciles.has(sessionId)
+  ) {
+    retainSession(input, entry, sessionId);
+    return;
+  }
+  const retained = entry.retainedSessionTimers.get(sessionId);
+  if (retained) clearTimeout(retained.timer);
   entry.retainedSessionTimers.delete(sessionId);
+  entry.runActiveObservedAt.delete(sessionId);
+  entry.assistantMessageCompletedAt.delete(sessionId);
+  entry.gatewayUsageRuns.delete(sessionId);
+  for (const [key, pending] of entry.pendingDeltas) {
+    if (pending.sessionId === sessionId) entry.pendingDeltas.delete(key);
+  }
   entry.deltaFlushBuffer = entry.deltaFlushBuffer.filter(
     (item) => item.sessionId !== sessionId,
   );
-  const queryClient = getReactQueryClient();
-  queryClient.removeQueries({ queryKey: permissionKey(input.workspaceId, sessionId), exact: true });
+  if (entry.deltaFlushBuffer.length === 0) {
+    entry.cancelDeltaFlush?.();
+    entry.deltaFlushLane = null;
+    entry.cancelDeltaFlush = null;
+  }
+  // A runtime restart can replace the endpoint while retaining the same
+  // workspace/session cache keys. Releasing the old sync must not erase the
+  // replacement sync's mounted or retained conversation.
+  const hasOtherOwner = [...syncs.values()].some((other) =>
+    other !== entry && other.input.workspaceId === input.workspaceId && isTrackedSession(other, sessionId));
+  if (!hasOtherOwner) {
+    // Keep sequence and settlement watermarks: delayed events/reads must not
+    // resurrect a terminal run or a replied interaction after cache release.
+    queryClient.removeQueries({ queryKey: permissionKey(input.workspaceId, sessionId), exact: true });
+    queryClient.removeQueries({ queryKey: questionKey(input.workspaceId, sessionId), exact: true });
+    // These caches are GC-exempt (see query-client.ts). In particular, live
+    // transcripts must retain their part declarations so deltas can land.
+    queryClient.removeQueries({ queryKey: transcriptKey(input.workspaceId, sessionId), exact: true });
+    queryClient.removeQueries({ queryKey: statusKey(input.workspaceId, sessionId), exact: true });
+    queryClient.removeQueries({ queryKey: todoKey(input.workspaceId, sessionId), exact: true });
+  }
   if (entry.refs <= 0 && entry.retainedSessionTimers.size === 0) {
     disposeWorkspaceSync(syncKey(input), entry);
   }
@@ -263,10 +559,16 @@ function clearTrackedSession(input: SyncOptions, entry: SyncEntry, sessionId: st
 
 function retainSession(input: SyncOptions, entry: SyncEntry, sessionId: string, ttlMs = retainedSessionTtlMs) {
   const existing = entry.retainedSessionTimers.get(sessionId);
-  if (existing) clearTimeout(existing);
-  entry.retainedSessionTimers.set(sessionId, setTimeout(() => {
-    clearTrackedSession(input, entry, sessionId);
-  }, ttlMs));
+  const releaseAt = Date.now() + ttlMs;
+  if (existing && existing.releaseAt <= releaseAt) return;
+  if (existing) clearTimeout(existing.timer);
+  entry.retainedSessionTimers.set(sessionId, {
+    releaseAt,
+    timer: setTimeout(() => {
+      entry.retainedSessionTimers.delete(sessionId);
+      clearTrackedSession(input, entry, sessionId);
+    }, ttlMs),
+  });
 }
 
 function disposeWorkspaceSync(key: string, entry: SyncEntry) {
@@ -275,8 +577,21 @@ function disposeWorkspaceSync(key: string, entry: SyncEntry) {
     clearTimeout(entry.disposeTimer);
     entry.disposeTimer = null;
   }
-  for (const timer of entry.retainedSessionTimers.values()) clearTimeout(timer);
+  for (const { timer } of entry.retainedSessionTimers.values()) clearTimeout(timer);
   entry.retainedSessionTimers.clear();
+  entry.cancelDeltaFlush?.();
+  entry.deltaFlushLane = null;
+  entry.cancelDeltaFlush = null;
+  if (entry.statusReconcileTimer) clearTimeout(entry.statusReconcileTimer);
+  entry.statusReconcileTimer = null;
+  entry.statusReconcileAbort?.abort();
+  entry.statusReconcileAbort = null;
+  for (const controller of entry.permissionReconciles.values()) controller.abort();
+  entry.permissionReconciles.clear();
+  entry.liveSessionIds.clear();
+  entry.runActiveObservedAt.clear();
+  entry.assistantMessageCompletedAt.clear();
+  entry.gatewayUsageRuns.clear();
   entry.titleRecovery?.dispose();
   entry.dispose();
   if (syncs.get(key) === entry) syncs.delete(key);
@@ -347,24 +662,86 @@ function sortQuestions(a: PendingQuestion, b: PendingQuestion) {
   return a.receivedAt - b.receivedAt || a.id.localeCompare(b.id);
 }
 
+// Keep settlements with the owning question cache, shared by every pane/client.
+// A list already in flight must not resurrect a request after its reply event.
+const settledQuestionsKey = (workspaceId: string, sessionId: string) =>
+  [...questionKey(workspaceId, sessionId), "settled"];
+const settledPermissionsKey = (workspaceId: string, sessionId: string) =>
+  [...permissionKey(workspaceId, sessionId), "settled"];
+
+export function settlePermissionState(workspaceId: string, sessionId: string, requestId: string) {
+  const queryClient = getReactQueryClient();
+  queryClient.setQueryData<string[]>(settledPermissionsKey(workspaceId, sessionId), (current = []) =>
+    current.includes(requestId) ? current : [...current, requestId],
+  );
+  queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId), (current = []) =>
+    current.filter((permission) => permission.id !== requestId),
+  );
+  useSessionActivityStore.getState().setWaitingRequest(workspaceId, sessionId, "permission", requestId, false);
+}
+
+export function settleQuestionState(workspaceId: string, sessionId: string, requestId: string) {
+  const queryClient = getReactQueryClient();
+  queryClient.setQueryData<string[]>(settledQuestionsKey(workspaceId, sessionId), (current = []) =>
+    current.includes(requestId) ? current : [...current, requestId],
+  );
+  queryClient.setQueryData<PendingQuestion[]>(questionKey(workspaceId, sessionId), (current = []) =>
+    current.filter((question) => question.id !== requestId),
+  );
+  useSessionActivityStore.getState().setWaitingRequest(workspaceId, sessionId, "question", requestId, false);
+}
+
+/**
+ * Settle every cached question/permission whose tool call is in
+ * `terminalCallIds`. OpenCode never publishes a rejection for a request whose
+ * turn was aborted or superseded, so the terminal tool part is the only
+ * signal; settling also keeps a later list read from resurrecting it.
+ */
+function settleOrphanedInteractions(workspaceId: string, sessionId: string, terminalCallIds: ReadonlySet<string>) {
+  if (terminalCallIds.size === 0) return;
+  const queryClient = getReactQueryClient();
+  for (const question of queryClient.getQueryData<PendingQuestion[]>(questionKey(workspaceId, sessionId)) ?? []) {
+    if (isOrphanedInteraction(question.tool, terminalCallIds)) settleQuestionState(workspaceId, sessionId, question.id);
+  }
+  for (const permission of queryClient.getQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId)) ?? []) {
+    if (isOrphanedInteraction(permission.tool, terminalCallIds)) settlePermissionState(workspaceId, sessionId, permission.id);
+  }
+}
+
+function terminalTranscriptCallIds(workspaceId: string, sessionId: string) {
+  return terminalTranscriptToolCallIds(getReactQueryClient().getQueryData<UIMessage[]>(transcriptKey(workspaceId, sessionId)) ?? []);
+}
+
 export function seedPermissionState(
   workspaceId: string,
   sessionId: string,
   permissions: PermissionSeed[],
-  options: { snapshotStartedAt?: number } = {},
+  options: { snapshotStartedAt?: number; snapshotRevision?: number } = {},
 ) {
-  useSessionActivityStore.getState().replaceWaitingRequests(
-    workspaceId,
-    sessionId,
-    "permission",
-    permissions.flatMap((permission) => permission.sessionID === sessionId ? [permission.id] : []),
-  );
   const queryClient = getReactQueryClient();
   const now = Date.now();
-  queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId), (current = []) => {
+  const settled = new Set(queryClient.getQueryData<string[]>(settledPermissionsKey(workspaceId, sessionId)) ?? []);
+  const terminalCallIds = terminalTranscriptCallIds(workspaceId, sessionId);
+  for (const permission of permissions) {
+    if (!isV2PermissionRequest(permission) && isOrphanedInteraction(permission.tool, terminalCallIds)) settled.add(permission.id);
+  }
+  const changedDuringRead = options.snapshotRevision === undefined
+    || options.snapshotRevision !== (queryClient.getQueryState(permissionKey(workspaceId, sessionId))?.dataUpdateCount ?? 0);
+  const snapshotKey = [...permissionKey(workspaceId, sessionId), "snapshot-started-at"];
+  if (options.snapshotStartedAt !== undefined) {
+    if (options.snapshotStartedAt < (queryClient.getQueryData<number>(snapshotKey) ?? 0)) return;
+    queryClient.setQueryData(snapshotKey, options.snapshotStartedAt);
+    const ids = new Set(permissions.filter((permission) => permission.sessionID === sessionId).map((permission) => permission.id));
+    for (const permission of queryClient.getQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId)) ?? []) {
+      if (!ids.has(permission.id) && (!changedDuringRead || permission.receivedAt < options.snapshotStartedAt)) settled.add(permission.id);
+    }
+    queryClient.setQueryData(settledPermissionsKey(workspaceId, sessionId), [...settled]);
+  }
+  const nextPermissions = queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId), (current = []) => {
     const receivedAtById = new Map(current.map((permission) => [permission.id, permission.receivedAt]));
     const seeded = permissions.flatMap((permission) =>
-      permission.sessionID === sessionId ? [permissionWithReceivedAt(permission, receivedAtById.get(permission.id) ?? now)] : [],
+      permission.sessionID === sessionId && !settled.has(permission.id)
+        ? [permissionWithReceivedAt(permission, receivedAtById.get(permission.id) ?? now)] : [],
     );
     const seededIds = new Set(seeded.map((permission) => permission.id));
     const snapshotStartedAt = options.snapshotStartedAt;
@@ -373,12 +750,19 @@ export function seedPermissionState(
         ? current.filter(
             (permission) =>
               permission.sessionID === sessionId &&
-              permission.receivedAt > snapshotStartedAt &&
+              changedDuringRead &&
+              permission.receivedAt >= snapshotStartedAt &&
               !seededIds.has(permission.id),
           )
         : [];
     return [...seeded, ...liveAfterSnapshot].sort(sortPermissions);
   });
+  useSessionActivityStore.getState().replaceWaitingRequests(
+    workspaceId,
+    sessionId,
+    "permission",
+    (nextPermissions ?? []).map((permission) => permission.id),
+  );
 }
 
 export function seedQuestionState(
@@ -387,18 +771,18 @@ export function seedQuestionState(
   questions: QuestionRequest[],
   options: { snapshotStartedAt?: number } = {},
 ) {
-  useSessionActivityStore.getState().replaceWaitingRequests(
-    workspaceId,
-    sessionId,
-    "question",
-    questions.flatMap((question) => question.sessionID === sessionId ? [question.id] : []),
-  );
   const queryClient = getReactQueryClient();
   const now = Date.now();
-  queryClient.setQueryData<PendingQuestion[]>(questionKey(workspaceId, sessionId), (current = []) => {
+  const settled = new Set(queryClient.getQueryData<string[]>(settledQuestionsKey(workspaceId, sessionId)) ?? []);
+  const terminalCallIds = terminalTranscriptCallIds(workspaceId, sessionId);
+  for (const question of questions) {
+    if (isOrphanedInteraction(question.tool, terminalCallIds)) settled.add(question.id);
+  }
+  const nextQuestions = queryClient.setQueryData<PendingQuestion[]>(questionKey(workspaceId, sessionId), (current = []) => {
     const receivedAtById = new Map(current.map((question) => [question.id, question.receivedAt]));
     const seeded = questions.flatMap((question) =>
-      question.sessionID === sessionId ? [questionWithReceivedAt(question, receivedAtById.get(question.id) ?? now)] : [],
+      question.sessionID === sessionId && !settled.has(question.id)
+        ? [questionWithReceivedAt(question, receivedAtById.get(question.id) ?? now)] : [],
     );
     const seededIds = new Set(seeded.map((question) => question.id));
     const snapshotStartedAt = options.snapshotStartedAt;
@@ -413,6 +797,12 @@ export function seedQuestionState(
         : [];
     return [...seeded, ...liveAfterSnapshot].sort(sortQuestions);
   });
+  useSessionActivityStore.getState().replaceWaitingRequests(
+    workspaceId,
+    sessionId,
+    "question",
+    (nextQuestions ?? []).map((question) => question.id),
+  );
 }
 
 function fileProviderMetadata(part: FilePart) {
@@ -464,13 +854,7 @@ function toFileUIParts(part: FilePart): UIMessage["parts"] {
 
 function toUIPart(part: Part): UIMessage["parts"][number] | null {
   if (part.type === "text") {
-    if (part.synthetic || part.ignored) return null;
-    return {
-      type: "text",
-      text: part.text,
-      state: "done",
-      providerMetadata: { opencode: { partId: part.id } },
-    };
+    return textPartToUIPart(part);
   }
   if (part.type === "reasoning") {
     return {
@@ -502,6 +886,7 @@ function toUIPart(part: Part): UIMessage["parts"][number] | null {
 }
 
 function toUIParts(part: Part): UIMessage["parts"] {
+  if (part.type === "text" && part.synthetic) return attachmentNoteToUIParts(part);
   if (part.type === "file") return toFileUIParts(part);
   const mapped = toUIPart(part);
   if (!mapped) return [];
@@ -512,20 +897,13 @@ function toUIParts(part: Part): UIMessage["parts"] {
   return [mapped];
 }
 
-function getPartMetadataId(part: UIMessage["parts"][number]) {
-  if (part.type === "dynamic-tool") {
-    const metadata = part.callProviderMetadata?.opencode;
-    if (!metadata || typeof metadata !== "object") return null;
-    return "partId" in metadata ? (metadata as { partId?: string }).partId ?? null : null;
-  }
-  if (part.type !== "text" && part.type !== "reasoning" && part.type !== "file" && part.type !== "source-url" && part.type !== "source-document") return null;
-  const metadata = part.providerMetadata?.opencode;
-  if (!metadata || typeof metadata !== "object") return null;
-  return "partId" in metadata ? (metadata as { partId?: string }).partId ?? null : null;
-}
-
 function upsertMessage(messages: UIMessage[], next: UIMessage) {
   const index = messages.findIndex((message) => message.id === next.id);
+  if (next.metadata !== undefined) {
+    const existing = messages[index];
+    const merged = existing ? { ...existing, ...next, parts: next.parts.length > 0 ? next.parts : existing.parts } : next;
+    return upsertMessageByChronology(messages, merged);
+  }
   if (index === -1) return [...messages, next];
   return messages.map((message, messageIndex) =>
     messageIndex === index
@@ -536,28 +914,6 @@ function upsertMessage(messages: UIMessage[], next: UIMessage) {
         }
       : message,
   );
-}
-
-/**
- * When a message.part.updated or message.part.delta event arrives for a
- * messageID we haven't seen a message.updated for yet, we have to stub the
- * message so the part has somewhere to live. The stub's role used to be
- * hard-coded to "assistant", which meant that if part events beat the
- * message.updated event for a *user* turn (a common race during
- * promptAsync), that user message flashed as an assistant-styled block
- * until the real role arrived a tick later.
- *
- * Infer the stub role from the conversation instead. Chat sessions
- * alternate, so the new message is almost always the opposite role of the
- * most recent known message. If the transcript is empty the first message
- * is always the user's.
- */
-function inferStubRole(messages: UIMessage[]): UIMessage["role"] {
-  const lastMessage = messages[messages.length - 1];
-  if (!lastMessage) return "user";
-  if (lastMessage.role === "user") return "assistant";
-  if (lastMessage.role === "assistant") return "user";
-  return "assistant";
 }
 
 function upsertPart(messages: UIMessage[], messageId: string, partId: string, next: UIMessage["parts"][number]) {
@@ -575,139 +931,119 @@ function upsertPart(messages: UIMessage[], messageId: string, partId: string, ne
   });
 }
 
-function appendDelta(messages: UIMessage[], messageId: string, partId: string, delta: string, reasoning: boolean) {
-  // Fast path: locate the target message by index, only clone that message
-  // and its parts array. The previous implementation ran messages.map AND
-  // message.parts.map on every delta event, which is O(N * P) per token.
-  // For an old session with hundreds of prior messages/parts that allocated
-  // thousands of objects per token and crushed the main thread after a
-  // handful of tokens.
-  const messageIndex = messages.findIndex((message) => message.id === messageId);
-  if (messageIndex === -1) return messages;
-
-  const target = messages[messageIndex]!;
-  const lastPart = target.parts[target.parts.length - 1];
-
-  let partIndex = -1;
-  for (let i = 0; i < target.parts.length; i++) {
-    const part = target.parts[i]!;
-    const id = getPartMetadataId(part);
-    if (reasoning && part.type === "reasoning") {
-      if (id === partId || (!id && part === lastPart)) {
-        partIndex = i;
-        break;
-      }
-    } else if (!reasoning && part.type === "text") {
-      if (id === partId || (!id && part === lastPart)) {
-        partIndex = i;
-        break;
-      }
-    }
-  }
-
-  let nextParts: UIMessage["parts"];
-  if (partIndex === -1) {
-    // No existing matching part — append a fresh one so the delta is not lost.
-    const newPart: UIMessage["parts"][number] = reasoning
-      ? {
-          type: "reasoning",
-          text: delta,
-          state: "streaming" as const,
-          providerMetadata: { opencode: { partId } },
-        }
-      : {
-          type: "text",
-          text: delta,
-          state: "streaming" as const,
-          providerMetadata: { opencode: { partId } },
-        };
-    nextParts = target.parts.slice();
-    nextParts.push(newPart);
-  } else {
-    const existing = target.parts[partIndex]!;
-    nextParts = target.parts.slice();
-    if (existing.type === "text") {
-      nextParts[partIndex] = {
-        ...existing,
-        text: `${existing.text}${delta}`,
-        state: "streaming",
-      };
-    } else if (existing.type === "reasoning") {
-      nextParts[partIndex] = {
-        ...existing,
-        text: `${existing.text}${delta}`,
-        state: "streaming",
-      };
-    }
-  }
-
-  const nextMessages = messages.slice();
-  nextMessages[messageIndex] = { ...target, parts: nextParts };
-  return nextMessages;
-}
-
-export function coalescePendingDeltas(items: PendingDelta[]) {
-  if (items.length < 2) return items;
-
-  const ordered: PendingDelta[] = [];
-  const byKey = new Map<string, PendingDelta>();
-  for (const item of items) {
-    const key = `${item.sessionId}\u0000${item.messageId}\u0000${item.partId}`;
-    const existing = byKey.get(key);
-    if (existing) {
-      existing.delta += item.delta;
-      existing.reasoning = existing.reasoning || item.reasoning;
-      continue;
-    }
-
-    const next = { ...item };
-    byKey.set(key, next);
-    ordered.push(next);
-  }
-  return ordered;
-}
-
 function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent) {
+  observeModelsTaskEvent(workspaceId, event);
   const queryClient = getReactQueryClient();
   const input = entry.input;
+
+  // Native durable sequence numbers order lifecycle edges across successor
+  // executions. A replayed terminal must never settle a newer run.
+  if (event.type.startsWith("session.execution.") || event.type === "session.status") {
+    const props = event.properties;
+    const sessionId = sessionIdFromProperties(props);
+    const sequence = props && typeof props === "object" && "sequence" in props ? props.sequence : undefined;
+    if (sessionId && typeof sequence === "number") {
+      if (sequence <= (entry.nativeSequenceBySession.get(sessionId)?.sequence ?? -1)) return;
+      entry.nativeSequenceBySession.set(sessionId, { sequence, revision: ++entry.nativeSequenceRevision });
+    }
+  }
+
+  if (event.type.startsWith("session.execution.")) {
+    const sessionId = sessionIdFromProperties(event.properties);
+    if (!sessionId) return;
+    if (event.type === "session.execution.started") {
+      entry.nativeTerminalSessions.delete(sessionId);
+      applySessionRunStatus(entry, workspaceId, sessionId, { type: "busy" });
+      const usageRun = entry.gatewayUsageRuns.get(sessionId);
+      if (usageRun) usageRun.providerId = gatewayUsageProviderId(event.properties);
+    } else if (event.type === "session.execution.progress") {
+      clearSessionRetry(entry, workspaceId, sessionId);
+    } else if (event.type === "session.execution.failed") {
+      entry.nativeTerminalSessions.add(sessionId);
+      applyEvent(entry, workspaceId, { type: "session.error", properties: event.properties });
+      void reconcileSessionPermissions(entry, sessionId);
+    } else if (event.type === "session.execution.succeeded") {
+      entry.nativeTerminalSessions.add(sessionId);
+      applySessionRunStatus(entry, workspaceId, sessionId, idleStatus, { completed: true, terminalEvent: true });
+    } else if (event.type === "session.execution.interrupted") {
+      const props = event.properties;
+      const reason = props && typeof props === "object" && "reason" in props ? props.reason : undefined;
+      if (reason === "user") {
+        entry.nativeTerminalSessions.add(sessionId);
+        applySessionRunStatus(entry, workspaceId, sessionId, idleStatus, { completed: false, terminalEvent: true });
+      } else {
+        // Shutdown retains durable intent; supersession may already have a
+        // successor. Reconcile ownership rather than manufacturing an idle edge.
+        clearSessionRetry(entry, workspaceId, sessionId);
+        entry.liveSessionIds.add(sessionId);
+        scheduleActiveSessionStatusReconciliation(entry);
+        void reconcileSessionPermissions(entry, sessionId);
+      }
+    }
+    return;
+  }
 
   if (event.type === "session.created") {
     const session = getSessionCreatedInfo(event);
     if (!session) return;
-    for (const listener of entry.sessionCreatedListeners) listener(session);
+    for (const listener of entry.sessionCreatedListeners.keys()) listener(session);
     return;
   }
 
   if (event.type === "session.updated") {
     const update = getSessionUpdatedInfo(event);
     if (!update) return;
+    // Sidebar metadata updates must not depend on transcript tracking.
+    for (const listener of entry.sessionUpdatedListeners.keys()) listener(update);
     const title = typeof update.info.title === "string" ? update.info.title : "";
     if (title && !isGeneratedSessionTitle(title)) entry.titleRecovery?.resolve(update.sessionId);
     if (!isTrackedSession(entry, update.sessionId)) return;
+    const revert = (update.info as { revert?: OpenworkSessionSnapshot["session"]["revert"] }).revert;
+    queryClient.setQueryData(sessionMetadataKey(input, update.sessionId), { revert });
     // Keep the cached snapshot's revert cursor in sync with the server. The
     // renderer derives the visible transcript from this cursor, so a revert
     // (or its cleanup on the next prompt) must reach the snapshot cache or
     // the transcript stays frozen on stale history.
-    queryClient.setQueryData<OpenworkSessionSnapshot>(
+    queryClient.setQueryData<OpenworkSessionHistory>(
       snapshotKey(workspaceId, update.sessionId),
       (current) => {
         if (!current) return current;
-        const revert = (update.info as { revert?: OpenworkSessionSnapshot["session"]["revert"] }).revert;
         return { ...current, session: { ...current.session, revert } };
       },
     );
-    for (const listener of entry.sessionUpdatedListeners) listener(update);
     return;
   }
 
   if (event.type === "session.deleted") {
     const props = (event.properties ?? {}) as { sessionID?: string; info?: { id?: string } };
     const sessionId = props.sessionID ?? props.info?.id ?? "";
-    if (sessionId) entry.titleRecovery?.resolve(sessionId);
-    if (sessionId) useSessionActivityStore.getState().removeSession(workspaceId, sessionId);
-    if (sessionId) {
-      for (const listener of entry.sessionDeletedListeners) listener(sessionId);
+    if (!sessionId) return;
+    entry.permissionReconciles.get(sessionId)?.abort();
+    entry.permissionReconciles.delete(sessionId);
+    // Deletion settles known interactions, but their watermarks must outlive
+    // the pending caches so delayed snapshots/events cannot revive them.
+    const record = useSessionActivityStore.getState().recordsByWorkspaceId[workspaceId]?.[sessionId];
+    for (const requestId of new Set([
+      ...(record?.waitingPermissionIds ?? []),
+      ...(queryClient.getQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId)) ?? []).map((request) => request.id),
+    ])) {
+      settlePermissionState(workspaceId, sessionId, requestId);
     }
+    for (const requestId of new Set([
+      ...(record?.waitingQuestionIds ?? []),
+      ...(queryClient.getQueryData<PendingQuestion[]>(questionKey(workspaceId, sessionId)) ?? []).map((request) => request.id),
+    ])) {
+      settleQuestionState(workspaceId, sessionId, requestId);
+    }
+    queryClient.removeQueries({ queryKey: permissionKey(workspaceId, sessionId), exact: true });
+    queryClient.removeQueries({ queryKey: questionKey(workspaceId, sessionId), exact: true });
+    void closeSessionBrowserTabs(sessionId);
+    entry.titleRecovery?.resolve(sessionId);
+    useSessionActivityStore.getState().removeSession(workspaceId, sessionId);
+    useWorkbenchStore.getState().closeTab({ workspaceId, sessionId });
+    stopTrackingLiveSession(entry, sessionId);
+    for (const listener of entry.sessionDeletedListeners.keys()) listener(sessionId);
+    clearTrackedSession(input, entry, sessionId);
     return;
   }
 
@@ -716,6 +1052,7 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
     if (sessionId) {
       const sessionError = sessionErrorFromProperties(event.properties);
       const errorPresentation = presentOpencodeSessionError(sessionError);
+      if (errorPresentation.gatewayUsage) void queryClient.invalidateQueries({ queryKey: gatewayUsageQueryPrefix });
       const errorText = describeOpencodeSessionError(sessionError);
       const runStartedAt = takeTaskRunStart(sessionId);
       if (runStartedAt !== null) {
@@ -726,7 +1063,16 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
       }
       notifyDesktopEvent({ type: "task.failed", sessionId, errorText });
       useSessionActivityStore.getState().setError(workspaceId, sessionId, errorText);
+      stopTrackingLiveSession(entry, sessionId);
       if (isTrackedSession(entry, sessionId)) {
+        flushSessionDeltas(entry, workspaceId, sessionId);
+        void refreshSessionTodos(workspaceId, sessionId);
+        // The activity store treats session.error as terminal (setError
+        // lowers runActive), but the chat surface derives its thread status
+        // from this react-query cache. An engine that errors without a
+        // following idle event otherwise leaves the transcript's "Working…"
+        // row ticking forever beside the error card. Mirror the idle write.
+        queryClient.setQueryData(statusKey(workspaceId, sessionId), idleStatus);
         queryClient.setQueryData<UIMessage[]>(transcriptKey(workspaceId, sessionId), (current = []) => {
           // Key the error to the latest assistant turn so it lands beside the
           // turn that failed and a later turn's error becomes its own message
@@ -748,6 +1094,10 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
           exact: true,
         });
       }
+      // An errored run is over: give status listeners (like the queued-send
+      // drainer) the same idle edge session.idle would have delivered, so
+      // queued messages are not wedged behind a run that will never finish.
+      for (const listener of entry.sessionStatusListeners.keys()) listener({ sessionId, status: idleStatus });
     }
     return;
   }
@@ -767,11 +1117,7 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
   if (event.type === "session.status") {
     const props = (event.properties ?? {}) as { sessionID?: string; status?: SessionStatus };
     if (!props.sessionID || !props.status) return;
-    useSessionActivityStore.getState().setRunStatus(workspaceId, props.sessionID, props.status);
-    const tracked = isTrackedSession(entry, props.sessionID);
-    if (tracked) queryClient.setQueryData(statusKey(workspaceId, props.sessionID), props.status);
-    for (const listener of entry.sessionStatusListeners) listener({ sessionId: props.sessionID, status: props.status });
-    if (input && tracked && !isLiveStatus(props.status)) releaseRetainedSessionSoon(input, entry, props.sessionID);
+    applySessionRunStatus(entry, workspaceId, props.sessionID, props.status, { source: "stream" });
     return;
   }
 
@@ -786,13 +1132,13 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
   if (event.type === "permission.asked") {
     const permission = event.properties as PermissionRequest;
     if (!permission?.id || !permission.sessionID) return;
+    if (queryClient.getQueryData<string[]>(settledPermissionsKey(workspaceId, permission.sessionID))?.includes(permission.id)) return;
     notifyDesktopEvent({
       type: "permission.asked",
       sessionId: permission.sessionID,
       detail: permissionNotificationDetail(permission),
     });
     useSessionActivityStore.getState().setWaitingRequest(workspaceId, permission.sessionID, "permission", permission.id, true);
-    if (!isTrackedSession(entry, permission.sessionID)) return;
     const receivedAt = Date.now();
     queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, permission.sessionID), (current = []) => {
       const existing = current.find((item) => item.id === permission.id);
@@ -808,13 +1154,13 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
   if (event.type === "permission.v2.asked") {
     const permission = event.properties as PermissionV2Request;
     if (!permission?.id || !permission.sessionID) return;
+    if (queryClient.getQueryData<string[]>(settledPermissionsKey(workspaceId, permission.sessionID))?.includes(permission.id)) return;
     notifyDesktopEvent({
       type: "permission.asked",
       sessionId: permission.sessionID,
       detail: permissionNotificationDetail(permission),
     });
     useSessionActivityStore.getState().setWaitingRequest(workspaceId, permission.sessionID, "permission", permission.id, true);
-    if (!isTrackedSession(entry, permission.sessionID)) return;
     const receivedAt = Date.now();
     queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, permission.sessionID), (current = []) => {
       const existing = current.find((item) => item.id === permission.id);
@@ -830,24 +1176,20 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
   if (event.type === "permission.replied" || event.type === "permission.v2.replied") {
     const props = (event.properties ?? {}) as { sessionID?: string; requestID?: string };
     if (!props.sessionID || !props.requestID) return;
-    useSessionActivityStore.getState().setWaitingRequest(workspaceId, props.sessionID, "permission", props.requestID, false);
-    if (!isTrackedSession(entry, props.sessionID)) return;
-    queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, props.sessionID), (current = []) =>
-      current.filter((permission) => permission.id !== props.requestID),
-    );
+    settlePermissionState(workspaceId, props.sessionID, props.requestID);
     return;
   }
 
   if (event.type === "question.asked") {
     const question = event.properties as QuestionRequest;
     if (!question?.id || !question.sessionID) return;
+    if (queryClient.getQueryData<string[]>(settledQuestionsKey(workspaceId, question.sessionID))?.includes(question.id)) return;
     notifyDesktopEvent({
       type: "question.asked",
       sessionId: question.sessionID,
       question: questionNotificationText(question),
     });
     useSessionActivityStore.getState().setWaitingRequest(workspaceId, question.sessionID, "question", question.id, true);
-    if (!isTrackedSession(entry, question.sessionID)) return;
     const receivedAt = Date.now();
     queryClient.setQueryData<PendingQuestion[]>(questionKey(workspaceId, question.sessionID), (current = []) => {
       const existing = current.find((item) => item.id === question.id);
@@ -863,37 +1205,74 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
   if (event.type === "question.replied" || event.type === "question.rejected") {
     const props = (event.properties ?? {}) as { sessionID?: string; requestID?: string };
     if (!props.sessionID || !props.requestID) return;
-    useSessionActivityStore.getState().setWaitingRequest(workspaceId, props.sessionID, "question", props.requestID, false);
-    if (!isTrackedSession(entry, props.sessionID)) return;
-    queryClient.setQueryData<PendingQuestion[]>(questionKey(workspaceId, props.sessionID), (current = []) =>
-      current.filter((question) => question.id !== props.requestID),
-    );
+    settleQuestionState(workspaceId, props.sessionID, props.requestID);
     return;
   }
 
   if (event.type === "message.updated") {
     const props = (event.properties ?? {}) as {
-      info?: { id?: string; role?: UIMessage["role"] | string; sessionID?: string; time?: { created?: number; completed?: number } };
+      info?: { id?: string; role?: UIMessage["role"] | string; sessionID?: string; parentID?: string; time?: { created?: number; completed?: number } };
     };
     const info = props.info;
     if (!info?.id || !info.sessionID || (info.role !== "user" && info.role !== "assistant" && info.role !== "system")) {
       return;
     }
+    const usageRun = entry.gatewayUsageRuns.get(info.sessionID);
+    if (usageRun && info.role === "assistant") usageRun.providerId = gatewayUsageProviderId(info) ?? usageRun.providerId;
     useSessionActivityStore.getState().markMessageRole(workspaceId, info.sessionID, info.id, info.role);
+    if (info.role === "assistant" && typeof info.time?.completed === "number") {
+      const observedAt = perfNow();
+      entry.assistantMessageCompletedAt.set(info.sessionID, observedAt);
+      const runActiveAt = entry.runActiveObservedAt.get(info.sessionID);
+      recordSessionCompletionMark("assistant-message-completed", {
+        sessionID: info.sessionID,
+        ...(runActiveAt === undefined
+          ? {}
+          : { sinceRunActiveMs: Math.round((observedAt - runActiveAt) * 100) / 100 }),
+      });
+    }
     if (!isTrackedSession(entry, info.sessionID)) return;
     const created = info.time?.created;
     const completed = info.time?.completed;
     const next = {
       id: info.id,
       role: info.role,
-      ...(typeof created === "number"
-        ? { metadata: { opencode: { created, ...(typeof completed === "number" ? { completed } : {}) } } }
+      ...(typeof created === "number" || typeof info.parentID === "string"
+        ? { metadata: { opencode: { ...(typeof created === "number" ? { created } : {}), ...(typeof completed === "number" ? { completed } : {}), ...(typeof info.parentID === "string" ? { parentID: info.parentID } : {}) } } }
         : {}),
       parts: [],
     } satisfies UIMessage;
     queryClient.setQueryData<UIMessage[]>(transcriptKey(workspaceId, info.sessionID), (current = []) =>
       upsertMessage(current, next),
     );
+    useSessionActivityStore.getState().observeTranscript(workspaceId, info.sessionID,
+      queryClient.getQueryData<UIMessage[]>(transcriptKey(workspaceId, info.sessionID)) ?? []);
+    return;
+  }
+
+  if (event.type === "session.history.truncated") {
+    const props = event.properties;
+    if (!props || typeof props !== "object" || !("sessionID" in props) || !("messageID" in props)
+      || typeof props.sessionID !== "string" || typeof props.messageID !== "string") return;
+    const { sessionID, messageID } = props;
+    if (!isTrackedSession(entry, sessionID)) return;
+    const fullKey = snapshotKey(workspaceId, sessionID);
+    const latestKey = ["react-session-latest", ...fullKey];
+    void queryClient.cancelQueries({ queryKey: latestKey });
+    void queryClient.cancelQueries({ queryKey: fullKey, exact: true });
+    // Native revert commit permanently deletes this suffix. Ordinary snapshot
+    // merges deliberately preserve cached messages, so clear every history
+    // cache before removing the temporary revert cursor.
+    queryClient.setQueriesData<LatestSessionHistory>({ queryKey: latestKey }, current => current ? {
+      messages: applyRevertCursor(current.messages, messageID),
+      source: applyRevertCursor(current.source, messageID),
+    } : current);
+    queryClient.setQueryData<UIMessage[]>(transcriptKey(workspaceId, sessionID), (current = []) => applyRevertCursor(current, messageID));
+    queryClient.setQueryData<OpenworkSessionHistory>(fullKey, current => {
+      if (!current) return current;
+      const boundary = current.messages.findIndex(message => message.info.id === messageID);
+      return boundary < 0 ? current : { ...current, messages: current.messages.slice(0, boundary) };
+    });
     return;
   }
 
@@ -904,10 +1283,19 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
     const props = (event.properties ?? {}) as { sessionID?: string; messageID?: string };
     if (!props.sessionID || !props.messageID) return;
     if (!isTrackedSession(entry, props.sessionID)) return;
+    const fullKey = snapshotKey(workspaceId, props.sessionID);
+    const latestKey = ["react-session-latest", ...fullKey];
+    void queryClient.cancelQueries({ queryKey: latestKey });
+    void queryClient.cancelQueries({ queryKey: fullKey, exact: true });
+    const keep = (message: UIMessage) => message.id !== props.messageID
+      && message.id !== `${SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX}${props.messageID}`;
+    queryClient.setQueriesData<LatestSessionHistory>({ queryKey: latestKey }, (current) => current ? {
+      messages: current.messages.filter(keep), source: current.source.filter(keep),
+    } : current);
     queryClient.setQueryData<UIMessage[]>(transcriptKey(workspaceId, props.sessionID), (current = []) =>
-      current.filter((message) => message.id !== props.messageID),
+      current.filter(keep),
     );
-    queryClient.setQueryData<OpenworkSessionSnapshot>(
+    queryClient.setQueryData<OpenworkSessionHistory>(
       snapshotKey(workspaceId, props.sessionID),
       (current) => {
         if (!current) return current;
@@ -922,12 +1310,15 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
     const part = props.part;
     if (!part?.sessionID || !part.messageID) return;
     if (partHasVisibleAssistantOutput(part)) {
+      clearSessionRetry(entry, workspaceId, part.sessionID);
       useSessionActivityStore.getState().markAssistantOutput(workspaceId, part.sessionID, part.messageID);
     }
+    if (isTerminalToolPart(part)) settleOrphanedInteractions(workspaceId, part.sessionID, new Set([part.callID]));
     if (!isTrackedSession(entry, part.sessionID)) return;
     const [mapped, ...attachments] = toUIParts(part);
     if (!mapped) return;
-    const pending = entry.pendingDeltas.get(part.id);
+    const pendingKey = JSON.stringify([part.sessionID, part.messageID, part.id]);
+    const pending = entry.pendingDeltas.get(pendingKey);
     // Seed the new part with any deltas that arrived before this
     // declaration. We deliberately ignore `pending.reasoning` — it
     // can't be trusted because opencode emits `field: "text"` for
@@ -953,7 +1344,7 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
     // cumulative text we just wrote, duplicating bytes mid-stream.
     if (entry.deltaFlushBuffer.length > 0) {
       entry.deltaFlushBuffer = entry.deltaFlushBuffer.filter(
-        (item) => item.partId !== part.id,
+        (item) => item.sessionId !== part.sessionID || item.messageId !== part.messageID || item.partId !== part.id,
       );
     }
     queryClient.setQueryData<UIMessage[]>(transcriptKey(workspaceId, part.sessionID), (current = []) => {
@@ -973,7 +1364,9 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
       }
       return next;
     });
-    if (pending) entry.pendingDeltas.delete(part.id);
+    if (pending) entry.pendingDeltas.delete(pendingKey);
+    useSessionActivityStore.getState().observeTranscript(workspaceId, part.sessionID,
+      queryClient.getQueryData<UIMessage[]>(transcriptKey(workspaceId, part.sessionID)) ?? []);
     return;
   }
 
@@ -986,6 +1379,7 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
       delta?: string;
     };
     if (!props.sessionID || !props.messageID || !props.partID || !props.delta) return;
+    clearSessionRetry(entry, workspaceId, props.sessionID);
     useSessionActivityStore.getState().markAssistantOutput(workspaceId, props.sessionID, props.messageID, { allowUnknownMessageRole: true });
     if (!isTrackedSession(entry, props.sessionID)) return;
     // Note: we do NOT trust `props.field` to disambiguate reasoning vs
@@ -1008,65 +1402,63 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
   if (event.type === "session.idle") {
     const props = (event.properties ?? {}) as { sessionID?: string };
     if (!props.sessionID) return;
-    // Only emits for runs this client instrumented (markTaskRunStart in the
-    // send path); also dedupes idle events from multiple workspace syncs.
-    const runStartedAt = takeTaskRunStart(props.sessionID);
-    if (runStartedAt !== null) {
-      captureAnalyticsEvent("task_run_completed", {
-        duration_ms: Date.now() - runStartedAt,
-      });
-      trackTaskCompleted(props.sessionID, Date.now() - runStartedAt);
-      notifyDesktopEvent({ type: "task.completed", sessionId: props.sessionID });
-      entry.titleRecovery?.observe(props.sessionID);
-    }
-    useSessionActivityStore.getState().setRunStatus(workspaceId, props.sessionID, idleStatus);
-    const tracked = isTrackedSession(entry, props.sessionID);
-    if (tracked) {
-      queryClient.setQueryData(statusKey(workspaceId, props.sessionID), idleStatus);
-      // A fast tool can complete and persist before its final part.updated SSE
-      // reaches the renderer. Reconcile successful turns from the durable
-      // snapshot just as failed turns do, so standard MCP App results mount
-      // without requiring an artificial provider delay or a page reload.
-      void queryClient.invalidateQueries({
-        queryKey: snapshotKey(workspaceId, props.sessionID),
-        exact: true,
-      });
-    }
-    for (const listener of entry.sessionStatusListeners) listener({ sessionId: props.sessionID, status: idleStatus });
-    if (input && tracked) releaseRetainedSessionSoon(input, entry, props.sessionID);
+    applySessionRunStatus(entry, workspaceId, props.sessionID, idleStatus, {
+      source: "stream",
+      terminalEvent: true,
+    });
   }
 }
 
 function scheduleDeltaFlush(entry: SyncEntry, workspaceId: string) {
-  if (entry.deltaFlushScheduled) return;
-  entry.deltaFlushScheduled = true;
-  const run = () => {
-    entry.deltaFlushScheduled = false;
-    if (entry.deltaFlushBuffer.length === 0) return;
-    flushDeltas(entry, workspaceId);
-  };
-  if (
-    typeof window !== "undefined" &&
-    typeof window.requestAnimationFrame === "function" &&
-    (typeof document === "undefined" || document.visibilityState === "visible")
-  ) {
-    window.requestAnimationFrame(run);
-  } else if (typeof window !== "undefined") {
-    window.setTimeout(run, 50);
-  } else {
-    queueMicrotask(run);
-  }
+  if (entry.deltaFlushBuffer.length === 0) return;
+  const lane = selectDeltaFlushLane(entry.deltaFlushBuffer, entry.input.visibleSessionId);
+  if (entry.deltaFlushLane === lane || entry.deltaFlushLane === "foreground") return;
+
+  entry.cancelDeltaFlush?.();
+  entry.deltaFlushLane = lane;
+  entry.cancelDeltaFlush = deltaFlushScheduler(lane, () => {
+    if (entry.deltaFlushLane !== lane) return;
+    entry.deltaFlushLane = null;
+    entry.cancelDeltaFlush = null;
+    flushDeltas(entry, workspaceId, lane);
+    scheduleDeltaFlush(entry, workspaceId);
+  });
 }
 
-function flushDeltas(entry: SyncEntry, workspaceId: string) {
-  const queryClient = getReactQueryClient();
+function flushDeltas(entry: SyncEntry, workspaceId: string, lane: DeltaFlushLane) {
   const pending = coalescePendingDeltas(entry.deltaFlushBuffer);
-  entry.deltaFlushBuffer = [];
+  const { flushing, deferred } = partitionPendingDeltasByLane(
+    pending,
+    entry.input.visibleSessionId,
+    lane,
+  );
+  entry.deltaFlushBuffer = deferred;
+  commitDeltas(entry, workspaceId, flushing);
+}
+
+function flushSessionDeltas(entry: SyncEntry, workspaceId: string, sessionId: string) {
+  const { flushing, deferred } = partitionPendingDeltasBySession(
+    entry.deltaFlushBuffer,
+    sessionId,
+  );
+  if (flushing.length === 0) return;
+
+  entry.deltaFlushBuffer = deferred;
+  if (deferred.length === 0) {
+    entry.cancelDeltaFlush?.();
+    entry.deltaFlushLane = null;
+    entry.cancelDeltaFlush = null;
+  }
+  commitDeltas(entry, workspaceId, coalescePendingDeltas(flushing));
+}
+
+function commitDeltas(entry: SyncEntry, workspaceId: string, items: PendingDelta[]) {
+  const queryClient = getReactQueryClient();
 
   // Group by session id so each transcript cache is touched at most once
   // per flush.
   const bySession = new Map<string, PendingDelta[]>();
-  for (const item of pending) {
+  for (const item of items) {
     const bucket = bySession.get(item.sessionId);
     if (bucket) bucket.push(item);
     else bySession.set(item.sessionId, [item]);
@@ -1076,189 +1468,418 @@ function flushDeltas(entry: SyncEntry, workspaceId: string) {
     queryClient.setQueryData<UIMessage[]>(
       transcriptKey(workspaceId, sessionId),
       (current = []) => {
-        let next = current;
-        const nextById = new Map(next.map((message) => [message.id, message]));
-        // Track which message shells we've ensured exist this flush so we
-        // don't call upsertMessage for the same message on every delta.
-        const ensuredMessageIds = new Set<string>();
-        for (const item of items) {
-          if (!ensuredMessageIds.has(item.messageId)) {
-            // Preserve the existing role if the message is already in
-            // state; otherwise infer it from the alternation pattern
-            // so the brief "stub before message.updated" window doesn't
-            // mislabel the message's bubble style.
-            const existing = nextById.get(item.messageId);
-            const role = existing?.role ?? inferStubRole(next);
-            const ensuredMessage = { id: item.messageId, role, parts: existing?.parts ?? [] };
-            next = upsertMessage(next, ensuredMessage);
-            nextById.set(item.messageId, ensuredMessage);
-            ensuredMessageIds.add(item.messageId);
-          }
-          // Resolve the part kind from the transcript instead of trusting
-          // the inbound delta event (opencode emits `field: "text"` for
-          // both text and reasoning parts). If the part hasn't been
-          // declared yet via `message.part.updated`, defer the delta into
-          // `entry.pendingDeltas` so the part can be created with the
-          // correct kind later. Without this, every delta lands as a text
-          // part — and reasoning content leaks into the response markdown
-          // until the next reload reconstructs the transcript from the
-          // snapshot.
-          const ownerMessage = nextById.get(item.messageId);
-          const ownerPartsById = new Map(
-            (ownerMessage?.parts ?? []).flatMap((part) => {
-              const id = part.type === "dynamic-tool" ? part.toolCallId : getPartMetadataId(part);
-              return id ? [[id, part] as const] : [];
-            }),
-          );
-          const ownerPart = ownerPartsById.get(item.partId);
-
-          if (!ownerPart) {
-            const existing = entry.pendingDeltas.get(item.partId) ?? {
-              messageId: item.messageId,
-              reasoning: item.reasoning,
-              text: "",
-            };
-            existing.text += item.delta;
-            entry.pendingDeltas.set(item.partId, existing);
-            continue;
-          }
-
-          const reasoning = ownerPart.type === "reasoning";
-          next = appendDelta(next, item.messageId, item.partId, item.delta, reasoning);
+        const result = applyPendingDeltasToTranscript(current, items);
+        for (const item of result.unapplied) {
+          // The declaration event is the source of truth for text versus
+          // reasoning. Hold early deltas until that event arrives instead of
+          // projecting them into the wrong Markdown surface.
+          const pendingKey = JSON.stringify([sessionId, item.messageId, item.partId]);
+          const existing = entry.pendingDeltas.get(pendingKey) ?? {
+            sessionId,
+            messageId: item.messageId,
+            reasoning: item.reasoning,
+            text: "",
+          };
+          existing.text += item.delta;
+          entry.pendingDeltas.set(pendingKey, existing);
         }
-        return next;
+        return result.messages;
       },
     );
+    useSessionActivityStore.getState().observeTranscript(workspaceId, sessionId,
+      queryClient.getQueryData<UIMessage[]>(transcriptKey(workspaceId, sessionId)) ?? []);
   }
 }
 
 function startSync(input: SyncOptions, entry: SyncEntry) {
-  const controller = new AbortController();
-  let disposed = false;
-  let retryTimer: ReturnType<typeof setTimeout> | null = null;
-  let watchdogTimer: ReturnType<typeof setInterval> | null = null;
-  let activeConnectionController: AbortController | null = null;
-  let lastEventAt = Date.now();
-  let retryDelayMs = 1_000;
-  const staleStreamMs = 30_000;
-
-  const scheduleRetry = () => {
-    if (disposed || controller.signal.aborted || retryTimer) return;
-    activeConnectionController = null;
-    retryTimer = setTimeout(() => {
-      retryTimer = null;
-      void connect();
-    }, retryDelayMs);
-    retryDelayMs = Math.min(retryDelayMs * 2, 10_000);
-  };
-
-  const connect = async () => {
-    const connectionController = new AbortController();
-    activeConnectionController = connectionController;
-    try {
-      const stream = await syncSubscriptionFactory(input.baseUrl, entry.openworkToken, connectionController.signal);
-      retryDelayMs = 1_000;
-      lastEventAt = Date.now();
-      void reconcileSessionRunStatuses(entry, input, connectionController.signal);
-      for await (const raw of stream) {
-        if (controller.signal.aborted || connectionController.signal.aborted) return;
-        lastEventAt = Date.now();
-        const event = normalizeEvent(raw);
-        if (!event) continue;
-        applyEvent(entry, input.workspaceId, event);
-      }
-      if (!controller.signal.aborted && activeConnectionController === connectionController) scheduleRetry();
-    } catch (error) {
-      if (
-        !controller.signal.aborted &&
-        (connectionController.signal.aborted || shouldRetrySyncSubscribe(error))
-      ) {
-        scheduleRetry();
-      }
-    } finally {
-      if (activeConnectionController === connectionController) activeConnectionController = null;
-    }
-  };
-
-  void connect();
-  watchdogTimer = setInterval(() => {
-    if (disposed || controller.signal.aborted || retryTimer) return;
-    const active = activeConnectionController;
-    if (!active || active.signal.aborted) return;
-    if (Date.now() - lastEventAt < staleStreamMs) return;
-    active.abort();
-    scheduleRetry();
-  }, 10_000);
+  const streamKey = syncKey(input);
+  const lifecycle = startSyncStreamLifecycle({
+    // Read the token at connect time so every retry — including a
+    // generation-triggered restart — uses the latest credential.
+    subscribe: (signal) => syncSubscriptionFactory(input.baseUrl, entry.openworkToken, signal),
+    onEvent: (raw) => {
+      const event = normalizeEvent(raw);
+      if (!event) return;
+      applyEvent(entry, input.workspaceId, event);
+    },
+    // Level-reconcile run statuses on every (re)connect before trusting any
+    // cached idle: the server may have started or finished work while the
+    // stream was down.
+    onConnected: (signal) => {
+      void reconcileSessionRunStatuses(entry, input, signal, "connect-reconcile");
+    },
+    onPhaseChange: (phase) => {
+      useWorkspaceSyncStreamStore.getState().publishPhase(streamKey, phase);
+    },
+    isAuthError: isAuthBlockedSubscribeError,
+  });
+  entry.notifyStreamGenerationChanged = lifecycle.notifyGenerationChanged;
 
   return () => {
-    disposed = true;
-    if (retryTimer) clearTimeout(retryTimer);
-    if (watchdogTimer) clearInterval(watchdogTimer);
-    activeConnectionController?.abort();
-    controller.abort();
+    entry.notifyStreamGenerationChanged = null;
+    lifecycle.dispose();
+    useWorkspaceSyncStreamStore.getState().removePhase(streamKey);
   };
 }
 
-async function reconcileSessionRunStatuses(entry: SyncEntry, input: SyncOptions, signal: AbortSignal) {
+/**
+ * Apply a session run status through the same path a live `session.status`
+ * event takes: the activity store, the react-query status cache for tracked
+ * sessions, and the sync listeners. Fetched (level-triggered) statuses pass
+ * `snapshotStartedAt` so they are ordered against live writes — a fetch that
+ * raced a newer SSE status is dropped instead of clobbering it.
+ */
+function applySessionRunStatus(
+  entry: SyncEntry,
+  workspaceId: string,
+  sessionId: string,
+  status: SessionStatus,
+  options: {
+    snapshotStartedAt?: number;
+    source?: SessionStatusSource;
+    terminalEvent?: boolean;
+    completed?: boolean;
+  } = {},
+) {
+  const snapshotStartedAt = options.snapshotStartedAt;
+  const store = useSessionActivityStore.getState();
+  const previousRecord = store.recordsByWorkspaceId[workspaceId]?.[sessionId];
+  const v2 = isOpencodeV2BaseUrl(entry.input.baseUrl);
+  // /active only says running. Preserve the richer stream retry across polls
+  // from independent clients until actual execution progress or a terminal.
+  if (v2 && snapshotStartedAt !== undefined && status.type === "busy") {
+    if (entry.nativeTerminalSessions.has(sessionId)) {
+      if (options.source !== "connect-reconcile") return;
+      entry.nativeTerminalSessions.delete(sessionId);
+    }
+    const current = getReactQueryClient().getQueryData<SessionStatus>(statusKey(workspaceId, sessionId));
+    if (current?.type === "retry") status = current;
+  }
+  const wasTrackedLive = entry.liveSessionIds.has(sessionId);
+  const wasLive = wasTrackedLive || previousRecord?.runActive === true;
+  if (typeof snapshotStartedAt === "number") {
+    if (snapshotStartedAt < (previousRecord?.runStatusAt ?? 0)) return;
+    store.seedSessionRun(workspaceId, sessionId, status, undefined, { snapshotStartedAt });
+  } else {
+    store.setRunStatus(workspaceId, sessionId, status);
+  }
+
+  const live = isLiveStatus(status);
+  if (live && (!wasLive || !entry.gatewayUsageRuns.has(sessionId))) {
+    entry.gatewayUsageRuns.set(sessionId, newGatewayUsageRun(`${workspaceId}:${sessionId}:run:${++gatewayUsageRunSequence}`));
+  }
+  if (v2 && !live) {
+    store.replaceWaitingRequests(workspaceId, sessionId, "permission",
+      (getReactQueryClient().getQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId)) ?? []).map((permission) => permission.id));
+  }
+  const observedAt = perfNow();
+  if (live) {
+    trackLiveSession(entry, sessionId, status, options.source ?? "stream");
+  } else {
+    entry.liveSessionIds.delete(sessionId);
+    clearActiveSessionStatusReconcileTimer(entry);
+  }
+
+  const tracked = isTrackedSession(entry, sessionId);
+  if (tracked || v2) getReactQueryClient().setQueryData(statusKey(workspaceId, sessionId), status);
+  if (!live) {
+    // A level-triggered idle response is as authoritative as the SSE edge.
+    // Converge through the same terminal path so a missed status event also
+    // flushes final deltas and refreshes any final persisted message parts.
+    const runStartedAt = takeTaskRunStart(sessionId);
+    if (runStartedAt !== null && (options.completed ?? !v2)) {
+      captureAnalyticsEvent("task_run_completed", {
+        duration_ms: Date.now() - runStartedAt,
+      });
+      trackTaskCompleted(sessionId, Date.now() - runStartedAt);
+      notifyDesktopEvent({ type: "task.completed", sessionId });
+      entry.titleRecovery?.observe(sessionId);
+    }
+    const shouldRecordTerminal = wasLive || runStartedAt !== null;
+    const shouldConvergeTerminal = shouldRecordTerminal || options.terminalEvent === true;
+    if (shouldConvergeTerminal && (options.completed ?? !v2)) {
+      const usageRun = entry.gatewayUsageRuns.get(sessionId) ?? newGatewayUsageRun(`${workspaceId}:${sessionId}:terminal:${entry.nativeSequenceBySession.get(sessionId)?.sequence ?? "unknown"}`);
+      entry.gatewayUsageRuns.set(sessionId, usageRun);
+      if (!usageRun.completed) {
+        usageRun.completed = true;
+        if (usageRun.providerId === null || usageRun.providerId.startsWith("ipr_")) {
+          refreshGatewayUsageAfterCompletion(usageRun.scope, usageRun.key);
+        }
+      }
+    }
+    if (shouldConvergeTerminal) void reconcileSessionPermissions(entry, sessionId);
+    if (tracked && shouldConvergeTerminal) void refreshSessionTodos(workspaceId, sessionId);
+    if (tracked && shouldConvergeTerminal) {
+      flushSessionDeltas(entry, workspaceId, sessionId);
+      void getReactQueryClient().invalidateQueries({
+        queryKey: snapshotKey(workspaceId, sessionId),
+        exact: true,
+      });
+    }
+    if (shouldRecordTerminal) {
+      const assistantCompletedAt = entry.assistantMessageCompletedAt.get(sessionId);
+      const runActiveAt = entry.runActiveObservedAt.get(sessionId);
+      recordSessionCompletionMark("run-terminal", {
+        sessionID: sessionId,
+        source: options.source ?? "stream",
+        ...(assistantCompletedAt === undefined
+          ? {}
+          : { sinceAssistantMessageCompletedMs: Math.round((observedAt - assistantCompletedAt) * 100) / 100 }),
+        ...(runActiveAt === undefined
+          ? {}
+          : { sinceRunActiveMs: Math.round((observedAt - runActiveAt) * 100) / 100 }),
+      });
+    }
+    entry.runActiveObservedAt.delete(sessionId);
+    entry.assistantMessageCompletedAt.delete(sessionId);
+    if (entry.input && tracked) releaseRetainedSessionSoon(entry.input, entry, sessionId);
+  }
+  // A listener can admit a queued successor synchronously. Consume the old
+  // run's analytics marker before notifying it, never the successor's marker.
+  for (const listener of entry.sessionStatusListeners.keys()) listener({ sessionId, status });
+}
+
+function clearSessionRetry(entry: SyncEntry, workspaceId: string, sessionId: string) {
+  if (!isOpencodeV2BaseUrl(entry.input.baseUrl)) return;
+  const status = getReactQueryClient().getQueryData<SessionStatus>(statusKey(workspaceId, sessionId));
+  if (status?.type === "retry") applySessionRunStatus(entry, workspaceId, sessionId, { type: "busy" });
+}
+
+async function reconcileSessionPermissions(entry: SyncEntry, sessionId: string) {
+  if (!isOpencodeV2BaseUrl(entry.input.baseUrl)) return;
+  entry.permissionReconciles.get(sessionId)?.abort();
+  const controller = new AbortController();
+  entry.permissionReconciles.set(sessionId, controller);
+  const snapshotStartedAt = Date.now();
+  const snapshotRevision = getReactQueryClient().getQueryState(permissionKey(entry.input.workspaceId, sessionId))?.dataUpdateCount ?? 0;
+  try {
+    const permissions = await sessionPermissionFetcher(entry.input.baseUrl, entry.openworkToken, sessionId,
+      AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]));
+    if (controller.signal.aborted || syncs.get(syncKey(entry.input)) !== entry) return;
+    seedPermissionState(entry.input.workspaceId, sessionId, permissions, { snapshotStartedAt, snapshotRevision });
+  } catch {
+    // Failed reads are not permission settlements. Reconnect will retry.
+  } finally {
+    if (entry.permissionReconciles.get(sessionId) === controller) entry.permissionReconciles.delete(sessionId);
+  }
+}
+
+// Snapshot-only busy observations need the same validation as stream edges.
+function trackLiveSession(entry: SyncEntry, sessionId: string, status: SessionStatus, source: SessionStatusSource) {
+  if (entry.refs <= 0 && !isTrackedSession(entry, sessionId)) retainSession(entry.input, entry, sessionId);
+  if (!entry.liveSessionIds.has(sessionId)) {
+    entry.liveSessionIds.add(sessionId);
+    entry.runActiveObservedAt.set(sessionId, perfNow());
+    recordSessionCompletionMark("run-active", { sessionID: sessionId, source, status: status.type });
+  }
+  scheduleActiveSessionStatusReconciliation(entry);
+}
+
+async function reconcileSessionRunStatuses(
+  entry: SyncEntry,
+  input: SyncOptions,
+  signal: AbortSignal,
+  source: Exclude<SessionStatusSource, "stream" | "snapshot">,
+) {
   const startedAt = Date.now();
+  const key = syncKey(input);
+  // Capture one revision instead of copying every historical sequence on each
+  // poll. A same-clock native edge still invalidates this read for its session.
+  const sequenceRevision = entry.nativeSequenceRevision;
+  if (source === "connect-reconcile") {
+    const records = useSessionActivityStore.getState().recordsByWorkspaceId[input.workspaceId] ?? {};
+    for (const sessionId of new Set([...Object.keys(records), ...entry.trackedSessionRefs.keys()])) {
+      void reconcileSessionPermissions(entry, sessionId);
+      void refreshSessionTodos(input.workspaceId, sessionId);
+    }
+  }
   let statuses: Record<string, SessionStatus>;
   try {
     statuses = await sessionStatusFetcher(input.baseUrl, entry.openworkToken, signal);
   } catch {
+    // The run state itself is deliberately left untouched: a failed fetch is
+    // not evidence that work stopped. It is evidence that the busy state can
+    // no longer be validated, so record it where surfaces can stop
+    // presenting a confident ticking "Working" row. Aborted fetches are
+    // lifecycle noise (dispose, generation rotation), not failures.
+    if (!signal.aborted) {
+      useWorkspaceSyncStreamStore.getState().publishReconcileFailure(key);
+    }
     return;
   }
   if (signal.aborted) return;
+  const streamStore = useWorkspaceSyncStreamStore.getState();
+  const recovered = (streamStore.reconcileHealthByKey[key]?.consecutiveFailures ?? 0) > 0;
+  streamStore.publishReconcileSuccess(key, startedAt);
+  // Reachability recovered with this credential: wake a parked stream rather
+  // than waiting out the outage's backoff. Healthy streams ignore the nudge.
+  if (recovered) entry.notifyStreamGenerationChanged?.();
 
-  const records = useSessionActivityStore.getState().recordsByWorkspaceId[input.workspaceId];
-  if (!records) return;
-  for (const sessionId of Object.keys(records)) {
-    useSessionActivityStore.getState().seedSessionRun(
-      input.workspaceId,
-      sessionId,
-      statuses[sessionId] ?? idleStatus,
-      undefined,
-      { snapshotStartedAt: startedAt },
-    );
+  // Reconnect converges all known records. Steady-state polls only revisit
+  // live/unsettled sessions, not the workspace's entire idle history. Include
+  // newly reported live sessions to heal missed busy edges, and owned pending
+  // runs whose optimistic activity write arrived without a stream edge.
+  const records = useSessionActivityStore.getState().recordsByWorkspaceId[input.workspaceId] ?? {};
+  const sessionIds = new Set(entry.liveSessionIds);
+  for (const [sessionId, status] of Object.entries(statuses)) {
+    if (source === "connect-reconcile" || isLiveStatus(status)) sessionIds.add(sessionId);
   }
+  const knownSessionIds = source === "connect-reconcile"
+    ? Object.keys(records)
+    : [...entry.trackedSessionRefs.keys(), ...entry.retainedSessionTimers.keys()];
+  for (const sessionId of knownSessionIds) {
+    const record = records[sessionId];
+    if (source === "connect-reconcile" || record?.runActive || record?.compacting) sessionIds.add(sessionId);
+  }
+  for (const sessionId of sessionIds) {
+    if ((entry.nativeSequenceBySession.get(sessionId)?.revision ?? 0) > sequenceRevision) continue;
+    applySessionRunStatus(entry, input.workspaceId, sessionId, statuses[sessionId] ?? idleStatus, {
+      snapshotStartedAt: startedAt,
+      source,
+    });
+  }
+}
+
+function clearActiveSessionStatusReconcileTimer(entry: SyncEntry) {
+  if (entry.liveSessionIds.size > 0 || !entry.statusReconcileTimer) return;
+  clearTimeout(entry.statusReconcileTimer);
+  entry.statusReconcileTimer = null;
+}
+
+function stopTrackingLiveSession(entry: SyncEntry, sessionId: string) {
+  entry.liveSessionIds.delete(sessionId);
+  entry.runActiveObservedAt.delete(sessionId);
+  entry.assistantMessageCompletedAt.delete(sessionId);
+  clearActiveSessionStatusReconcileTimer(entry);
+}
+
+function scheduleActiveSessionStatusReconciliation(entry: SyncEntry) {
+  if (
+    entry.liveSessionIds.size === 0
+    || entry.statusReconcileTimer
+    || entry.statusReconcileAbort
+  ) return;
+
+  entry.statusReconcileTimer = setTimeout(() => {
+    entry.statusReconcileTimer = null;
+    if (entry.liveSessionIds.size === 0) return;
+
+    const controller = new AbortController();
+    entry.statusReconcileAbort = controller;
+    void reconcileSessionRunStatuses(
+      entry,
+      entry.input,
+      controller.signal,
+      "active-reconcile",
+    ).finally(() => {
+      if (entry.statusReconcileAbort === controller) entry.statusReconcileAbort = null;
+      scheduleActiveSessionStatusReconciliation(entry);
+    });
+  }, activeSessionStatusReconcileIntervalMs);
+}
+
+/**
+ * A restored network (or a wake that brings it back) should not wait out
+ * retry backoff or the next watchdog tick: reconnect any parked stream with
+ * fresh backoff and revalidate run statuses immediately, so a run that ended
+ * or kept working while the machine was offline settles within one fetch.
+ * Resolving means the probe settled; reconcileHealthByKey carries failures.
+ */
+export async function revalidateWorkspaceSessionSync(input: Pick<SyncOptions, "workspaceId" | "baseUrl">) {
+  const entry = syncs.get(syncKey(input));
+  if (!entry) return;
+  entry.notifyStreamGenerationChanged?.();
+  // Own the immediate probe so disposal cancels it and an older active poll
+  // cannot overwrite its result. This only reads status; it never resends.
+  entry.statusReconcileAbort?.abort();
+  if (entry.statusReconcileTimer) clearTimeout(entry.statusReconcileTimer);
+  entry.statusReconcileTimer = null;
+  const controller = new AbortController();
+  entry.statusReconcileAbort = controller;
+  try {
+    await reconcileSessionRunStatuses(entry, entry.input, controller.signal, "connect-reconcile");
+  } finally {
+    if (entry.statusReconcileAbort === controller) entry.statusReconcileAbort = null;
+    scheduleActiveSessionStatusReconciliation(entry);
+  }
+}
+
+function revalidateWorkspaceSyncs() {
+  for (const entry of syncs.values()) {
+    void revalidateWorkspaceSessionSync(entry.input);
+  }
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("online", revalidateWorkspaceSyncs);
+}
+
+export function __revalidateWorkspaceSyncsForTest() {
+  revalidateWorkspaceSyncs();
+}
+
+export function __resetWorkspaceSyncReconcileHealthForTest() {
+  lastReconcileSuccessAtByKey.clear();
+  useWorkspaceSyncStreamStore.setState({ reconcileHealthByKey: {} });
 }
 
 export function ensureWorkspaceSessionSync(input: SyncOptions) {
   const key = syncKey(input);
   const existing = syncs.get(key);
   if (existing) {
-    existing.openworkToken = input.openworkToken;
+    existing.input = input;
+    if (existing.openworkToken !== input.openworkToken) {
+      // Reattachment with a rotated token (or a restarted runtime's fresh
+      // credential) is a new connection generation: restart a stream parked
+      // in auth backoff instead of leaving the task streaming nowhere.
+      existing.openworkToken = input.openworkToken;
+      existing.notifyStreamGenerationChanged?.();
+    }
     if (existing.disposeTimer) {
       clearTimeout(existing.disposeTimer);
       existing.disposeTimer = null;
     }
-    if (input.onSessionCreated) existing.sessionCreatedListeners.add(input.onSessionCreated);
-    if (input.onSessionUpdated) existing.sessionUpdatedListeners.add(input.onSessionUpdated);
-    if (input.onSessionDeleted) existing.sessionDeletedListeners.add(input.onSessionDeleted);
-    if (input.onSessionStatus) existing.sessionStatusListeners.add(input.onSessionStatus);
+    retainListener(existing.sessionCreatedListeners, input.onSessionCreated);
+    retainListener(existing.sessionUpdatedListeners, input.onSessionUpdated);
+    retainListener(existing.sessionDeletedListeners, input.onSessionDeleted);
+    retainListener(existing.sessionStatusListeners, input.onSessionStatus);
     existing.refs += 1;
+    scheduleDeltaFlush(existing, input.workspaceId);
     return () => releaseWorkspaceSessionSync(input);
   }
 
   const created: SyncEntry = {
     input,
     openworkToken: input.openworkToken,
+    notifyStreamGenerationChanged: null,
     refs: 1,
     dispose: () => {},
     disposeTimer: null,
     trackedSessionRefs: new Map(),
     retainedSessionTimers: new Map(),
-    sessionCreatedListeners: new Set(input.onSessionCreated ? [input.onSessionCreated] : []),
-    sessionUpdatedListeners: new Set(input.onSessionUpdated ? [input.onSessionUpdated] : []),
-    sessionDeletedListeners: new Set(input.onSessionDeleted ? [input.onSessionDeleted] : []),
-    sessionStatusListeners: new Set(input.onSessionStatus ? [input.onSessionStatus] : []),
+    sessionCreatedListeners: createListenerRegistry(input.onSessionCreated),
+    sessionUpdatedListeners: createListenerRegistry(input.onSessionUpdated),
+    sessionDeletedListeners: createListenerRegistry(input.onSessionDeleted),
+    sessionStatusListeners: createListenerRegistry(input.onSessionStatus),
     pendingDeltas: new Map(),
     deltaFlushBuffer: [],
-    deltaFlushScheduled: false,
+    deltaFlushLane: null,
+    cancelDeltaFlush: null,
+    liveSessionIds: new Set(),
+    statusReconcileTimer: null,
+    statusReconcileAbort: null,
+    runActiveObservedAt: new Map(),
+    assistantMessageCompletedAt: new Map(),
+    gatewayUsageRuns: new Map(),
+    nativeSequenceBySession: new Map(),
+    nativeSequenceRevision: 0,
+    nativeTerminalSessions: new Set(),
+    permissionReconciles: new Map(),
     titleRecovery: null,
   };
   created.titleRecovery = createSessionTitleRecovery({
     fetch: async (sessionId) => {
-      const client = createClient(input.baseUrl, undefined, { token: created.openworkToken, mode: "openwork" });
+      const client = createSyncClient(input.baseUrl, created.openworkToken);
       const [session, messages] = await Promise.all([
         client.session.get({ sessionID: sessionId }).then(unwrap),
         client.session.messages({ sessionID: sessionId, limit: 20 }).then(unwrap),
@@ -1273,13 +1894,13 @@ export function ensureWorkspaceSessionSync(input: SyncOptions) {
       };
     },
     onResolved: (sessionId, title) => {
-      getReactQueryClient().setQueryData<OpenworkSessionSnapshot>(
+      getReactQueryClient().setQueryData<OpenworkSessionHistory>(
         snapshotKey(input.workspaceId, sessionId),
         (current) => current
           ? { ...current, session: { ...current.session, title } }
           : current,
       );
-      for (const listener of created.sessionUpdatedListeners) {
+      for (const listener of created.sessionUpdatedListeners.keys()) {
         listener({ sessionId, info: { title } });
       }
     },
@@ -1303,12 +1924,16 @@ function releaseWorkspaceSessionSync(input: SyncOptions) {
   const key = syncKey(input);
   const existing = syncs.get(key);
   if (!existing) return;
-  if (input.onSessionCreated) existing.sessionCreatedListeners.delete(input.onSessionCreated);
-  if (input.onSessionUpdated) existing.sessionUpdatedListeners.delete(input.onSessionUpdated);
-  if (input.onSessionDeleted) existing.sessionDeletedListeners.delete(input.onSessionDeleted);
-  if (input.onSessionStatus) existing.sessionStatusListeners.delete(input.onSessionStatus);
+  releaseListener(existing.sessionCreatedListeners, input.onSessionCreated);
+  releaseListener(existing.sessionUpdatedListeners, input.onSessionUpdated);
+  releaseListener(existing.sessionDeletedListeners, input.onSessionDeleted);
+  releaseListener(existing.sessionStatusListeners, input.onSessionStatus);
   existing.refs = Math.max(0, existing.refs - 1);
   if (existing.refs > 0) return;
+  // A status fetch can discover work that no transcript owner ever mounted.
+  for (const sessionId of existing.liveSessionIds) {
+    if (!isTrackedSession(existing, sessionId)) retainSession(input, existing, sessionId);
+  }
   if (existing.retainedSessionTimers.size > 0 || existing.disposeTimer) return;
   existing.disposeTimer = setTimeout(() => {
     existing.disposeTimer = null;
@@ -1318,25 +1943,123 @@ function releaseWorkspaceSessionSync(input: SyncOptions) {
   }, workspaceSyncDisposeGraceMs);
 }
 
-export function seedSessionState(workspaceId: string, snapshot: OpenworkSessionSnapshot) {
+export function seedSessionStatus(
+  workspaceId: string,
+  sessionId: string,
+  incomingStatus: SessionStatus,
+  options: { snapshotStartedAt: number },
+) {
+  const queryClient = getReactQueryClient();
+  const { snapshotStartedAt } = options;
+  const record = useSessionActivityStore.getState().recordsByWorkspaceId[workspaceId]?.[sessionId];
+  // A read cannot supersede a live edge from the same clock tick either.
+  if (record && snapshotStartedAt <= record.runStatusAt) return;
+  const currentStatus = queryClient.getQueryData<SessionStatus>(statusKey(workspaceId, sessionId));
+  const terminal = [...syncs.values()].some((entry) => entry.input.workspaceId === workspaceId
+    && entry.nativeTerminalSessions.has(sessionId));
+  const status = incomingStatus.type === "busy" && currentStatus && (currentStatus.type === "retry" || terminal)
+    ? currentStatus : incomingStatus;
+  useSessionActivityStore.getState().seedSessionRun(
+    workspaceId,
+    sessionId,
+    status,
+    undefined,
+    { snapshotStartedAt },
+  );
+  if (!isLiveStatus(status)) {
+    // Run status is not an interaction snapshot. An idle read must not hide
+    // cached approvals/questions when their independent refresh fails or waits.
+    const activity = useSessionActivityStore.getState();
+    const permissions = queryClient.getQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId));
+    const questions = queryClient.getQueryData<PendingQuestion[]>(questionKey(workspaceId, sessionId));
+    if (permissions) activity.replaceWaitingRequests(workspaceId, sessionId, "permission", permissions.map((item) => item.id));
+    if (questions) activity.replaceWaitingRequests(workspaceId, sessionId, "question", questions.map((item) => item.id));
+  }
+  queryClient.setQueryData(statusKey(workspaceId, sessionId), status);
+  if (isLiveStatus(status)) {
+    for (const entry of syncs.values()) {
+      if (entry.input.workspaceId === workspaceId) {
+        trackLiveSession(entry, sessionId, status, "snapshot");
+      }
+    }
+  }
+}
+
+export function seedSessionTodos(
+  workspaceId: string,
+  sessionId: string,
+  todos: Todo[],
+  options: { snapshotStartedAt: number },
+) {
+  const queryClient = getReactQueryClient();
+  const key = todoKey(workspaceId, sessionId);
+  const state = queryClient.getQueryState(key);
+  // Millisecond ties cannot establish that a snapshot is newer than live data.
+  if (state?.data === undefined || options.snapshotStartedAt > state.dataUpdatedAt) {
+    queryClient.setQueryData(key, todos, { updatedAt: options.snapshotStartedAt });
+  }
+}
+
+async function refreshSessionTodos(workspaceId: string, sessionId: string) {
+  const queryClient = getReactQueryClient();
+  const queryKey = [...todoKey(workspaceId, sessionId), "hydration"];
+  await queryClient.cancelQueries({ queryKey });
+  await queryClient.invalidateQueries({ queryKey });
+}
+
+export function seedSessionState(workspaceId: string, snapshot: OpenworkSessionHistory, options: { preview?: boolean } = {}) {
+  // A reverted window cannot establish which messages are still visible.
+  if (options.preview && snapshot.session.revert?.messageID) return;
   const queryClient = getReactQueryClient();
   const key = transcriptKey(workspaceId, snapshot.session.id);
-  const incoming = snapshotToUIMessages(snapshot);
+  const projected = snapshotToUIMessages(snapshot);
+  let incoming = projected;
+  // Commit against the old text before merging a cumulative snapshot, never
+  // append those same queued bytes to the snapshot afterwards.
+  for (const entry of syncs.values()) {
+    if (entry.input.workspaceId !== workspaceId) continue;
+    flushSessionDeltas(entry, workspaceId, snapshot.session.id);
+    if (entry.pendingDeltas.size === 0) continue;
+    for (let messageIndex = 0; messageIndex < incoming.length; messageIndex += 1) {
+      let message = incoming[messageIndex];
+      for (let partIndex = 0; partIndex < message.parts.length; partIndex += 1) {
+        const part = message.parts[partIndex];
+        if (part.type !== "text" && part.type !== "reasoning") continue;
+        const partId = getPartMetadataId(part);
+        if (!partId) continue;
+        const pendingKey = JSON.stringify([snapshot.session.id, message.id, partId]);
+        const pending = entry.pendingDeltas.get(pendingKey);
+        if (!pending || pending.messageId !== message.id) continue;
+        // Early deltas and the declaration are cumulative views, as with
+        // message.part.updated. Unrepresented parts remain pending.
+        if (pending.text.length > part.text.length) {
+          const parts = message.parts.slice();
+          parts[partIndex] = { ...part, text: pending.text };
+          message = { ...message, parts };
+          if (incoming === projected) incoming = incoming.slice();
+          incoming[messageIndex] = message;
+        }
+        entry.pendingDeltas.delete(pendingKey);
+      }
+    }
+  }
   const existing = queryClient.getQueryData<UIMessage[]>(key);
 
+  if (options.preview) {
+    // Supply declaration baselines for live deltas, not whole-session truth.
+    // In particular, a partial turn must not settle admission or seed idle.
+    queryClient.setQueryData(key, reconcileTranscriptMessages({
+      currentMessages: existing ?? [],
+      snapshotMessages: incoming,
+    }));
+    return;
+  }
+
   const snapshotStartedAt = sessionSnapshotFetchStarts.get(snapshot);
-  if (typeof snapshotStartedAt === "number") {
-    const record = useSessionActivityStore.getState().recordsByWorkspaceId[workspaceId]?.[snapshot.session.id];
-    useSessionActivityStore.getState().seedSessionRun(
-      workspaceId,
-      snapshot.session.id,
-      snapshot.status,
-      assistantOutputAfterLatestUser(incoming),
-      { snapshotStartedAt },
-    );
-    if (snapshotStartedAt >= (record?.runStatusAt ?? 0)) {
-      queryClient.setQueryData(statusKey(workspaceId, snapshot.session.id), snapshot.status);
-    }
+  if (snapshot.status !== undefined && typeof snapshotStartedAt === "number") {
+    seedSessionStatus(workspaceId, snapshot.session.id, snapshot.status, {
+      snapshotStartedAt,
+    });
   }
 
   // The snapshot's revert cursor is authoritative: messages at/after it are
@@ -1350,8 +2073,34 @@ export function seedSessionState(workspaceId: string, snapshot: OpenworkSessionS
     }),
     snapshot.session.revert?.messageID ?? null,
   ));
+  settleOrphanedInteractions(workspaceId, snapshot.session.id, terminalToolCallIds(snapshot.messages));
 
-  queryClient.setQueryData(todoKey(workspaceId, snapshot.session.id), snapshot.todos);
+  if (snapshot.todos !== undefined) {
+    // Remember first observation for unmarked snapshots too, so reselecting a
+    // cached object never makes it newer than a subsequent todo.updated event.
+    const todosStartedAt = snapshotStartedAt ?? todoSnapshotFirstSeen.get(snapshot) ?? Date.now();
+    todoSnapshotFirstSeen.set(snapshot, todosStartedAt);
+    seedSessionTodos(workspaceId, snapshot.session.id, snapshot.todos, { snapshotStartedAt: todosStartedAt });
+  }
+  const transcript = queryClient.getQueryData<UIMessage[]>(key) ?? [];
+  useSessionActivityStore.getState().observeTranscript(workspaceId, snapshot.session.id, transcript, true, {
+    snapshotStartedAt,
+  });
+}
+
+/**
+ * A session the app just created has no history to load, so its surface must
+ * not spend the first snapshot round trip in the "switching" state where the
+ * composer refuses to send. Seed the cache from the create response and leave
+ * it stale, so the first real fetch runs as a background refresh of a session
+ * that is already on screen.
+ */
+export function seedCreatedSessionSnapshot(workspaceId: string, session: Session) {
+  getReactQueryClient().setQueryData<OpenworkSessionSnapshot>(
+    snapshotKey(workspaceId, session.id),
+    { session, messages: [], todos: [], status: { type: "idle" } },
+    { updatedAt: 0 },
+  );
 }
 
 /**
@@ -1367,7 +2116,7 @@ export function applySessionRevert(workspaceId: string, session: Session) {
   const queryClient = getReactQueryClient();
   const revertMessageId = session.revert?.messageID ?? null;
 
-  queryClient.setQueryData<OpenworkSessionSnapshot>(
+  queryClient.setQueryData<OpenworkSessionHistory>(
     snapshotKey(workspaceId, session.id),
     (current) => (current ? { ...current, session: { ...current.session, revert: session.revert } } : current),
   );
@@ -1378,11 +2127,24 @@ export function applySessionRevert(workspaceId: string, session: Session) {
   void queryClient.invalidateQueries({ queryKey: snapshotKey(workspaceId, session.id) });
 }
 
+/** Apply confirmed archive metadata for every caller, not only the transcript's Restore button. */
+export async function applySessionArchived(workspaceId: string, sessionId: string, archived: boolean) {
+  const queryClient = getReactQueryClient();
+  const queryKey = snapshotKey(workspaceId, sessionId);
+  // An older in-flight snapshot must not put the archived flag back after Restore.
+  await queryClient.cancelQueries({ queryKey, exact: true });
+  queryClient.setQueryData<OpenworkSessionHistory>(queryKey, current => current ? {
+    ...current,
+    session: { ...current.session, time: { ...current.session.time, archived: archived ? Date.now() : 0 } },
+  } : current);
+  void queryClient.invalidateQueries({ queryKey, exact: true });
+}
+
 /** Clear a server-confirmed revert cursor without discarding cached history. */
 export function applySessionUnrevert(workspaceId: string, sessionId: string) {
   const queryClient = getReactQueryClient();
   void queryClient.cancelQueries({ queryKey: snapshotKey(workspaceId, sessionId) });
-  queryClient.setQueryData<OpenworkSessionSnapshot>(
+  queryClient.setQueryData<OpenworkSessionHistory>(
     snapshotKey(workspaceId, sessionId),
     (current) => (current ? { ...current, session: { ...current.session, revert: undefined } } : current),
   );
@@ -1397,7 +2159,7 @@ export function trackWorkspaceSessionSync(input: SyncOptions, sessionId: string 
 
   const retainedTimer = entry.retainedSessionTimers.get(normalizedSessionId);
   if (retainedTimer) {
-    clearTimeout(retainedTimer);
+    clearTimeout(retainedTimer.timer);
     entry.retainedSessionTimers.delete(normalizedSessionId);
   }
 
@@ -1435,24 +2197,39 @@ export function __createWorkspaceSessionSyncForTest(input: SyncOptions) {
   syncs.set(key, {
     input,
     openworkToken: input.openworkToken,
+    notifyStreamGenerationChanged: null,
     refs: 1,
     dispose: () => {},
     disposeTimer: null,
     trackedSessionRefs: new Map(),
     retainedSessionTimers: new Map(),
-    sessionCreatedListeners: new Set(input.onSessionCreated ? [input.onSessionCreated] : []),
-    sessionUpdatedListeners: new Set(),
-    sessionDeletedListeners: new Set(input.onSessionDeleted ? [input.onSessionDeleted] : []),
-    sessionStatusListeners: new Set(),
+    sessionCreatedListeners: createListenerRegistry(input.onSessionCreated),
+    sessionUpdatedListeners: createListenerRegistry(input.onSessionUpdated),
+    sessionDeletedListeners: createListenerRegistry(input.onSessionDeleted),
+    sessionStatusListeners: createListenerRegistry(input.onSessionStatus),
     pendingDeltas: new Map(),
     deltaFlushBuffer: [],
-    deltaFlushScheduled: false,
+    deltaFlushLane: null,
+    cancelDeltaFlush: null,
+    liveSessionIds: new Set(),
+    statusReconcileTimer: null,
+    statusReconcileAbort: null,
+    runActiveObservedAt: new Map(),
+    assistantMessageCompletedAt: new Map(),
+    gatewayUsageRuns: new Map(),
+    nativeSequenceBySession: new Map(),
+    nativeSequenceRevision: 0,
+    nativeTerminalSessions: new Set(),
+    permissionReconciles: new Map(),
     titleRecovery: null,
   });
   return () => {
     const entry = syncs.get(key);
     if (entry) {
-      for (const timer of entry.retainedSessionTimers.values()) clearTimeout(timer);
+      for (const { timer } of entry.retainedSessionTimers.values()) clearTimeout(timer);
+      if (entry.statusReconcileTimer) clearTimeout(entry.statusReconcileTimer);
+      entry.statusReconcileAbort?.abort();
+      for (const controller of entry.permissionReconciles.values()) controller.abort();
     }
     syncs.delete(key);
   };
@@ -1476,10 +2253,25 @@ export function __applySessionSyncEventForTest(input: SyncOptions, event: Openco
   applyEvent(entry, input.workspaceId, event);
 }
 
+export function __queueSessionSyncDeltaForTest(input: SyncOptions, delta: PendingDelta) {
+  const entry = syncs.get(syncKey(input));
+  if (!entry) return;
+  entry.deltaFlushBuffer.push(delta);
+  scheduleDeltaFlush(entry, input.workspaceId);
+}
+
+export function __setSessionSyncDeltaFlushSchedulerForTest(scheduler: DeltaFlushScheduler | null) {
+  deltaFlushScheduler = scheduler ?? defaultDeltaFlushScheduler;
+}
+
 export function __setWorkspaceSessionSyncSubscriptionFactoryForTest(factory: SyncSubscriptionFactory | null) {
   syncSubscriptionFactory = factory ?? defaultSyncSubscriptionFactory;
 }
 
 export function __setWorkspaceSessionSyncStatusFetcherForTest(fetcher: SessionStatusFetcher | null) {
   sessionStatusFetcher = fetcher ?? defaultSessionStatusFetcher;
+}
+
+export function __setWorkspaceSessionSyncPermissionFetcherForTest(fetcher: typeof defaultSessionPermissionFetcher | null) {
+  sessionPermissionFetcher = fetcher ?? defaultSessionPermissionFetcher;
 }
