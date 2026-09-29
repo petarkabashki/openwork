@@ -1,6 +1,8 @@
 import * as React from "react";
+import { activeBrowserTabIdForSession, browserTabsForSession } from "@openwork/browser-tabs";
 
 import type { BrowserStatePayload } from "@/app/lib/desktop";
+import { toast } from "@/components/ui/sonner";
 
 import {
   type PanelTab,
@@ -11,9 +13,11 @@ import { getElectronBrowser } from "./utils";
 export function useSidePanelTabs(sessionId: string) {
   const syncBrowserTabs = usePanelTabStore((state) => state.syncBrowserTabs);
 
+  // Every conversation only sees the tabs it opened (plus shared tabs): the
+  // native browser is one surface, but ownership decides what each panel shows.
   const applyBrowserState = React.useCallback((browserState: BrowserStatePayload) => {
-    const tabs = browserState.tabs ?? [];
-    const activeTabId = browserState.activeTabId ?? tabs[0]?.id ?? null;
+    const tabs = browserTabsForSession(browserState.tabs ?? [], sessionId);
+    const activeTabId = activeBrowserTabIdForSession(browserState, sessionId, tabs);
 
     syncBrowserTabs(sessionId, tabs, activeTabId);
   }, [sessionId, syncBrowserTabs]);
@@ -45,16 +49,65 @@ export function useSidePanelTabs(sessionId: string) {
   const reorderTabs = useReorderTabs();
 
   return {
-    createTab: (url?: string) => createTab(url),
+    createTab: (url?: string) => createTab(url, sessionId),
     closeTab: (tab: PanelTab) => closeTab(sessionId, tab),
     selectTab: (tabId: string) => selectTab(sessionId, tabId),
     reorderTabs: (tabIds: string[]) => reorderTabs(sessionId, tabIds),
   };
 }
 
+export function useOpenBrowserRailPane(
+  sessionId: string,
+  active: boolean,
+  setPanel: (panel: "panel" | null) => void,
+) {
+  const createTab = useCreateTab();
+  const selectTab = useSelectTab();
+  const generation = React.useRef(0);
+
+  React.useLayoutEffect(() => () => { generation.current += 1; }, [sessionId]);
+
+  return React.useCallback(async () => {
+    const request = ++generation.current;
+    if (active) {
+      setPanel(null);
+      return;
+    }
+
+    try {
+      const browserState = await getElectronBrowser()?.getState?.();
+      if (request !== generation.current || !browserState) return;
+
+      const tabs = browserTabsForSession(browserState.tabs ?? [], sessionId);
+      usePanelTabStore.getState().syncBrowserTabs(
+        sessionId,
+        tabs,
+        activeBrowserTabIdForSession(browserState, sessionId, tabs),
+      );
+      const session = usePanelTabStore.getState().sessions[sessionId];
+      const activeTab = session?.tabs.find((tab) => tab.id === session.activeTabId);
+      const browserTab = activeTab?.type === "browser"
+        ? activeTab
+        : session?.tabs.find((tab) => tab.type === "browser");
+      if (browserTab) {
+        selectTab(sessionId, browserTab.id);
+      } else {
+        void createTab(undefined, sessionId);
+      }
+      setPanel("panel");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
+  }, [active, createTab, selectTab, sessionId, setPanel]);
+}
+
 export function useCreateTab() {
-  return React.useCallback((url?: string) => {
-    void getElectronBrowser()?.createTab?.(url);
+  return React.useCallback(async (url?: string, sessionId?: string | null) => {
+    try {
+      await getElectronBrowser()?.createTab?.(url, sessionId);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
   }, []);
 }
 
@@ -77,7 +130,9 @@ export function useCloseTab() {
       const nextTab = usePanelTabStore.getState().sessions[sessionId]?.tabs.find((entry) => entry.id === nextTabId);
 
       if (nextTab?.type === "browser") {
-        void getElectronBrowser()?.selectTab?.(nextTab.id);
+        void getElectronBrowser()?.selectTab?.(nextTab.id).catch((error: unknown) => {
+          toast.error(error instanceof Error ? error.message : String(error));
+        });
       }
     }
   }, [closeTab]);
@@ -97,7 +152,9 @@ export function useSelectTab() {
     selectTab(sessionId, tabId);
 
     if (tab.type === "browser") {
-      void getElectronBrowser()?.selectTab?.(tabId);
+      void getElectronBrowser()?.selectTab?.(tabId).catch((error: unknown) => {
+        toast.error(error instanceof Error ? error.message : String(error));
+      });
     }
   }, [selectTab]);
 }

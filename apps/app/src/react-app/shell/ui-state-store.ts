@@ -8,13 +8,13 @@ const LEGACY_WORKSPACE_RIGHT_SIDEBAR_WIDTH_KEY = "openwork.workspace-shell.right
 
 export const DEFAULT_WORKSPACE_LEFT_SIDEBAR_WIDTH = 260;
 export const MIN_WORKSPACE_LEFT_SIDEBAR_WIDTH = 220;
-export const MAX_WORKSPACE_LEFT_SIDEBAR_WIDTH = 420;
+export const MAX_WORKSPACE_LEFT_SIDEBAR_WIDTH = 600;
 export const DEFAULT_WORKSPACE_RIGHT_SIDEBAR_COLLAPSED_WIDTH = 72;
 export const DEFAULT_WORKSPACE_RIGHT_SIDEBAR_EXPANDED_WIDTH = 520;
 export const MIN_WORKSPACE_RIGHT_SIDEBAR_WIDTH = 320;
 export const MAX_WORKSPACE_RIGHT_SIDEBAR_WIDTH = 960;
 
-export const SIDE_PANEL_ITEMS = ["panel", "extensions", "voice"] as const;
+export const SIDE_PANEL_ITEMS = ["panel", "extensions"] as const;
 export type SidePanelItem = (typeof SIDE_PANEL_ITEMS)[number];
 export type SidePanelState = Record<string, SidePanelItem | null>;
 
@@ -29,6 +29,10 @@ export type UiState = {
   sidebarOpen: boolean;
   // Deliberately not persisted so each app load starts with only chat visible.
   sidePanelState: SidePanelState;
+  // Which workspace groups are open in the session sidebar. Kept in memory
+  // (not persisted) so leaving for Settings and coming back does not collapse
+  // them: the session route unmounts while Settings is open.
+  expandedWorkspaceIds: string[];
   applicationMenuVisible: boolean;
   workspaceLeftSidebarWidth: number;
   workspaceLeftSidebarResizing: boolean;
@@ -39,6 +43,7 @@ export type UiState = {
 const initialState: UiState = {
   sidebarOpen: true,
   sidePanelState: {},
+  expandedWorkspaceIds: [],
   applicationMenuVisible: false,
   workspaceLeftSidebarWidth: DEFAULT_WORKSPACE_LEFT_SIDEBAR_WIDTH,
   workspaceLeftSidebarResizing: false,
@@ -228,6 +233,33 @@ export function toggleSidePanelState(
   return setSidePanelState(state, sessionId, getSidePanelState(state, sessionId) === panel ? null : panel);
 }
 
+export function expandWorkspace(state: UiState, workspaceId: string): UiState {
+  const id = workspaceId.trim();
+  if (!id || state.expandedWorkspaceIds.includes(id)) {
+    return state;
+  }
+
+  return {
+    ...state,
+    expandedWorkspaceIds: [...state.expandedWorkspaceIds, id],
+  };
+}
+
+export function toggleWorkspaceExpanded(state: UiState, workspaceId: string): UiState {
+  const id = workspaceId.trim();
+  if (!id) {
+    return state;
+  }
+  if (!state.expandedWorkspaceIds.includes(id)) {
+    return expandWorkspace(state, id);
+  }
+
+  return {
+    ...state,
+    expandedWorkspaceIds: state.expandedWorkspaceIds.filter((entry) => entry !== id),
+  };
+}
+
 export function setApplicationMenuVisible(state: UiState, visible: boolean): UiState {
   if (state.applicationMenuVisible === visible) {
     return state;
@@ -290,7 +322,9 @@ export function toggleWorkspaceRightSidebar(state: UiState): UiState {
 }
 
 function syncApplicationMenuVisible(visible: boolean): void {
-  void globalThis.window?.__OPENWORK_ELECTRON__?.invokeDesktop?.("__setApplicationMenuVisible", visible);
+  // Fire-and-forget window chrome: the shell refuses this before enterprise
+  // activation, and the menu simply keeps its default visibility then.
+  void globalThis.window?.__OPENWORK_ELECTRON__?.invokeDesktop?.("__setApplicationMenuVisible", visible)?.catch(() => undefined);
 }
 
 type UiStateStore = UiState & {
@@ -298,6 +332,8 @@ type UiStateStore = UiState & {
   toggleSidebar: () => void;
   setSidePanelState: (sessionId: string | null | undefined, panel: SidePanelItem | null) => void;
   toggleSidePanelState: (sessionId: string | null | undefined, panel: SidePanelItem) => void;
+  expandWorkspace: (workspaceId: string) => void;
+  toggleWorkspaceExpanded: (workspaceId: string) => void;
   setApplicationMenuVisible: (visible: boolean) => void;
   setWorkspaceLeftSidebarWidth: (width: number) => void;
   setWorkspaceLeftSidebarResizing: (resizing: boolean) => void;
@@ -312,6 +348,8 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
   toggleSidebar: () => set((state) => toggleSidebar(state)),
   setSidePanelState: (sessionId, panel) => set((state) => setSidePanelState(state, sessionId, panel)),
   toggleSidePanelState: (sessionId, panel) => set((state) => toggleSidePanelState(state, sessionId, panel)),
+  expandWorkspace: (workspaceId) => set((state) => expandWorkspace(state, workspaceId)),
+  toggleWorkspaceExpanded: (workspaceId) => set((state) => toggleWorkspaceExpanded(state, workspaceId)),
   setApplicationMenuVisible: (visible) => {
     set((state) => setApplicationMenuVisible(state, visible));
     syncApplicationMenuVisible(visible);

@@ -1,10 +1,13 @@
 /** @jsxImportSource react */
-import { useEffect, useReducer, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
+
+import { useLocation } from "react-router";
+import { ADVANCED_SETTINGS_SECTIONS } from "../advanced-sections";
 
 import { Separator } from "@/components/ui/separator";
 
 import type { OpencodeConnectStatus } from "@/app/types";
-import type { OpenworkCloudMcpHealth, OpenworkRuntimeConfigStatus, OpenworkServerStatus } from "@/app/lib/openwork-server";
+import type { OpenworkServerClient, OpenworkCloudMcpHealth, OpenworkRuntimeConfigStatus, OpenworkServerStatus } from "@/app/lib/openwork-server";
 import { t } from "@/i18n";
 import { LayoutStack } from "../settings-layout";
 import type { useDenSession } from "../cloud/use-den-session";
@@ -12,10 +15,12 @@ import type { useDenSession } from "../cloud/use-den-session";
 import { advancedLocalReducer, initialAdvancedLocalState } from "./advanced-view-state";
 import {
   AdvancedDeveloperSection,
+  AdvancedEngineV2PreviewSection,
   AdvancedCloudMcpDiagnosticsSection,
   AdvancedOrganizationServerSection,
-  AdvancedRuntimeMigrationSection,
+  AdvancedRuntimeConfigSourcesSection,
   AdvancedRuntimeSection,
+  AdvancedWorkspaceRunModeSection,
 } from "./advanced-view-sections";
 
 type AdvancedOrganizationServerSession = Pick<
@@ -33,6 +38,7 @@ type AdvancedOrganizationServerSession = Pick<
 >;
 
 export type AdvancedViewProps = {
+  sectionId?: string;
   busy: boolean;
   clientConnected: boolean;
   opencodeConnectStatus: OpencodeConnectStatus | null;
@@ -41,18 +47,30 @@ export type AdvancedViewProps = {
   toggleDeveloperMode: () => void;
   opencodeDevModeEnabled: boolean;
   openDebugDeepLink: (rawUrl: string) => Promise<{ ok: boolean; message: string }>;
-  canMigrateRuntimeConfig: boolean;
-  migrateRuntimeConfig: () => Promise<{ migrated: boolean; keys: string[] }>;
+  canInspectRuntimeConfig: boolean;
   getRuntimeConfigStatus: () => Promise<OpenworkRuntimeConfigStatus>;
   organizationServer: AdvancedOrganizationServerSession;
   cloudMcpUrl: string | null;
   cloudMcpHealth: OpenworkCloudMcpHealth | null;
   refreshCloudMcpHealth: () => Promise<OpenworkCloudMcpHealth | null>;
+  engineClient: OpenworkServerClient | null;
 };
 
 type AdvancedStatusTone = "ready" | "warning" | "error" | "neutral";
 
 export function AdvancedView(props: AdvancedViewProps) {
+  const location = useLocation();
+  const viewRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const sectionId = props.sectionId;
+    if (!ADVANCED_SETTINGS_SECTIONS.some((section) => section.id === sectionId)) return;
+    const frame = requestAnimationFrame(() => {
+      const section = viewRef.current?.querySelector<HTMLElement>(`#advanced-${sectionId}`);
+      section?.scrollIntoView({ block: "start" });
+      section?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [location.key, props.sectionId]);
   const [localState, dispatchLocal] = useReducer(
     advancedLocalReducer,
     initialAdvancedLocalState,
@@ -65,8 +83,6 @@ export function AdvancedView(props: AdvancedViewProps) {
     deepLinkInput: debugDeepLinkInput,
     deepLinkBusy: debugDeepLinkBusy,
     deepLinkStatus: debugDeepLinkStatus,
-    migrationBusy,
-    migrationStatus,
   } = localState;
 
   const clientStatusLabel = (() => {
@@ -138,7 +154,7 @@ export function AdvancedView(props: AdvancedViewProps) {
   };
 
   const refreshRuntimeConfigStatus = async () => {
-    if (!props.canMigrateRuntimeConfig) {
+    if (!props.canInspectRuntimeConfig) {
       setConfigStatus(null);
       return;
     }
@@ -155,85 +171,66 @@ export function AdvancedView(props: AdvancedViewProps) {
 
   useEffect(() => {
     void refreshRuntimeConfigStatus();
-  }, [props.canMigrateRuntimeConfig]);
-
-  const migrateRuntimeConfig = async () => {
-    if (props.busy || migrationBusy || !props.canMigrateRuntimeConfig) return;
-    dispatchLocal({ type: "migrationStart" });
-    try {
-      const result = await props.migrateRuntimeConfig();
-      await refreshRuntimeConfigStatus();
-      dispatchLocal({
-        type: "migrationStatus",
-        status: result.migrated
-          ? `Migrated legacy runtime config: ${result.keys.join(", ")}.`
-          : "No legacy runtime config found for this workspace.",
-      });
-    } catch (error) {
-      dispatchLocal({
-        type: "migrationStatus",
-        status: error instanceof Error ? error.message : "Failed to migrate legacy runtime config.",
-      });
-    } finally {
-      dispatchLocal({ type: "migrationDone" });
-    }
-  };
+  }, [props.canInspectRuntimeConfig]);
 
   return (
-    <LayoutStack>
-      <AdvancedOrganizationServerSection
-        authBusy={props.organizationServer.authBusy}
-        baseUrl={props.organizationServer.baseUrl}
-        baseUrlBusy={props.organizationServer.baseUrlBusy}
-        baseUrlDraft={props.organizationServer.baseUrlDraft}
-        baseUrlError={props.organizationServer.baseUrlError}
-        onApplyBaseUrl={props.organizationServer.onApplyBaseUrl}
-        onBaseUrlDraftChange={props.organizationServer.onBaseUrlDraftChange}
-        onClearServerConfiguration={props.organizationServer.onClearServerConfiguration}
-        onResetBaseUrlToDefault={props.organizationServer.onResetBaseUrlToDefault}
-        sessionBusy={props.organizationServer.sessionBusy}
-        cloudMcpUrl={props.cloudMcpUrl}
-      />
+    <div ref={viewRef}>
+      <LayoutStack>
+        <AdvancedOrganizationServerSection
+          authBusy={props.organizationServer.authBusy}
+          baseUrl={props.organizationServer.baseUrl}
+          baseUrlBusy={props.organizationServer.baseUrlBusy}
+          baseUrlDraft={props.organizationServer.baseUrlDraft}
+          baseUrlError={props.organizationServer.baseUrlError}
+          onApplyBaseUrl={props.organizationServer.onApplyBaseUrl}
+          onBaseUrlDraftChange={props.organizationServer.onBaseUrlDraftChange}
+          onClearServerConfiguration={props.organizationServer.onClearServerConfiguration}
+          onResetBaseUrlToDefault={props.organizationServer.onResetBaseUrlToDefault}
+          sessionBusy={props.organizationServer.sessionBusy}
+          cloudMcpUrl={props.cloudMcpUrl}
+        />
 
-      <AdvancedRuntimeSection
-        clientStatusLabel={clientStatusLabel}
-        clientTone={clientTone}
-        clientDetailLines={clientDetailLines}
-        openworkStatusLabel={openworkStatusLabel}
-        openworkTone={openworkTone}
-        openworkDetailLines={openworkDetailLines}
-      />
+        <AdvancedRuntimeSection
+          clientStatusLabel={clientStatusLabel}
+          clientTone={clientTone}
+          clientDetailLines={clientDetailLines}
+          openworkStatusLabel={openworkStatusLabel}
+          openworkTone={openworkTone}
+          openworkDetailLines={openworkDetailLines}
+        />
 
-      <AdvancedCloudMcpDiagnosticsSection
-        cloudMcpHealth={props.cloudMcpHealth}
-        onRefresh={props.refreshCloudMcpHealth}
-      />
+        <AdvancedCloudMcpDiagnosticsSection
+          cloudMcpHealth={props.cloudMcpHealth}
+          onRefresh={props.refreshCloudMcpHealth}
+        />
 
-      <AdvancedRuntimeMigrationSection
-        busy={props.busy}
-        canMigrate={props.canMigrateRuntimeConfig}
-        migrationBusy={migrationBusy}
-        migrationStatus={migrationStatus}
-        configStatus={configStatus}
-        configStatusBusy={configStatusBusy}
-        configStatusError={configStatusError}
-        onRefresh={refreshRuntimeConfigStatus}
-        onMigrate={migrateRuntimeConfig}
-      />
+        <AdvancedRuntimeConfigSourcesSection
+          busy={props.busy}
+          canInspect={props.canInspectRuntimeConfig}
+          configStatus={configStatus}
+          configStatusBusy={configStatusBusy}
+          configStatusError={configStatusError}
+          onRefresh={refreshRuntimeConfigStatus}
+        />
 
-      <AdvancedDeveloperSection
-        busy={props.busy}
-        developerMode={props.developerMode}
-        opencodeDevModeEnabled={props.opencodeDevModeEnabled}
-        deepLinkOpen={debugDeepLinkOpen}
-        deepLinkInput={debugDeepLinkInput}
-        deepLinkBusy={debugDeepLinkBusy}
-        deepLinkStatus={debugDeepLinkStatus}
-        onToggleDeveloperMode={props.toggleDeveloperMode}
-        onToggleDeepLink={() => dispatchLocal({ type: "toggleDeepLink" })}
-        onDeepLinkInput={(input) => dispatchLocal({ type: "deepLinkInput", input })}
-        onSubmitDeepLink={submitDebugDeepLink}
-      />
-    </LayoutStack>
+        <AdvancedEngineV2PreviewSection client={props.engineClient} />
+
+        <AdvancedWorkspaceRunModeSection />
+
+        <AdvancedDeveloperSection
+          busy={props.busy}
+          developerMode={props.developerMode}
+          opencodeDevModeEnabled={props.opencodeDevModeEnabled}
+          deepLinkOpen={debugDeepLinkOpen}
+          deepLinkInput={debugDeepLinkInput}
+          deepLinkBusy={debugDeepLinkBusy}
+          deepLinkStatus={debugDeepLinkStatus}
+          onToggleDeveloperMode={props.toggleDeveloperMode}
+          onToggleDeepLink={() => dispatchLocal({ type: "toggleDeepLink" })}
+          onDeepLinkInput={(input) => dispatchLocal({ type: "deepLinkInput", input })}
+          onSubmitDeepLink={submitDebugDeepLink}
+        />
+      </LayoutStack>
+    </div>
   );
 }

@@ -3,7 +3,7 @@ import { SiteFooter } from "../../components/site-footer";
 import { SiteNav } from "../../components/site-nav";
 import { StructuredData } from "../../components/structured-data";
 import { getGithubData } from "../../lib/github";
-import { baseOpenGraph } from "../../lib/seo";
+import { baseOpenGraph, withSocialMetadata } from "../../lib/seo";
 
 const pricingSchema = {
   "@context": "https://schema.org",
@@ -15,16 +15,17 @@ const pricingSchema = {
   offers: [
     {
       "@type": "Offer",
-      name: "Solo",
+      name: "Free",
       price: "0",
       priceCurrency: "USD",
       url: "https://app.openworklabs.com?mode=sign-up",
       availability: "https://schema.org/InStock",
-      description: "Free forever. Open source desktop app with bring-your-own-keys."
+      description:
+        "First 5 seats free on OpenWork Cloud. Open source desktop app with bring-your-own-keys; self-host the full platform free for organizations up to 5 users."
     },
     {
       "@type": "Offer",
-      name: "Team Starter",
+      name: "Team",
       price: "10",
       priceCurrency: "USD",
       url: "https://app.openworklabs.com/dashboard/billing",
@@ -36,22 +37,31 @@ const pricingSchema = {
         unitText: "seat per month"
       },
       description:
-        "First 5 seats free, then $10 per seat per month. API access, Extension Marketplace, distributed keys."
+        "$10 per seat per month, unlimited users. SSO/SAML, Extension Marketplace, distributed keys, cloud automations, basic analytics, standard support included."
     },
     {
       "@type": "Offer",
       name: "Enterprise",
+      price: "20",
+      priceCurrency: "USD",
       url: "https://openworklabs.com/enterprise",
+      availability: "https://schema.org/InStock",
+      priceSpecification: {
+        "@type": "UnitPriceSpecification",
+        price: "20",
+        priceCurrency: "USD",
+        unitText: "user per month"
+      },
       description:
-        "Custom pricing. SSO/SAML and SCIM, bring your own inference, desktop policies and version controls, managed deployment, custom skill development, MCP consulting, and custom commercial terms."
+        "$20 per user per month billed annually, cloud or self-hosted. Everything in Team, plus SCIM provisioning, usage analytics, desktop policies, audit log, spend observability, standard SLA support. Volume pricing above 250 users."
     }
   ]
 };
 
-export const metadata = {
-  title: "OpenWork Pricing — Free desktop, $10/seat teams, enterprise",
+export const metadata = withSocialMetadata({
+  title: "OpenWork Pricing — First 5 Cloud seats free, $10 Team, $20 Enterprise",
   description:
-    "OpenWork is free forever for solo use with bring-your-own-keys. Teams get their first 5 seats free, then $10 per seat per month, plus custom enterprise plans with SSO and bring-your-own inference.",
+    "First 5 seats free on OpenWork Cloud, then Team $10 per seat/month with SSO; self-hosting is free for organizations up to 5 users. Enterprise $20 per user/month with SCIM and desktop policies.",
   alternates: {
     canonical: "/pricing"
   },
@@ -59,7 +69,7 @@ export const metadata = {
     ...baseOpenGraph,
     url: "https://openworklabs.com/pricing"
   }
-};
+});
 
 export default async function PricingPage() {
   const github = await getGithubData();
@@ -73,7 +83,6 @@ export default async function PricingPage() {
           <SiteNav
             stars={github.stars}
             callUrl={callUrl}
-            downloadHref={github.downloads.macos}
             active="pricing"
           />
         </div>

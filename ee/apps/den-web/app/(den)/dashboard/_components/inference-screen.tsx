@@ -1,159 +1,22 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { INFERENCE_MODEL_ALIASES } from "@openwork/types/den/inference";
 import { DenButton } from "../../_components/ui/button";
+import { DenPageHeader } from "../../_components/ui/page-header";
 import { DenCard } from "../../_components/ui/card";
 import { DenNotice } from "../../_components/ui/notice";
-import { DenPageHeader } from "../../_components/ui/page-header";
+import { parseInferencePayload, type InferenceStatus } from "../../_lib/inference-status";
 import { DenSectionHeader } from "../../_components/ui/section-header";
 import { DenTable, type DenTableColumn } from "../../_components/ui/table";
 import { getErrorMessage, getRequestError, requestJson } from "../../_lib/den-flow";
 import { getBillingRoute, getCustomLlmProvidersRoute, getOrgAccessFlags } from "../../_lib/den-org";
 import { useDenFlow } from "../../_providers/den-flow-provider";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
-
-type InferenceWindowType = "five_hour" | "weekly" | "monthly";
-
-type InferenceUsageBucket = {
-  windowType: InferenceWindowType;
-  windowStartAt: string;
-  windowEndAt: string;
-  limitAmount: number;
-  usedAmount: number;
-};
-
-type InferenceStatus = {
-  enabled: boolean;
-  tier: "tier1" | "tier2";
-  memberCount: number;
-  proxyBaseUrl: string;
-  upstreamProviderConfigured: boolean;
-  subscribed: boolean;
-  buckets: InferenceUsageBucket[];
-};
-
-const WINDOW_LABEL: Record<InferenceWindowType, string> = {
-  five_hour: "5 hour usage limit",
-  weekly: "Weekly usage limit",
-  monthly: "Monthly usage limit",
-};
-
-const WINDOW_ORDER: InferenceWindowType[] = ["five_hour", "weekly", "monthly"];
-
-function isWindowType(value: unknown): value is InferenceWindowType {
-  return value === "five_hour" || value === "weekly" || value === "monthly";
-}
-
-function parseUsageBuckets(value: unknown): InferenceUsageBucket[] {
-  if (!Array.isArray(value)) return [];
-  const buckets: InferenceUsageBucket[] = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object") continue;
-    const candidate = item as Partial<InferenceUsageBucket>;
-    if (
-      !isWindowType(candidate.windowType) ||
-      typeof candidate.windowStartAt !== "string" ||
-      typeof candidate.windowEndAt !== "string" ||
-      typeof candidate.limitAmount !== "number" ||
-      typeof candidate.usedAmount !== "number"
-    ) {
-      continue;
-    }
-    buckets.push({
-      windowType: candidate.windowType,
-      windowStartAt: candidate.windowStartAt,
-      windowEndAt: candidate.windowEndAt,
-      limitAmount: candidate.limitAmount,
-      usedAmount: candidate.usedAmount,
-    });
-  }
-  return buckets;
-}
-
-function parseInferencePayload(payload: unknown): InferenceStatus | null {
-  if (!payload || typeof payload !== "object" || !("inference" in payload)) {
-    return null;
-  }
-  const inference = (payload as { inference?: unknown }).inference;
-  if (!inference || typeof inference !== "object") {
-    return null;
-  }
-  const value = inference as Partial<InferenceStatus> & { buckets?: unknown };
-  if (typeof value.enabled !== "boolean" || (value.tier !== "tier1" && value.tier !== "tier2")) {
-    return null;
-  }
-  return {
-    enabled: value.enabled,
-    tier: value.tier,
-    memberCount: typeof value.memberCount === "number" ? value.memberCount : 0,
-    proxyBaseUrl: typeof value.proxyBaseUrl === "string" ? value.proxyBaseUrl : "",
-    upstreamProviderConfigured: value.upstreamProviderConfigured === true,
-    subscribed: value.subscribed === true,
-    buckets: parseUsageBuckets(value.buckets),
-  };
-}
-
-function formatResetLabel(bucket: InferenceUsageBucket): string {
-  const reset = new Date(bucket.windowEndAt);
-  if (Number.isNaN(reset.getTime())) return "—";
-  if (bucket.windowType === "five_hour") {
-    return `Resets ${reset.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
-  }
-  return `Resets ${reset.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`;
-}
-
-function computeRemainingPercent(bucket: InferenceUsageBucket): number {
-  if (bucket.limitAmount <= 0) return 0;
-  const ratio = 1 - bucket.usedAmount / bucket.limitAmount;
-  if (!Number.isFinite(ratio)) return 0;
-  return Math.max(0, Math.min(100, ratio * 100));
-}
-
-function UsageLimitsCard({ buckets }: { buckets: InferenceUsageBucket[] }) {
-  const ordered = WINDOW_ORDER
-    .map((windowType) => buckets.find((bucket) => bucket.windowType === windowType))
-    .filter((bucket): bucket is InferenceUsageBucket => Boolean(bucket));
-
-  if (ordered.length === 0) return null;
-
-  return (
-    <DenCard className="overflow-hidden p-0">
-      <div className="border-b border-gray-100 px-6 py-4">
-        <DenSectionHeader
-          title="Usage limits"
-          description="Shared across your organization and scale with the number of active members."
-        />
-      </div>
-      <ul className="divide-y divide-gray-100">
-        {ordered.map((bucket) => {
-          const remaining = computeRemainingPercent(bucket);
-          return (
-            <li key={bucket.windowType} className="flex items-center gap-6 px-6 py-5">
-              <div className="min-w-[200px]">
-                <p className="text-[15px] font-medium text-gray-950">{WINDOW_LABEL[bucket.windowType]}</p>
-                <p className="mt-1 text-[13px] text-gray-500">{formatResetLabel(bucket)}</p>
-              </div>
-              <div className="flex flex-1 items-center gap-4">
-                <div className="h-2 flex-1 overflow-hidden rounded-full bg-gray-100">
-                  <div
-                    className="h-full rounded-full bg-gray-900 transition-[width] duration-500"
-                    style={{ width: `${remaining}%` }}
-                  />
-                </div>
-                <span className="min-w-[80px] text-right text-[13px] font-medium text-gray-700">
-                  {remaining.toFixed(1)}% left
-                </span>
-              </div>
-            </li>
-          );
-        })}
-      </ul>
-    </DenCard>
-  );
-}
+import { getGatewayDashboardAccess } from "../_lib/gateway-dashboard-access";
+import { UsageLimitsCard } from "../_features/analytics/usage-limits-card";
 
 /**
  * Editorial detail per model: what a knowledge worker should reach for it for,
@@ -221,54 +84,6 @@ const MODEL_COLUMNS: readonly DenTableColumn<LineupModel>[] = [
   },
 ];
 
-const PILLARS = [
-  {
-    label: "You or your whole team",
-    body: "One subscription activates OpenWork Models across your organization and lets everyone use battle-tested LLMs without setting anything up.",
-  },
-  {
-    label: "Nothing to set up",
-    body: "Every member is provisioned automatically. No provider accounts, no API keys.",
-  },
-  {
-    label: "No lock-in",
-    body: "Keep your own provider keys alongside these models and switch whenever you want.",
-  },
-];
-
-const STEPS: ReactNode[] = [
-  "Subscribe — one plan covers the whole workspace",
-  "Every member is provisioned automatically — nothing to send",
-  <>
-    Open OpenWork and pick any model from the{" "}
-    <code className="rounded-md bg-gray-100 px-2 py-1 font-mono text-[12px] text-gray-700">OpenWork</code> group
-  </>,
-  "Start working — usage limits are shared and scale with active members",
-];
-
-function GettingStartedCard() {
-  return (
-    <DenCard className="grid gap-6">
-      <div className="grid gap-4 sm:grid-cols-3">
-        {PILLARS.map((pillar) => (
-          <div key={pillar.label} className="grid gap-2 rounded-[16px] border border-gray-100 p-5">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-gray-400">{pillar.label}</p>
-            <p className="text-[13px] leading-5 text-gray-500">{pillar.body}</p>
-          </div>
-        ))}
-      </div>
-      <ol className="grid gap-3 border-t border-gray-100 px-1 pt-6">
-        {STEPS.map((step, index) => (
-          <li key={index} className="flex items-baseline gap-3">
-            <span className="shrink-0 font-mono text-[12px] text-gray-400">{index + 1}.</span>
-            <span className="text-[13.5px] leading-6 text-gray-700">{step}</span>
-          </li>
-        ))}
-      </ol>
-    </DenCard>
-  );
-}
-
 function ModelsLineup({ subscribed }: { subscribed: boolean }) {
   return (
     <section className="grid gap-3.5">
@@ -287,9 +102,38 @@ function ModelsLineup({ subscribed }: { subscribed: boolean }) {
   );
 }
 
-export function InferenceScreen() {
+export function InferenceScreen({ embedded = false }: { embedded?: boolean }) {
   const router = useRouter();
   const { runtimeConfig, runtimeConfigLoaded } = useDenFlow();
+  const dashboard = useOrgDashboard();
+  const gatewayAccess = getGatewayDashboardAccess(dashboard);
+  const checking = gatewayAccess === "checking" || !runtimeConfigLoaded;
+  const access = getOrgAccessFlags(
+    dashboard.orgContext?.currentMember.role ?? "member",
+    dashboard.orgContext?.currentMember.isOwner ?? false,
+    dashboard.orgContext?.roles,
+  );
+  const redirect = !access.isAdmin ? "/dashboard"
+    : runtimeConfig.orgMode === "single_org" ? getCustomLlmProvidersRoute(dashboard.orgSlug)
+    : null;
+
+  useEffect(() => {
+    if (!checking && !dashboard.orgError && redirect) router.replace(redirect);
+  }, [checking, dashboard.orgError, redirect, router]);
+
+  if (dashboard.orgError && !checking) return <DenNotice tone="error" message={dashboard.orgError} />;
+  if (checking || redirect) {
+    return <div className="flex min-h-[320px] items-center justify-center px-6 text-[14px] text-gray-500" data-testid="models-access-state" data-access-state={checking ? "checking" : "denied"}>
+      {checking ? "Checking workspace access..." : "Redirecting to your dashboard..."}
+    </div>;
+  }
+
+  // Do not mount data fetching or management actions until this workspace is verified.
+  return <InferenceContent key={dashboard.orgId} embedded={embedded} />;
+}
+
+function InferenceContent({ embedded }: { embedded: boolean }) {
+  const router = useRouter();
   const { activeOrg, orgContext, refreshOrgData, runReauthableAction } = useOrgDashboard();
   const [status, setStatus] = useState<InferenceStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -303,15 +147,7 @@ export function InferenceScreen() {
     orgContext?.roles,
   );
   const canManageModels = access.isAdmin;
-  // OpenWork Models are a hosted OpenWork Cloud offering; self-hosted
-  // (single-org) deployments manage their own LLM providers instead.
-  const isSelfHosted = runtimeConfigLoaded && runtimeConfig.orgMode === "single_org";
   const activeOrgSlug = activeOrg?.slug ?? null;
-
-  useEffect(() => {
-    if (!isSelfHosted) return;
-    router.replace(getCustomLlmProvidersRoute(activeOrgSlug));
-  }, [isSelfHosted, activeOrgSlug, router]);
 
   async function loadStatus() {
     setLoading(true);
@@ -411,10 +247,6 @@ export function InferenceScreen() {
     }
   }
 
-  if (isSelfHosted) {
-    return null;
-  }
-
   const enabled = status?.enabled === true;
   const subscribed = status?.subscribed === true;
   const showGettingStarted = !loading && status !== null && !subscribed;
@@ -424,24 +256,19 @@ export function InferenceScreen() {
     ? `${memberCount} active member${memberCount === 1 ? "" : "s"}`
     : "billed per active member";
 
+  const description = "Reliable, hand-picked models for knowledge work. No API keys to manage.";
+  const caption = `$10 / user / month · ${memberCaption}`;
+  const action = <DenButton type="button" onClick={subscribed ? toggleEnabled : () => void startSubscribeCheckout()}
+    loading={loading || saving || subscribeBusy} disabled={!canManageModels} variant={enabled ? "secondary" : "primary"}>
+    {actionLabel}
+  </DenButton>;
+
   return (
-    <div className="mx-auto grid max-w-[860px] gap-6 px-8 pb-16 pt-8">
-      <DenPageHeader
-        title="OpenWork Models"
-        description="Reliable, hand-picked models for knowledge work. No API keys to manage."
-        action={
-          <DenButton
-            type="button"
-            onClick={subscribed ? toggleEnabled : () => void startSubscribeCheckout()}
-            loading={loading || saving || subscribeBusy}
-            disabled={!canManageModels}
-            variant={enabled ? "secondary" : "primary"}
-          >
-            {actionLabel}
-          </DenButton>
-        }
-        caption={`$10 / user / month · ${memberCaption}`}
-      />
+    <div className={embedded ? "grid gap-6" : "mx-auto grid w-full max-w-[960px] gap-6 px-4 pb-12 pt-5 sm:px-6 lg:px-8"}>
+      {embedded ? <DenSectionHeader title="OpenWork Models"
+        description={<>{description}<span className="block">{caption}</span></>}
+        action={action} /> : <DenPageHeader title="OpenWork Models"
+        description={description} caption={caption} action={action} />}
 
       {error ? <DenNotice message={error} tone="error" /> : null}
 
@@ -452,11 +279,13 @@ export function InferenceScreen() {
         />
       )}
 
-      {showGettingStarted ? <GettingStartedCard /> : null}
-
-      <ModelsLineup subscribed={subscribed} />
+      {showGettingStarted ? <DenCard>
+        <p className="text-sm leading-6 text-[#637291]">One subscription activates models for everyone in your workspace. After subscribing, choose a model from the OpenWork group in the app and start a task.</p>
+      </DenCard> : null}
 
       {enabled && status ? <UsageLimitsCard buckets={status.buckets} /> : null}
+
+      <ModelsLineup subscribed={subscribed} />
 
       <p className="text-[13px] text-gray-400">
         Prefer your own provider accounts?{" "}

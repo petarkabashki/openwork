@@ -1,7 +1,7 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { getRequestError, requestJson } from "../../_lib/den-flow";
+import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { DenRequestCanceledError, DenRequestTimeoutError, getRequestError, isReauthRequiredError, requestJson } from "../../_lib/den-flow";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import {
   type ExternalMcpDiagnostic,
@@ -43,6 +43,8 @@ export type ExternalMcpConnection = {
   url: string;
   authType: ExternalMcpAuthType;
   credentialMode: ExternalMcpCredentialMode;
+  /** True when granted members may use this connection as a standard MCP server with its own tool catalog. */
+  exposeDirectly: boolean;
   connected: boolean;
   connectedAt: string | null;
   createdByName?: string | null;
@@ -233,6 +235,8 @@ export type ExternalMcpPreset = {
   url: string;
   authType: ExternalMcpAuthType;
   requiresOAuthClient?: boolean;
+  defaultOAuthClientId?: string;
+  supportedAuthTypes?: ExternalMcpAuthType[];
 };
 
 export type CreatedMcpConnection = ExternalMcpConnection & {
@@ -418,6 +422,25 @@ export class McpOAuthConfigurationRequiredError extends McpOAuthStartError {
   }
 }
 
+const MCP_OAUTH_START_UNREADABLE_MESSAGE =
+  "OpenWork could not read the answer from its API when starting the sign-in. The browser blocked the response or the request never completed. Try again; if it keeps happening, tell your workspace admin the time of this attempt.";
+
+/**
+ * The browser refused to hand the page a response: a network failure, or an
+ * error answer (often from a proxy) without CORS headers. Without a readable
+ * status the sign-in tab would show only the browser's own text ("Failed to fetch"),
+ * so wrap what is known into structured details. Den's own timeout, cancel and
+ * re-authentication errors keep their existing meaning.
+ */
+function mcpOAuthStartUnreadableError(error: unknown): McpOAuthStartError {
+  const browserError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return new McpOAuthStartError(MCP_OAUTH_START_UNREADABLE_MESSAGE, {
+    httpStatus: "unavailable",
+    errorCode: "response_unreadable",
+    responseJson: JSON.stringify({ error: "response_unreadable", browserError }, null, 2),
+  });
+}
+
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
@@ -444,6 +467,7 @@ function mcpOAuthStartDebugDetails(payload: unknown, httpStatus: number): McpAut
   return {
     httpStatus,
     ...(errorCode ? { errorCode } : {}),
+    ...(diagnostic?.code ? { diagnosticCode: diagnostic.code } : {}),
     ...(redirectUri ? { redirectUri } : {}),
     ...(clientMetadataUrl ? { clientMetadataUrl } : {}),
     ...(diagnostic?.referenceId ? { diagnosticReference: diagnostic.referenceId } : {}),
@@ -563,6 +587,7 @@ async function fetchConnections(scope: ExternalMcpConnectionScope, orgId: string
     requiredBy: parseRequiredBy(connection.requiredBy),
     identityManagedBy: parseRequiredBy(connection.identityManagedBy),
     updatedAt: typeof connection.updatedAt === "string" ? connection.updatedAt : null,
+    exposeDirectly: connection.exposeDirectly === true,
     ...(typeof connection.createdByName === "string" || connection.createdByName === null ? { createdByName: connection.createdByName } : {}),
     ...(typeof connection.needsReconnect === "boolean" ? { needsReconnect: connection.needsReconnect } : {}),
     ...(connection.credentialHealth === "unknown" || connection.credentialHealth === "ready" || connection.credentialHealth === "reconnect_required"
@@ -581,17 +606,20 @@ async function fetchConnections(scope: ExternalMcpConnectionScope, orgId: string
   }));
 }
 
-export function useMcpConnections(scope: ExternalMcpConnectionScope = "manageable") {
-  const { orgId } = useOrgDashboard();
-  return useQuery({
-    enabled: Boolean(orgId),
+export function mcpConnectionsQueryOptions(orgId: string | null, scope: ExternalMcpConnectionScope) {
+  return queryOptions({
     queryKey: mcpConnectionQueryKeys.list(orgId, scope),
     queryFn: () => fetchConnections(scope, requireOrgId(orgId)),
   });
 }
 
-export function useMcpConnectionPresets() {
-  return useQuery({
+export function useMcpConnections(scope: ExternalMcpConnectionScope = "manageable") {
+  const { orgId } = useOrgDashboard();
+  return useQuery({ ...mcpConnectionsQueryOptions(orgId, scope), enabled: Boolean(orgId) });
+}
+
+export function mcpConnectionPresetsQueryOptions() {
+  return queryOptions({
     queryKey: mcpConnectionQueryKeys.presets(),
     queryFn: async (): Promise<ExternalMcpPreset[]> => {
       const { response, payload } = await requestJson("/v1/mcp-connections/presets", {}, 15000);
@@ -601,7 +629,14 @@ export function useMcpConnectionPresets() {
       const record = payload as { presets?: ExternalMcpPreset[] };
       return record.presets ?? [];
     },
+    // The catalog is fixed for a Den deploy, so one load per session is enough.
+    staleTime: Infinity,
+    gcTime: Infinity,
   });
+}
+
+export function useMcpConnectionPresets() {
+  return useQuery(mcpConnectionPresetsQueryOptions());
 }
 
 export type McpConnectionAccessInput = {
@@ -615,6 +650,7 @@ export type CreateMcpConnectionInput = {
   url: string;
   authType: ExternalMcpAuthType;
   credentialMode: ExternalMcpCredentialMode;
+  exposeDirectly?: boolean;
   apiKey?: string;
   oauthClient?: {
     clientId: string;
@@ -642,6 +678,7 @@ export type UpdateMcpConnectionInput = {
   url: string;
   authType: ExternalMcpAuthType;
   credentialMode: ExternalMcpCredentialMode;
+  exposeDirectly: boolean;
   apiKey?: string;
   oauthClient?: {
     clientId: string;
@@ -878,11 +915,20 @@ export function useStartMcpConnectionOAuth() {
 
   return useMutation({
     mutationFn: async (connectionId: string): Promise<{ status: "connected" | "needs_auth"; authorizeUrl: string | null }> => {
-      const { response, payload } = await requestJson(
-        `/v1/mcp-connections/${encodeURIComponent(connectionId)}/connect/start`,
-        { headers: getOrgScopeHeaders(requireOrgId(orgId)) },
-        20000,
-      );
+      let response: Response;
+      let payload: unknown;
+      try {
+        ({ response, payload } = await requestJson(
+          `/v1/mcp-connections/${encodeURIComponent(connectionId)}/connect/start`,
+          { headers: getOrgScopeHeaders(requireOrgId(orgId)) },
+          20000,
+        ));
+      } catch (error) {
+        if (isReauthRequiredError(error) || error instanceof DenRequestTimeoutError || error instanceof DenRequestCanceledError) {
+          throw error;
+        }
+        throw mcpOAuthStartUnreadableError(error);
+      }
       if (!response.ok) {
         const details = mcpOAuthStartDebugDetails(payload, response.status);
         const requestError = getRequestError(payload, response, `Failed to start OAuth (${response.status}).`);

@@ -1,9 +1,8 @@
-import type { DynamicToolUIPart, ToolUIPart, UIMessage } from "ai"
+import type { DynamicToolUIPart, ToolUIPart } from "ai"
 import {
   isApplyPatchToolPart,
   isBashToolPart,
   isEditToolPart,
-  isEnvVarRequestToolPart,
   isGlobToolPart,
   isGrepToolPart,
   isLspToolPart,
@@ -15,21 +14,13 @@ import {
   isWebFetchToolPart,
   isWebSearchToolPart,
   isWriteToolPart,
-} from "@/lib/build-in-tools"
-import { parseFilename, truncateText } from "@/components/tools/path"
+} from "./build-in-tools"
+import { parseFilename, truncateText } from "../components/tools/path"
 
 type AnyToolPart = ToolUIPart | DynamicToolUIPart
 
 export function isToolPartInFlight(part: AnyToolPart): boolean {
   return part.state === "input-streaming" || part.state === "input-available"
-}
-
-export function collectToolParts(messages: UIMessage[]): DynamicToolUIPart[] {
-  return messages.flatMap((message) =>
-    message.parts.filter(
-      (part): part is DynamicToolUIPart => part.type === "dynamic-tool"
-    )
-  )
 }
 
 function hostnameOf(url: string | undefined): string | undefined {
@@ -93,10 +84,6 @@ export function getToolActivityLabel(part: AnyToolPart): string {
   if (isQuestionToolPart(part)) {
     return "Asking a question"
   }
-  if (isEnvVarRequestToolPart(part)) {
-    const key = part.input?.key?.trim()
-    return key ? `Requesting ${key}` : "Requesting an environment variable"
-  }
   if (isTaskToolPart(part)) {
     const description = part.input?.description?.trim()
     return description
@@ -119,4 +106,3 @@ export function getActiveToolLabel(parts: DynamicToolUIPart[]): string | null {
   }
   return null
 }
-

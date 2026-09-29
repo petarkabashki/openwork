@@ -22,9 +22,14 @@ export interface CliArgs {
   verbose?: boolean;
   logFormat?: LogFormat;
   logRequests?: boolean;
-  engineRollover?: boolean;
   version?: boolean;
   help?: boolean;
+  /** `openwork-server web`: serve the bundled UI + API on one origin with a managed engine. */
+  web?: boolean;
+  /** `web --open`: launch the default browser once the server is listening. */
+  open?: boolean;
+  /** `web --no-bootstrap-token`: do not sign the browser in automatically. */
+  bootstrapToken?: boolean;
 }
 
 interface FileConfig {
@@ -43,7 +48,6 @@ interface FileConfig {
   opencodePassword?: string;
   logFormat?: LogFormat;
   logRequests?: boolean;
-  engineRollover?: boolean;
 }
 
 const DEFAULT_PORT = 8787;
@@ -70,9 +74,21 @@ function parseBoolean(value: string | undefined): boolean | undefined {
 
 export function parseCliArgs(argv: string[]): CliArgs {
   const args: CliArgs = { workspaces: [] };
+  if (argv[0] === "web") {
+    args.web = true;
+    argv = argv.slice(1);
+  }
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (!value) continue;
+    if (value === "--open") {
+      args.open = true;
+      continue;
+    }
+    if (value === "--no-bootstrap-token") {
+      args.bootstrapToken = false;
+      continue;
+    }
     if (value === "--help" || value === "-h") {
       args.help = true;
       continue;
@@ -177,7 +193,14 @@ export function parseCliArgs(argv: string[]): CliArgs {
 
 export function printHelp(): void {
   const message = [
-    "openwork-server",
+    "openwork-server [web] [options]",
+    "",
+    "Commands:",
+    "  web                      Serve the OpenWork web UI + API on one origin with a",
+    "                           managed OpenCode engine (downloaded on first run).",
+    "                           Defaults: --host 127.0.0.1, --approval auto, workspace = cwd.",
+    "    --open                 Open the browser once listening",
+    "    --no-bootstrap-token   Require pasting the client token instead of auto sign-in",
     "",
     "Options:",
     "  --config <path>          Path to server.json",
@@ -306,9 +329,6 @@ export async function resolveServerConfig(cli: CliArgs): Promise<ServerConfig> {
   const envLogRequests = parseBoolean(process.env.OPENWORK_LOG_REQUESTS);
   const logRequests = cli.logRequests ?? envLogRequests ?? fileConfig.logRequests ?? DEFAULT_LOG_REQUESTS;
 
-  const envEngineRollover = parseBoolean(process.env.OPENWORK_ENGINE_ROLLOVER);
-  const engineRollover = cli.engineRollover ?? envEngineRollover ?? fileConfig.engineRollover ?? false;
-
   const authorizedRoots =
     fileConfig.authorizedRoots?.length
       ? fileConfig.authorizedRoots.map((root) => resolve(configDir, root))
@@ -337,6 +357,5 @@ export async function resolveServerConfig(cli: CliArgs): Promise<ServerConfig> {
     hostTokenSource,
     logFormat,
     logRequests,
-    engineRollover,
   };
 }

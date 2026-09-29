@@ -1,145 +1,243 @@
+import { spec } from "@openwork/testkit";
 import { expect } from "vitest";
-import { evalIn, go, waitFor } from "@openwork/behaviors";
-import { app, needs, server, test, unmetNeeds } from "@openwork/testkit";
-import type { TestNeeds } from "@openwork/testkit";
+import { modelPicker, modelPickerEffortWeb } from "../worlds/chat.ts";
 
-const requirements: TestNeeds = {
-  optIn: ["OPENWORK_EVAL_E2E_TESTS"],
-};
-const missingRequirements = unmetNeeds(requirements, process.env);
-const title = missingRequirements.length > 0
-  ? `composer model picker promo removal skipped — needs: ${missingRequirements.join(", ")}`
-  : "the composer model pickers keep their controls without the OpenWork Models subscribe promo";
+const test = spec.world(modelPicker);
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+test("the composer model pickers keep their controls without the OpenWork Models subscribe promo", async ({ user, probe, step }) => {
+  const draft = "Keep this draft while editing model settings.";
+  await user.type("composer", draft);
+  const initial = await probe.composer();
+  await user.click({ role: "button", label: "Change model" });
+  await user.click({ role: "button", label: /^Model\s+Big Pickle/ });
 
-test(title, async ({ evidence, place }) => {
-  needs(requirements);
-  await using den = await server({ place });
-  await using desktop = await app({ den, as: "admin", place });
-
-  await go(desktop, `/workspace/${desktop.workspaceId}/session`);
-  await waitFor(desktop, `Boolean(document.querySelector('button[aria-label="Change model"]'))`, {
-    timeoutMs: 60_000,
-    label: "composer model selector",
+  await step("the compact picker keeps controls without subscribe promotion", async () => {
+    await user.see({ placeholder: "Search models..." });
+    await user.see({ role: "button", label: "All models" });
+    await user.see({ role: "button", label: "Connect more providers" });
+    for (const removed of [
+      "Your API keys",
+      "Add your keys",
+      "hosted · no API keys",
+      "One subscription unlocks these in every workspace.",
+      "Enable →",
+      "Sign in →",
+      "Hide",
+    ]) await user.notSee({ text: removed });
   });
 
-  const compactOpened = await evalIn(desktop, `(() => {
-    const trigger = document.querySelector('button[aria-label="Change model"]');
-    if (!(trigger instanceof HTMLButtonElement)) return false;
-    trigger.click();
-    return true;
-  })()`);
-  expect(compactOpened).toBe(true);
-  await waitFor(desktop, `Boolean(document.querySelector('[data-slot="popover-content"] input[placeholder="Search models..."]'))`, {
-    timeoutMs: 20_000,
-    label: "compact model picker",
+  await user.click({ role: "button", label: "All models" });
+  await step("the full Models dialog keeps controls without subscribe promotion", async () => {
+    await user.see({ text: "Models" });
+    await user.see({ text: "Select a model for this session." });
+    await user.see({ placeholder: "Search providers and models..." });
+    await user.see({ role: "button", label: "Done" });
+    await user.notSee({ role: "button", label: "Hide OpenWork Models" });
+    await user.notSee({ text: "Subscribe to use hosted frontier models in this workspace." });
+    await user.notSee({ text: "Sign in to unlock hosted frontier models for your team." });
+    await user.notSee({ role: "button", label: "Subscribe" });
   });
+  await step("provider Default is explicit and editing it preserves the draft and model", async () => {
+    await user.see({ testId: "current-model-settings" });
+    await user.click({ role: "button", label: "Default" });
+    expect((await probe.dom('[data-testid="current-model-settings"] button[aria-pressed="true"]')).elements.map((element) => element.text)).toEqual(["Default"]);
+    await user.click({ role: "button", label: "Done" });
+    await user.see("composer", { text: draft });
+    const current = await probe.composer();
+    expect(current.selectedModelLabel).toBe(initial.selectedModelLabel);
+  });
+});
 
-  const compact = await evalIn(desktop, `(() => {
-    const popover = document.querySelector('[data-slot="popover-content"]');
-    if (!(popover instanceof HTMLElement)) return null;
-    const text = popover.innerText.replace(/\\s+/g, " ").trim();
-    const hasExactText = (expected) => [...popover.querySelectorAll("*")]
-      .some((element) => (element.textContent ?? "").replace(/\\s+/g, " ").trim() === expected);
-    return {
-      search: Boolean(popover.querySelector('input[placeholder="Search models..."]')),
-      allModels: [...popover.querySelectorAll("button")]
-        .some((button) => (button.textContent ?? "").trim() === "All models"),
-      connectMore: [...popover.querySelectorAll("button")]
-        .some((button) => (button.textContent ?? "").trim() === "Connect more providers"),
-      yourApiKeys: text.includes("Your API keys"),
-      addYourKeys: hasExactText("Add your keys"),
-      hostedMarker: text.includes("hosted · no API keys"),
-      unlockSentence: text.includes("One subscription unlocks these in every workspace."),
-      enableAction: hasExactText("Enable →"),
-      signInAction: hasExactText("Sign in →"),
-      hideAction: hasExactText("Hide"),
-    };
-  })()`);
-  expect(compact).toEqual({
-    search: true,
-    allModels: true,
-    connectMore: true,
-    yourApiKeys: false,
-    addYourKeys: false,
-    hostedMarker: false,
-    unlockSentence: false,
-    enableAction: false,
-    signInAction: false,
-    hideAction: false,
-  });
-  evidence.recordAssertionEvidence(
-    "The signed-in test app's compact model picker retains search and All models without the removed subscribe promo",
-    `Compact picker controls and removed-marker checks: ${JSON.stringify(compact)}.`,
-    isRecord(compact)
-      && compact.search === true
-      && compact.allModels === true
-      && compact.connectMore === true
-      && compact.yourApiKeys === false
-      && compact.addYourKeys === false
-      && compact.hostedMarker === false
-      && compact.unlockSentence === false
-      && compact.enableAction === false
-      && compact.signInAction === false
-      && compact.hideAction === false,
-  );
+const effortTest = spec.world(modelPickerEffortWeb, {
+  timeout: 420_000, resources: { surfaces: ["appWeb"], services: ["mock"] },
+});
 
-  const allModelsClicked = await evalIn(desktop, `(() => {
-    const popover = document.querySelector('[data-slot="popover-content"]');
-    const button = [...(popover?.querySelectorAll("button") ?? [])]
-      .find((candidate) => (candidate.textContent ?? "").trim() === "All models");
-    if (!(button instanceof HTMLButtonElement)) return false;
-    button.click();
-    return true;
-  })()`);
-  expect(allModelsClicked).toBe(true);
-  await waitFor(desktop, `Boolean(document.querySelector('[data-slot="dialog-content"] input[placeholder="Search providers and models..."]'))`, {
-    timeoutMs: 20_000,
-    label: "full Models dialog",
+effortTest("MODEL-01 selected reasoning effort survives reload and reaches the native provider", async ({ world, user, probe, step, evidence }) => {
+  expect(world.engine).toBe("v2");
+  const runtime = await world.runtimeFacts();
+  expect(runtime.browser).toContain("HeadlessChrome");
+  expect(runtime.electronBridge).toBe(false);
+  evidence.recordJsonArtifact("MODEL-01 headless runtime", runtime);
+  const prefix = `/workspace/${world.workspace.workspaceId}/opencode2/api`;
+  const status = await world.readNative("/experimental/engine-v2-preview/status");
+  expect(status.status).toBe(200);
+  expect(status.body).toMatchObject({ running: true, chatRouting: true });
+  const catalog = await world.readNative(`${prefix}/model`);
+  expect(catalog.status).toBe(200);
+  expect(catalog.body).toMatchObject({ data: expect.arrayContaining([
+    expect.objectContaining({ id: world.modelId, providerID: world.providerId, variants: [{ id: "low" }, { id: "high" }, { id: "CustomExact" }, { id: "auto" }] }),
+    expect.objectContaining({ id: "standard", providerID: world.providerId, variants: [] }),
+    expect.objectContaining({ id: world.fastModelId, providerID: world.fastProviderId, variants: [{ id: "high" }, { id: world.fastDefaultVariant }, { id: world.fastHighVariant }] }),
+  ]) });
+  expect(JSON.stringify(catalog.body)).not.toMatch(/synthetic-(effort|fast)-key|"settings":|"providerOptions":|"headers":/);
+  evidence.recordJsonArtifact("MODEL-01 native catalog", catalog);
+  await step("Default leaves the closed trigger showing only the model", async () => {
+    await user.looks([
+      "The closed composer model trigger shows Reasoning witness with a dropdown chevron, without a Default label or a middle-dot separator next to the model name.",
+    ]);
+    await user.see({ role: "button", label: "Change model" }, { text: /^Reasoning witness$/ });
   });
-
-  const full = await evalIn(desktop, `(() => {
-    const dialog = document.querySelector('[data-slot="dialog-content"]');
-    if (!(dialog instanceof HTMLElement)) return null;
-    const text = dialog.innerText.replace(/\\s+/g, " ").trim();
-    const hasExactText = (expected) => [...dialog.querySelectorAll("*")]
-      .some((element) => (element.textContent ?? "").replace(/\\s+/g, " ").trim() === expected);
-    return {
-      title: hasExactText("Models"),
-      subtitle: hasExactText("Select a model for this session."),
-      search: Boolean(dialog.querySelector('input[placeholder="Search providers and models..."]')),
-      done: [...dialog.querySelectorAll("button")]
-        .some((button) => (button.textContent ?? "").trim() === "Done"),
-      hideButton: Boolean(dialog.querySelector('button[aria-label="Hide OpenWork Models"]')),
-      subscribeSentence: text.includes("Subscribe to use hosted frontier models in this workspace."),
-      unlockSentence: text.includes("Sign in to unlock hosted frontier models for your team."),
-      subscribeAction: hasExactText("Subscribe"),
-    };
-  })()`);
-  expect(full).toEqual({
-    title: true,
-    subtitle: true,
-    search: true,
-    done: true,
-    hideButton: false,
-    subscribeSentence: false,
-    unlockSentence: false,
-    subscribeAction: false,
+  await user.click({ role: "button", label: "Change model" });
+  await step("only advertised effort choices are selectable", async () => {
+    await user.click({ role: "button", label: /^Effort/ });
+    await user.see({ role: "button", label: "Default" });
+    await user.see({ role: "button", label: "Low" });
+    await user.notSee({ role: "button", label: /^Hidden/ });
+    await user.click({ role: "button", label: "High" });
+    await user.see({ role: "button", label: "Change model" }, { text: /High/ });
+    await user.looks(["The closed composer model trigger shows Reasoning witness followed by a middle-dot separator and High, with a dropdown chevron."]);
   });
-  evidence.recordAssertionEvidence(
-    "All models opens the full session Models dialog without the removed subscribe promo",
-    `Full dialog controls and removed-marker checks: ${JSON.stringify(full)}.`,
-    isRecord(full)
-      && full.title === true
-      && full.subtitle === true
-      && full.search === true
-      && full.done === true
-      && full.hideButton === false
-      && full.subscribeSentence === false
-      && full.unlockSentence === false
-      && full.subscribeAction === false,
-  );
+  await user.press("Escape");
+  await user.type("composer", world.prompt);
+  await user.click("Run task");
+  await user.see({ text: "Air scatters blue light more strongly." }, { timeoutMs: 90_000 });
+  await user.see("Run task", { timeoutMs: 30_000 });
+  await step("High is persisted and reaches the real v2 provider request", async () => {
+    const requests = await world.requests();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ model: world.modelId, reasoningEffort: "high" });
+    expect(await world.modelRequests()).toEqual([{ model: { providerID: world.providerId, id: world.modelId, variant: "high" } }]);
+    const native = await world.readNative(`${prefix}/session/${world.session.sessionId}`);
+    expect(native.body).toMatchObject({ data: { model: { id: world.modelId, providerID: world.providerId, variant: "high" } } });
+    evidence.recordJsonArtifact("MODEL-01 first request and native session", { requests, native });
+    await user.reload();
+    await user.see("Run task", { timeoutMs: 60_000 });
+    await user.click({ role: "button", label: "Change model" });
+    await user.see({ role: "button", label: /^Effort\s+High/ });
+    await user.press("Escape");
+    await user.type("composer", world.prompt);
+    await user.click("Run task");
+    await probe.eventually(() => world.requests(), { within: 90_000, label: "reloaded effort reaches provider", until: (requests) => requests.length === 2 });
+    expect((await world.requests()).map((request) => request.reasoningEffort)).toEqual(["high", "high"]);
+    evidence.recordJsonArtifact("MODEL-01 reloaded provider requests", await world.requests());
+  });
+  await user.see("Run task", { timeoutMs: 30_000 });
+  await step("a custom effort ID reaches native resolution without case changes", async () => {
+    await user.click({ role: "button", label: "Change model" });
+    await user.click({ role: "button", label: /^Effort/ });
+    await user.click({ role: "button", label: "CustomExact" });
+    await user.see({ role: "button", label: "Change model" }, { text: /CustomExact/ });
+    await user.press("Escape");
+    await user.type("composer", world.prompt);
+    await user.click("Run task");
+    await probe.eventually(() => world.requests(), { within: 90_000, label: "custom effort reaches provider", until: (requests) => requests.length === 3 });
+    expect((await world.requests()).map((request) => request.reasoningEffort)).toEqual(["high", "high", "low"]);
+    const native = await world.readNative(`${prefix}/session/${world.session.sessionId}`);
+    expect(native.body).toMatchObject({ data: { model: { id: world.modelId, providerID: world.providerId, variant: "CustomExact" } } });
+    evidence.recordJsonArtifact("MODEL-01 custom effort request and native session", { requests: await world.requests(), native });
+  });
+  await user.see("Run task", { timeoutMs: 30_000 });
+  await step("a model without advertised variants keeps effort unavailable", async () => {
+    await user.click({ role: "button", label: "Change model" });
+    await user.click({ role: "button", label: /^Model\s+Reasoning witness/ });
+    await user.type({ placeholder: "Search models..." }, "Standard witness");
+    await user.click({ role: "option", label: /^Standard witness/ });
+    await user.see({ role: "button", label: "Change model" }, { text: /Standard witness/ });
+    await user.notSee({ placeholder: "Search models..." });
+    await user.click({ role: "button", label: "Change model" });
+    await user.see({ role: "button", label: /^Effort\s+Unavailable/ });
+    const disabled = await probe.dom('[data-slot="model-select-root"] button:disabled');
+    expect(disabled.elements.some((button) => button.text.includes("Effort") && button.text.includes("Unavailable"))).toBe(true);
+    await user.press("Escape");
+    await probe.eventually(() => probe.dom('[data-slot="model-select-root"]'), {
+      within: 5_000, label: "effort picker finishes closing", until: (snapshot) => snapshot.elements.length === 0,
+    });
+    await user.notSee({ role: "button", label: /^Effort\s+Unavailable/ });
+    await user.type("composer", world.prompt);
+    await user.click("Run task");
+    await probe.eventually(() => world.requests(), { within: 90_000, label: "unsupported model omits effort", until: (requests) => requests.length === 4 });
+    const requests = await world.requests();
+    expect(requests[3]).toMatchObject({ model: "standard", reasoningEffort: null });
+    const native = await world.readNative(`${prefix}/session/${world.session.sessionId}`);
+    const modelRequests = await world.modelRequests();
+    expect(modelRequests).toEqual([
+      { model: { providerID: world.providerId, id: world.modelId, variant: "high" } },
+      { model: { providerID: world.providerId, id: world.modelId, variant: "CustomExact" } },
+      { model: { providerID: world.providerId, id: "standard" } },
+    ]);
+    // Native v2 canonicalizes an omitted variant to its internal default ID.
+    expect(native.body).toMatchObject({ data: { model: { id: "standard", providerID: world.providerId, variant: "default" } } });
+    evidence.recordJsonArtifact("MODEL-01 unsupported model request and native session", { requests, modelRequests, native });
+    await user.see("Run task", { timeoutMs: 30_000 });
+  });
+  await step("returning to Default removes the suffix and persists after reload", async () => {
+    await user.click({ role: "button", label: "Change model" });
+    await user.click({ role: "button", label: /^Model\s+Standard witness/ });
+    await user.type({ placeholder: "Search models..." }, "Reasoning witness");
+    await user.click({ role: "option", label: /^Reasoning witness/ });
+    await user.click({ role: "button", label: "High" });
+    await user.see({ role: "button", label: "Change model" }, { text: /High/ });
+    await user.click({ role: "button", label: "Change model" });
+    await user.click({ role: "button", label: /^Effort/ });
+    await user.click({ role: "button", label: "Default" });
+    await user.see({ role: "button", label: "Change model" }, { text: /^Reasoning witness$/ });
+    await user.reload();
+    await user.see("Run task", { timeoutMs: 60_000 });
+    await user.see({ role: "button", label: "Change model" }, { text: /^Reasoning witness$/ });
+    await user.looks(["The closed composer model trigger shows Reasoning witness and its dropdown chevron, with no Default label and no middle-dot separator next to the model name."]);
+    await user.type("composer", world.prompt);
+    await user.click("Run task");
+    await probe.eventually(() => world.requests(), { within: 90_000, label: "Default reaches provider after reload", until: (requests) => requests.length === 5 });
+    expect((await world.requests())[4]).toMatchObject({ model: world.modelId, reasoningEffort: null });
+    await user.see("Run task", { timeoutMs: 30_000 });
+    const native = await world.readNative(`${prefix}/session/${world.session.sessionId}`);
+    expect(native.body).toMatchObject({ data: { model: { id: world.modelId, providerID: world.providerId, variant: "default" } } });
+    evidence.recordJsonArtifact("MODEL-01 Default after reload", native);
+    await user.click({ role: "button", label: "Change model" });
+    await user.see({ role: "button", label: /^Effort\s+Default/ });
+    await user.click({ role: "button", label: /^Effort/ });
+    await user.see({ role: "button", label: "Default" });
+    await user.looks(["The effort picker is open and retains a selectable Default choice alongside Low, High, Auto, and CustomExact."]);
+    await user.click({ role: "button", label: "Auto" });
+    await user.see({ role: "button", label: "Change model" }, { text: /^Reasoning witness\s*· Auto$/ });
+    await user.reload();
+    await user.see("Run task", { timeoutMs: 60_000 });
+    await user.see({ role: "button", label: "Change model" }, { text: /^Reasoning witness\s*· Auto$/ });
+    await user.looks(["The closed composer model trigger shows Reasoning witness followed by a middle-dot separator and Auto, with a dropdown chevron."]);
+    await user.type("composer", world.prompt);
+    await user.click("Run task");
+    await probe.eventually(() => world.requests(), { within: 90_000, label: "explicit Auto reaches provider after reload", until: (requests) => requests.length === 6 });
+    expect((await world.requests())[5]).toMatchObject({ model: world.modelId, reasoningEffort: "low" });
+    await user.see("Run task", { timeoutMs: 30_000 });
+    const explicit = await world.readNative(`${prefix}/session/${world.session.sessionId}`);
+    expect(explicit.body).toMatchObject({ data: { model: { id: world.modelId, providerID: world.providerId, variant: "auto" } } });
+    evidence.recordJsonArtifact("MODEL-01 explicit auto variant after reload", explicit);
+  });
+  await step("Default plus Fast hides only Default and preserves speed after reload", async () => {
+    await user.click({ role: "button", label: "Change model" });
+    await user.click({ role: "button", label: /^Model\s+Reasoning witness/ });
+    await user.type({ placeholder: "Search models..." }, "Fast witness");
+    await user.click({ role: "option", label: /^Fast witness/ });
+    await user.click({ role: "button", label: "Default" });
+    await user.see({ role: "button", label: "Change model" }, { text: /^Fast witness$/ });
+    await user.click({ role: "button", label: "Change model" });
+    await user.click({ role: "button", label: /^Effort/ });
+    await user.click({ role: "button", label: /^Fast\s+Off$/ });
+    await user.see({ role: "button", label: "Change model" }, { text: /^Fast witness\s*· Fast$/ });
+    await user.reload();
+    await user.see("Run task", { timeoutMs: 60_000 });
+    await user.see({ role: "button", label: "Change model" }, { text: /^Fast witness\s*· Fast$/ });
+    await user.looks(["The closed composer model trigger shows Fast witness followed by a middle-dot separator and Fast with a dropdown chevron. It does not show Default or Default + Fast."]);
+    await user.click({ role: "button", label: "Change model" });
+    await user.click({ role: "button", label: /^Effort/ });
+    await user.see({ role: "button", label: /^Fast\s+On$/ });
+    await user.see({ role: "button", label: "Default" });
+    const pressed = await probe.dom('[data-slot="model-thinking-submenu"] button[aria-pressed="true"]');
+    expect(pressed.elements.map((button) => button.text.replace(/\s/g, ""))).toEqual(["FastOn", "Default"]);
+    await user.looks(["The open effort picker for Fast witness shows Fast On and Default selected, and retains a High effort choice."]);
+    await user.press("Escape");
+    await user.type("composer", world.prompt);
+    await user.click("Run task");
+    await probe.eventually(() => world.requests(), { within: 90_000, label: "Default plus Fast reaches provider", until: (requests) => requests.length === 7 });
+    expect((await world.requests())[6]).toMatchObject({ model: world.fastModelId, reasoningEffort: "medium" });
+    const native = await world.readNative(`${prefix}/session/${world.session.sessionId}`);
+    expect(native.body).toMatchObject({ data: { model: { id: world.fastModelId, providerID: world.fastProviderId, variant: world.fastDefaultVariant } } });
+    evidence.recordJsonArtifact("MODEL-01 Default plus Fast native request", { native, requests: await world.requests() });
+    await user.see("Run task", { timeoutMs: 30_000 });
+    await user.click({ role: "button", label: "Change model" });
+    await user.click({ role: "button", label: /^Effort/ });
+    await user.click({ role: "button", label: "High" });
+    await user.see({ role: "button", label: "Change model" }, { text: /^Fast witness\s*· High \+ Fast$/ });
+    await user.looks(["The closed composer model trigger shows Fast witness followed by a middle-dot separator and High + Fast, with a dropdown chevron."]);
+  });
 });

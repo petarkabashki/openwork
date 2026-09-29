@@ -25,6 +25,20 @@ export function deriveSessionRenderModel(input: {
     };
   }
 
+  if (input.isError && input.hasSnapshot && input.renderedSessionId === input.intendedSessionId) {
+    // A failed background refresh of the session already on screen is not a
+    // failed transition. The server restarts often and briefly; the rendered
+    // history stays valid, so the composer must keep accepting sends. A send
+    // that reaches a server still down fails with its own visible error and
+    // restores the draft, which is the explanation the user needs.
+    return {
+      intendedSessionId: input.intendedSessionId,
+      renderedSessionId: input.renderedSessionId,
+      transitionState: "idle",
+      renderSource: "error",
+    };
+  }
+
   if (input.isError) {
     return {
       intendedSessionId: input.intendedSessionId,
@@ -55,7 +69,11 @@ export function deriveSessionRenderModel(input: {
   return {
     intendedSessionId: input.intendedSessionId,
     renderedSessionId: input.renderedSessionId,
-    transitionState: input.isFetching ? "switching" : "idle",
+    // A background refresh of the session already on screen is not a session
+    // switch. Keeping it idle prevents the composer from becoming temporarily
+    // non-editable (and losing focus) when a tool call or final message causes
+    // the current snapshot to refetch.
+    transitionState: "idle",
     renderSource: "live",
   };
 }

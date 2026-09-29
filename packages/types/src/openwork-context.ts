@@ -40,11 +40,14 @@ export const openworkConversationLayoutSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("single"),
     sessionId: z.string(),
+    workspaceId: z.string().optional(),
   }),
   z.object({
     kind: z.literal("split"),
     primarySessionId: z.string(),
+    primaryWorkspaceId: z.string().optional(),
     secondarySessionId: z.string(),
+    secondaryWorkspaceId: z.string().optional(),
     focused: z.enum(["primary", "secondary"]),
   }),
 ])
@@ -55,7 +58,7 @@ export const openworkPanelTabSchema = z.object({
   kind: z.enum(["browser", "artifact"]),
   label: z.string(),
   url: z.string().optional(),
-  status: z.enum(["loading", "ready"]).optional(),
+  status: z.enum(["loading", "ready", "suspending", "suspended", "restoring"]).optional(),
 })
 export type OpenworkPanelTab = z.infer<typeof openworkPanelTabSchema>
 
@@ -72,10 +75,14 @@ export const openworkContextSnapshotSchema = z.object({
   schemaVersion: z.literal(OPENWORK_CONTEXT_SCHEMA_VERSION),
   revision: z.number().int().nonnegative(),
   capturedAt: z.string(),
+  features: z.object({
+    connectionQuestions: z.boolean().optional(),
+  }).optional(),
   screen: openworkScreenSchema,
   conversations: z.object({
     tabs: z.array(openworkSessionRefSchema),
     layout: openworkConversationLayoutSchema,
+    pinnedSessionIds: z.array(z.string()),
   }),
   chrome: z.object({
     sidebarOpen: z.boolean(),
@@ -91,7 +98,7 @@ export const openworkContextSnapshotSchema = z.object({
   sidePanel: z.object({
     open: z.boolean(),
     ownerSessionId: z.string().nullable(),
-    kind: z.enum(["panel", "extensions", "voice"]).nullable(),
+    kind: z.enum(["panel", "extensions"]).nullable(),
     tabs: z.array(openworkPanelTabSchema),
     activeTabId: z.string().nullable(),
   }),

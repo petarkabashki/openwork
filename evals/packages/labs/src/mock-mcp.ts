@@ -10,6 +10,12 @@ export interface MockAuthorizeRequest {
   path: string;
   url: string;
   at: string;
+  status?: number;
+  grantType?: string;
+  /** Non-secret fingerprint, shared by token issuance and resource validation witnesses. */
+  tokenId?: string | null;
+  refreshTokenIssued?: boolean;
+  oauthError?: string;
 }
 
 /** A tool invocation the connector actually served, and which credential served it. */
@@ -20,6 +26,68 @@ export interface MockToolCall {
   tokenId: string | null;
   /** When the connector served it (the mock's clock). */
   at: string;
+}
+
+export interface MockAgentToolStep {
+  /** Emit an unadvertised tool call to exercise the engine's rejection boundary. */
+  allowUnadvertisedTool?: boolean;
+  /** Derive the handoff from the actual model input instead of fixture arguments. */
+  argumentsFrom?: "computer-mention" | "skill-catalog" | "capability-search" | "skill-list";
+  tool: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface MockAgentWorkload {
+  /** Chat Completions: return this many 429s with Retry-After before serving the workload. */
+  rateLimitAttempts?: number;
+  /** Chat Completions: return this many HTTP 500s before serving the workload. */
+  serverErrorAttempts?: number;
+  /** Chat Completions: match the latest user message and count only its tool rounds. */
+  latestUserTurn?: boolean;
+  promptMarker: string;
+  /** A dedicated mock may answer every main turn without changing user prompts. */
+  matchAll?: boolean;
+  finalReply: string;
+  /** Derive the final reply from the real tool result or model system instructions. */
+  finalReplyFrom?: "last-tool-text" | "system-text";
+  /** Stream the final reply as consecutive content deltas of this many characters instead of one. */
+  finalReplyChunkSize?: number;
+  /** Exact content-delta boundaries. Their concatenation must equal finalReply. */
+  finalReplyChunks?: string[];
+  /** Initially release this many exact chunks, then wait for releaseAgentReply(). 0 holds the whole reply. */
+  finalReplyInitiallyReleasedChunks?: number;
+  /** Hold the final response before sending headers, to exercise loading transitions. */
+  finalReplyDelayMs?: number;
+  /** Chat Completions: emit a reasoning block before the final answer. */
+  finalReasoning?: string;
+  /** Tool calls the agent makes before its final reply; empty answers directly. */
+  steps: MockAgentToolStep[];
+}
+
+export interface MockAgentRequest {
+  model: string;
+  advertisedToolNames?: string[];
+  toolResultCodes?: unknown;
+  reasoningEffort?: string | null;
+  promptMarker: string | null;
+  matchedMarkers: string[];
+  completedTools: number;
+  kind: "utility" | "tool" | "final" | "error";
+  toolName: string | null;
+  arguments: Record<string, unknown>;
+  at: string;
+}
+
+export interface MockAgentReplyState {
+  promptMarker: string;
+  releasedChunks: number;
+  deliveredChunks: number;
+  totalChunks: number;
+  prefix: string;
+  complete: boolean;
+  waiting: number;
+  aborted: boolean;
+  timedOut: boolean;
 }
 
 export interface MockMcpHandle {
@@ -37,24 +105,72 @@ export interface MockMcpHandle {
    * calls and returns before this run's calls ever arrive.
    */
   toolCalls(opts?: { name?: string; timeoutMs?: number; atLeast?: number; sinceIso?: string }): Promise<MockToolCall[]>;
+  agentRequests(opts?: { promptMarker?: string; timeoutMs?: number; atLeast?: number; sinceIso?: string }): Promise<MockAgentRequest[]>;
+  agentReplyState(promptMarker: string): Promise<MockAgentReplyState>;
+  releaseAgentReply(promptMarker: string, count?: number): Promise<MockAgentReplyState>;
   handshakes(opts?: { timeoutMs?: number; atLeast?: number; sinceIso?: string }): Promise<MockAuthorizeRequest[]>;
   configureOAuthRedirectUris(redirectUris: readonly string[]): Promise<void>;
+  /** Replace callback faults; an empty object restores normal token/resource responses. */
+  configureOAuthCallback(options: {
+    issueRefreshToken?: boolean;
+    resourceStatus?: 401 | 403;
+    /** Return HTTP 400 invalid_grant after validating the authorization code and PKCE. */
+    tokenErrorDescription?: string;
+  }): Promise<void>;
   resetOAuth(): Promise<void>;
+  /** Expire access tokens and hold refresh replies until explicitly released. */
+  holdRefreshResponses(): Promise<void>;
+  pendingRefreshResponses(): Promise<{ id: number; status: number; tokenId: string }[]>;
+  releaseRefreshResponse(id: number): Promise<void>;
   stop(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 }
 
+export interface MockMcpTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  title?: string;
+  annotations?: { readOnlyHint: boolean; destructiveHint: boolean };
+  _meta?: { ui: { resourceUri?: string; visibility?: string[] } };
+  /** Serve the HTML bound to this tool's _meta.ui.resourceUri. */
+  appHtml?: string;
+  /** Reject absent required input keys with JSON-RPC invalid params. */
+  validateRequiredArguments?: boolean;
+  /** Hold the response while the real engine exposes its running tool state. */
+  delayMs?: number;
+  /** Served verbatim as the tools/call result, so structured content and result metadata reach the host unchanged. */
+  result: { content: { type: "text"; text: string }[]; isError?: boolean; structuredContent?: Record<string, unknown>; _meta?: Record<string, unknown> };
+}
+
 export interface StartMockMcpOptions {
+  /** Replace the catalog with deterministic tools; served calls remain observable through toolCalls(). */
+  tools?: MockMcpTool[];
   port?: number;
   scriptPath?: string;
   publicUrl?: string;
   /** Advertised OAuth/resource origin when the mock sits behind a proxy; defaults to the mock's own URL. */
   issuer?: string;
+  /** Set RFC 9207 metadata explicitly; undefined omits it. Only true includes response iss. */
+  authorizationResponseIssuerSupported?: boolean;
   profileId?: EnterpriseMcpProfileId;
+  fault?: string;
   oauthClientSecret?: string;
+  /** Token requests from these clients fail with invalid_client (unsupported client authentication). Entries are a client id, "id:secret" to reject only that exact presented secret, or "@dynamic" for every dynamically registered client. */
+  rejectTokenClientIds?: string[];
   allowUnauthenticatedMcp?: boolean;
+  /** Reject dynamic client registration when the submitted OAuth redirect URI is not allowlisted. */
+  rejectDynamicRedirectUris?: "invalid_redirect_uri" | "invalid_request";
   /** Serve this many additional synthetic mock_tool_<i> tools for scale specs. */
   extraToolCount?: number;
+  /** Serve one app-visible MCP App launch tool (`_meta.ui.resourceUri`) under this name. */
+  appToolName?: string;
+  /** Script deterministic OpenAI-compatible agent turns through this mock. */
+  agentWorkloads?: MockAgentWorkload[];
+  /** Verify native provider requests retain this private model header. */
+  agentRequiredHeader?: { name: string; value: string };
+  /** Spawn the mock with executable-discovery variables only, excluding inherited credentials. */
+  isolatedProcessEnv?: boolean;
 }
 
 export type EnterpriseMcpProfileId =
@@ -80,7 +196,14 @@ function parseRequest(value: unknown): MockAuthorizeRequest | null {
     || typeof value.url !== "string"
     || typeof value.at !== "string"
   ) return null;
-  return { method: value.method, path: value.path, url: value.url, at: value.at };
+  return {
+    method: value.method, path: value.path, url: value.url, at: value.at,
+    ...(typeof value.status === "number" ? { status: value.status } : {}),
+    ...(typeof value.grantType === "string" ? { grantType: value.grantType } : {}),
+    ...(typeof value.tokenId === "string" || value.tokenId === null ? { tokenId: value.tokenId } : {}),
+    ...(typeof value.refreshTokenIssued === "boolean" ? { refreshTokenIssued: value.refreshTokenIssued } : {}),
+    ...(typeof value.oauthError === "string" ? { oauthError: value.oauthError } : {}),
+  };
 }
 
 function parseRequests(value: unknown): MockAuthorizeRequest[] {
@@ -89,6 +212,41 @@ function parseRequests(value: unknown): MockAuthorizeRequest[] {
     const request = parseRequest(entry);
     return request ? [request] : [];
   });
+}
+
+function parseAgentReplyState(value: unknown): MockAgentReplyState {
+  if (!isRecord(value)
+    || typeof value.promptMarker !== "string"
+    || typeof value.releasedChunks !== "number"
+    || typeof value.deliveredChunks !== "number"
+    || typeof value.totalChunks !== "number"
+    || typeof value.prefix !== "string"
+    || typeof value.complete !== "boolean"
+    || typeof value.waiting !== "number"
+    || typeof value.aborted !== "boolean"
+    || typeof value.timedOut !== "boolean") {
+    throw new Error("Mock agent reply state was invalid");
+  }
+  return {
+    promptMarker: value.promptMarker,
+    releasedChunks: value.releasedChunks,
+    deliveredChunks: value.deliveredChunks,
+    totalChunks: value.totalChunks,
+    prefix: value.prefix,
+    complete: value.complete,
+    waiting: value.waiting,
+    aborted: value.aborted,
+    timedOut: value.timedOut,
+  };
+}
+
+function isolatedMockEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of ["PATH", "TMPDIR", "SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR"]) {
+    const value = process.env[key];
+    if (value) env[key] = value;
+  }
+  return env;
 }
 
 async function waitForHealth(url: string, output: () => string, child: ChildProcess | null): Promise<void> {
@@ -197,9 +355,10 @@ async function startEnterpriseProfileMock(options: StartMockMcpOptions): Promise
       cwd: REPO_ROOT,
       detached: true,
       env: {
-        ...process.env,
+        ...(options.isolatedProcessEnv ? isolatedMockEnvironment() : process.env),
         PORT: String(port),
         PROFILE_ID: profileId,
+        ...(options.fault !== undefined ? { ACTIVE_FAULT_ID: options.fault } : {}),
         OAUTH_CLIENT_SECRET: options.oauthClientSecret ?? "enterprise-mcp-eval-client-secret",
         OAUTH_REDIRECT_URIS: redirectUris.join(","),
       },
@@ -230,6 +389,16 @@ async function startEnterpriseProfileMock(options: StartMockMcpOptions): Promise
       if ((opts.atLeast ?? 0) > 0) await sleep(opts.timeoutMs ?? 120_000);
       return [];
     },
+    async agentRequests(opts = {}) {
+      if ((opts.atLeast ?? 0) > 0) await sleep(opts.timeoutMs ?? 120_000);
+      return [];
+    },
+    async agentReplyState() {
+      throw new Error("Enterprise MCP profile mocks do not serve agent reply gates.");
+    },
+    async releaseAgentReply() {
+      throw new Error("Enterprise MCP profile mocks do not serve agent reply gates.");
+    },
     async handshakes(opts = {}) {
       if ((opts.atLeast ?? 0) > 0) await sleep(opts.timeoutMs ?? 120_000);
       return [];
@@ -242,10 +411,16 @@ async function startEnterpriseProfileMock(options: StartMockMcpOptions): Promise
       redirectUris = [...nextRedirectUris];
       await boot();
     },
+    async configureOAuthCallback() {
+      throw new Error("Callback fault controls are only supported by the legacy OAuth MCP mock.");
+    },
     async resetOAuth() {
       await stop();
       await boot();
     },
+    async holdRefreshResponses() { throw new Error("Refresh response control requires the legacy OAuth mock."); },
+    async pendingRefreshResponses() { throw new Error("Refresh response control requires the legacy OAuth mock."); },
+    async releaseRefreshResponse() { throw new Error("Refresh response control requires the legacy OAuth mock."); },
     stop,
     [Symbol.asyncDispose]: stop,
   };
@@ -264,13 +439,17 @@ export async function startMockMcp(options: StartMockMcpOptions = {}): Promise<M
     child = spawn(process.execPath, [options.scriptPath ?? join(REPO_ROOT, "scripts", "mock-oauth-mcp-server.mjs")], {
       cwd: REPO_ROOT,
       env: {
-        ...process.env,
-        HOST: "0.0.0.0",
+        ...(options.isolatedProcessEnv ? isolatedMockEnvironment() : process.env),
+        HOST: options.isolatedProcessEnv ? "127.0.0.1" : "0.0.0.0",
         PORT: String(port),
         ISSUER: options.issuer ?? url,
         AUTO_APPROVE: "1",
+        ...(options.authorizationResponseIssuerSupported === undefined ? {} : { MOCK_AUTHORIZATION_RESPONSE_ISSUER: options.authorizationResponseIssuerSupported ? "1" : "0" }),
         ...(options.allowUnauthenticatedMcp ? { MOCK_ALLOW_UNAUTHENTICATED_MCP: "1" } : {}),
+        ...(options.rejectDynamicRedirectUris ? { MOCK_REJECT_DCR_REDIRECT_URIS: options.rejectDynamicRedirectUris } : {}),
+        ...(options.rejectTokenClientIds?.length ? { MOCK_REJECT_TOKEN_CLIENT_IDS: options.rejectTokenClientIds.join(",") } : {}),
         ...(options.extraToolCount ? { MOCK_EXTRA_TOOL_COUNT: String(options.extraToolCount) } : {}),
+        ...(options.appToolName ? { MOCK_APP_TOOL_NAME: options.appToolName } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -283,6 +462,28 @@ export async function startMockMcp(options: StartMockMcpOptions = {}): Promise<M
   }
 
   await waitForHealth(url, () => output, child);
+
+  if (options.tools) {
+    const response = await fetch(`${url}/admin/tools`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tools: options.tools }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new Error(`Mock tool configuration failed: HTTP ${response.status}`);
+  }
+
+  if (options.agentWorkloads) {
+    const response = await fetch(`${url}/admin/agent-workloads`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workloads: options.agentWorkloads, requiredHeader: options.agentRequiredHeader }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      throw new Error(`Mock agent workload configuration failed: HTTP ${response.status} ${(await response.text()).slice(0, 500)}`);
+    }
+  }
 
   const requests = async (): Promise<MockAuthorizeRequest[]> => {
     const response = await fetch(`${url}/requests`, { signal: AbortSignal.timeout(15_000) });
@@ -323,6 +524,38 @@ export async function startMockMcp(options: StartMockMcpOptions = {}): Promise<M
     return calls;
   };
 
+  const readAgentRequests = async (promptMarker?: string, sinceIso?: string): Promise<MockAgentRequest[]> => {
+    const completions: MockAgentRequest[] = [];
+    for (const entry of await rawEntries()) {
+      if (!isRecord(entry.agentCompletion)) continue;
+      const completion = entry.agentCompletion;
+      const at = typeof entry.at === "string" ? entry.at : "";
+      if (sinceIso && at < sinceIso) continue;
+      const kind = completion.kind;
+      if (kind !== "utility" && kind !== "tool" && kind !== "final" && kind !== "error") continue;
+      const marker = typeof completion.promptMarker === "string" ? completion.promptMarker : null;
+      if (promptMarker && marker !== promptMarker) continue;
+      if (typeof completion.model !== "string"
+        || !Array.isArray(completion.matchedMarkers)
+        || typeof completion.completedTools !== "number") continue;
+      completions.push({
+        model: completion.model,
+        toolResultCodes: completion.toolResultCodes,
+        advertisedToolNames: Array.isArray(completion.advertisedToolNames)
+          ? completion.advertisedToolNames.filter((value): value is string => typeof value === "string") : undefined,
+        reasoningEffort: typeof completion.reasoningEffort === "string" ? completion.reasoningEffort : null,
+        promptMarker: marker,
+        matchedMarkers: completion.matchedMarkers.filter((value): value is string => typeof value === "string"),
+        completedTools: completion.completedTools,
+        kind,
+        toolName: typeof completion.toolName === "string" ? completion.toolName : null,
+        arguments: isRecord(completion.arguments) ? completion.arguments : {},
+        at,
+      });
+    }
+    return completions;
+  };
+
   const readHandshakes = async (sinceIso?: string): Promise<MockAuthorizeRequest[]> => {
     const handshakes: MockAuthorizeRequest[] = [];
     for (const entry of await rawEntries()) {
@@ -353,6 +586,36 @@ export async function startMockMcp(options: StartMockMcpOptions = {}): Promise<M
       }
       return calls;
     },
+    async agentRequests(opts = {}) {
+      const wanted = opts.atLeast ?? 0;
+      if (wanted <= 0) return readAgentRequests(opts.promptMarker, opts.sinceIso);
+      const deadline = Date.now() + (opts.timeoutMs ?? 120_000);
+      let completions = await readAgentRequests(opts.promptMarker, opts.sinceIso);
+      while (completions.length < wanted && Date.now() < deadline) {
+        await sleep(500);
+        completions = await readAgentRequests(opts.promptMarker, opts.sinceIso).catch(() => completions);
+      }
+      return completions;
+    },
+    async agentReplyState(promptMarker) {
+      const response = await fetch(`${url}/admin/agent-reply?promptMarker=${encodeURIComponent(promptMarker)}`, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(`Mock agent reply state failed: HTTP ${response.status}`);
+      return parseAgentReplyState(body);
+    },
+    async releaseAgentReply(promptMarker, count = 1) {
+      const response = await fetch(`${url}/admin/agent-reply`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ promptMarker, count }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(`Mock agent reply release failed: HTTP ${response.status}`);
+      return parseAgentReplyState(body);
+    },
     async handshakes(opts = {}) {
       const wanted = opts.atLeast ?? 0;
       if (wanted <= 0) return readHandshakes(opts.sinceIso);
@@ -380,9 +643,35 @@ export async function startMockMcp(options: StartMockMcpOptions = {}): Promise<M
     async configureOAuthRedirectUris() {
       throw new Error("The legacy mock must receive preregistered redirect URIs before startup.");
     },
+    async configureOAuthCallback(options) {
+      const response = await fetch(`${url}/admin/oauth-callback`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(options),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new Error(`Mock OAuth callback configuration failed: HTTP ${response.status}`);
+    },
     async resetOAuth() {
       const response = await fetch(`${url}/admin/expire-oauth-tokens`, { method: "POST" });
       if (!response.ok) throw new Error(`Mock OAuth reset failed: HTTP ${response.status}`);
+    },
+    async holdRefreshResponses() {
+      const response = await fetch(`${url}/admin/refresh-responses`, { method: "POST", signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) throw new Error(`Mock refresh hold failed: HTTP ${response.status}`);
+    },
+    async pendingRefreshResponses() {
+      const response = await fetch(`${url}/admin/refresh-responses`, { signal: AbortSignal.timeout(5_000) });
+      const body: unknown = await response.json();
+      if (!response.ok || !isRecord(body) || !Array.isArray(body.responses)) throw new Error("Mock refresh responses missing");
+      return body.responses.map((entry: unknown) => {
+        if (!isRecord(entry) || typeof entry.id !== "number" || typeof entry.status !== "number" || typeof entry.tokenId !== "string") throw new Error("Invalid mock refresh response");
+        return { id: entry.id, status: entry.status, tokenId: entry.tokenId };
+      });
+    },
+    async releaseRefreshResponse(id) {
+      const response = await fetch(`${url}/admin/refresh-responses/${id}/release`, { method: "POST", signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) throw new Error(`Mock refresh release failed: HTTP ${response.status}`);
     },
     stop,
     [Symbol.asyncDispose]: stop,

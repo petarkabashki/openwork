@@ -35,11 +35,11 @@ const WORKSPACES_PREFIX_PATTERN = /^workspaces\/[^/]+\//i;
 const WORKSPACE_ID_PREFIX_PATTERN = /^workspace\/(?:ws_[^/]+|\d+|[0-9a-f-]{6,})\//i;
 
 export function isMarkdownPreviewSupported(extension: string) {
-  return ["md", "markdown", "mdx"].includes(extension);
+  return ["md", "markdown", "mdx", "mmd"].includes(extension);
 }
 
 export function isSheetPreviewSupported(extension: string) {
-  return ["csv", "tsv", "xlsx", "xls", "ods"].includes(extension);
+  return ["csv", "tsv", "xlsx"].includes(extension);
 }
 
 export function isImagePreviewSupported(extension: string) {
@@ -69,7 +69,7 @@ export function getArtifactType(filename: string): ArtifactType {
     return "unknown";
   }
 
-  if (["md", "markdown", "mdx", "rmd", "rst"].includes(extension)) {
+  if (["md", "markdown", "mdx", "mmd", "rmd", "rst"].includes(extension)) {
     return "markdown";
   }
 
@@ -136,11 +136,15 @@ export function getArtifactTypeLabel(type: ArtifactType) {
 }
 
 export function canPreviewArtifact(artifact: ArtifactItem) {
-  return isCollectibleArtifactTarget(artifact.legacy_target);
+  const target = artifact.legacy_target;
+  return isCollectibleArtifactTarget(target)
+    || (target.kind === "file" && target.preview !== "browser" && target.preview !== "external");
 }
 
 export function canOpenArtifact(artifact: ArtifactItem) {
-  return canPreviewArtifact(artifact) || isOpenableFileTarget(artifact.legacy_target);
+  return canPreviewArtifact(artifact)
+    || isOpenableFileTarget(artifact.legacy_target)
+    || artifact.legacy_target.kind === "file";
 }
 
 function getArtifactName(path: string) {
@@ -367,18 +371,21 @@ export function useArtifacts(messages: UIMessage[], options: GetArtifactsOptions
 
 /** Open any file path in the artifact preview panel (markdown, code, images…). */
 export function useOpenArtifactPath() {
-  const { openTargets, onOpenTarget } = useOpenTargets();
+  const { onOpenTarget } = useOpenTargets();
 
   return React.useCallback((path: string, options?: { external?: boolean }) => {
-    const normalized = normalizeArtifactPath(path);
-    const target = openTargetFromArtifactPath(
-      normalized,
-      getArtifactName(normalized),
-      getArtifactType(normalized),
-      openTargets,
-    );
+    // Explicit file actions must not strip path prefixes or reuse suffix matches.
+    const target: OpenTarget = {
+      id: `file:${path}`,
+      kind: "file",
+      value: path,
+      name: getArtifactName(path),
+      preview: artifactTypeToPreview(getArtifactType(path)),
+      confidence: 95,
+      reason: "artifact",
+    };
     onOpenTarget?.(target, options);
-  }, [onOpenTarget, openTargets]);
+  }, [onOpenTarget]);
 }
 
 export function usePreviewArtifact() {

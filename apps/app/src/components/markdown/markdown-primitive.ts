@@ -1,8 +1,7 @@
 import DOMPurify from "dompurify";
 import emojiKeywords from "emojilib";
-import { Marked, type Tokens } from "marked";
+import { Marked, Renderer, TextRenderer, type MarkedExtension, type Token, type Tokens } from "marked";
 import { markedEmoji } from "marked-emoji";
-import markedShiki from "marked-shiki";
 import {
   transformerMetaHighlight,
   transformerMetaWordHighlight,
@@ -17,6 +16,8 @@ import { bundledLanguages, codeToHtml } from "shiki";
 import { faviconUrlForHref } from "@/lib/favicon";
 
 import { markdownMath } from "./markdown-math";
+import { parseSessionReference } from "@/components/chat/session-reference";
+import { containsInlineHtml, markUnsafeReferenceTokens, stripSessionReferenceAttributes, renderSessionReferenceText, sessionReferenceHtml, type ResolveSessionReference } from "./session-reference-html";
 
 export type MarkdownPresentation = "chat" | "surface";
 type RawHtmlMode = "passthrough" | "shiki-only";
@@ -43,6 +44,16 @@ const MARKDOWN_IMAGE_PREVIEW_MAX_HEIGHT = 160;
 const MARKDOWN_IMAGE_PREVIEW_MAX_WIDTH = 280;
 const CODE_COPY_ICON = `<svg data-openwork-code-copy-icon="" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-3.5 w-3.5" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`;
 const CODE_COPIED_ICON = `<svg data-openwork-code-copy-check-icon="" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-3.5 w-3.5" aria-hidden="true" hidden><path d="M20 6 9 17l-5-5"/></svg>`;
+const CODE_WRAP_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-3.5 w-3.5" aria-hidden="true"><path d="M3 6h18M3 12h15a3 3 0 1 1 0 6h-3"/><path d="m12 18-3 3 3 3"/></svg>`;
+const INLINE_CODE_FILE_EXTENSIONS = new Set([
+  "mp4", "webm", "mov", "m4v", "ogv",
+  "astro", "bash", "c", "cc", "cpp", "cs", "css", "dart", "docx", "ex", "exs", "gif", "go", "graphql",
+  "h", "hpp", "htm", "html", "java", "jpeg", "jpg", "js", "json", "jsonc", "jsx", "key", "kt", "kts",
+  "lua", "markdown", "md", "mdx", "mmd", "mjs", "cjs", "odp", "ods", "pdf", "php", "png", "pot", "potx",
+  "ppt", "pptm", "pptx", "prisma", "py", "rb", "rs", "scss", "sh", "sql", "svelte", "svg", "swift",
+  "toml", "ts", "tsv", "tsx", "txt", "log", "vue", "webp", "xls", "xlsx", "xml", "yaml", "yml", "zig",
+]);
+const INLINE_CODE_LINE_SUFFIX = /(?::\d+(?::\d+)?|#L\d+(?:-L?\d+)?)$/i;
 
 function escapeHtml(value: string) {
   return value
@@ -55,6 +66,32 @@ function escapeHtml(value: string) {
 
 function escapeAttribute(value: string) {
   return escapeHtml(value).replace(/`/g, "&#96;");
+}
+
+export function inlineCodeArtifactPath(value: string): string | null {
+  const trimmed = value.trim();
+  const path = trimmed.replace(INLINE_CODE_LINE_SUFFIX, "");
+
+  if (
+    !path ||
+    path.length > 500 ||
+    /[\u0000-\u001f<>"'`|?*]/.test(path) ||
+    /^(?:https?|wss?|ftp|mailto|tel|file):/i.test(path)
+  ) {
+    return null;
+  }
+
+  const normalized = path.replace(/[\\]+/g, "/");
+  const withoutDrive = normalized.replace(/^[A-Za-z]:\//, "/");
+  if (withoutDrive.slice(1).includes(":")) return null;
+
+  const segments = withoutDrive.split("/").filter(Boolean);
+  const filename = segments.at(-1);
+  if (!filename || segments.some((segment) => segment === "." || segment === "..")) return null;
+
+  const extensionIndex = filename.lastIndexOf(".");
+  const extension = extensionIndex >= 0 ? filename.slice(extensionIndex + 1).toLowerCase() : "";
+  return INLINE_CODE_FILE_EXTENSIONS.has(extension) ? path : null;
 }
 
 function safeHref(href: string) {
@@ -111,21 +148,37 @@ function codeCopyButton() {
   return `<button type="button" data-openwork-code-copy="" class="absolute right-2 top-2 z-10 inline-flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-background/95 text-muted-foreground shadow-sm transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" aria-label="Copy code block" title="Copy code block">${CODE_COPY_ICON}${CODE_COPIED_ICON}<span data-openwork-code-copy-label="" class="sr-only" aria-live="polite">Copy code block</span></button>`;
 }
 
+function codeWrapButton() {
+  return `<button type="button" data-openwork-code-wrap="" class="absolute right-11 top-2 z-10 inline-flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-background/95 text-muted-foreground shadow-sm transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" aria-label="Enable word wrap" aria-pressed="false" title="Enable word wrap">${CODE_WRAP_ICON}</button>`;
+}
+
 function chatCodeBlockContainer(html: string, shiki: boolean) {
   const shikiAttribute = shiki ? ` data-openwork-shiki="true"` : "";
 
-  return `<div data-openwork-code-block=""${shikiAttribute} class="relative my-4 overflow-hidden rounded-[18px] border border-border/70 bg-gray-2/60 font-mono text-xs leading-6 text-foreground">${codeCopyButton()}${html}</div>`;
+  return `<div data-openwork-code-block=""${shikiAttribute} class="relative my-4 overflow-hidden rounded-[18px] border border-border/70 bg-gray-2/60 font-mono text-xs leading-6 text-foreground">${codeWrapButton()}${codeCopyButton()}${html}</div>`;
 }
 
 function chatCodeBlockHtml(text: string, lang: string | undefined) {
   return chatCodeBlockContainer(
-    `<pre class="overflow-x-auto px-4 pb-3 pt-11"><code${codeLanguageClass(lang)}>${escapeHtml(text)}</code></pre>`,
+    `<pre data-openwork-code-scroll="" class="overflow-x-auto px-4 pb-3 pt-11"><code${codeLanguageClass(lang)}>${escapeHtml(text)}</code></pre>`,
     false,
   );
 }
 
 function surfaceCodeBlockHtml(text: string, lang: string | undefined) {
   return `<pre class="my-4 overflow-x-auto rounded-[18px] border border-dls-border/70 bg-gray-1/80 px-4 py-3 text-xs leading-6 text-muted-foreground"><code${codeLanguageClass(lang)}>${escapeHtml(text)}</code></pre>`;
+}
+
+function isMermaidLanguage(lang: string | undefined) {
+  return lang?.trim().split(/\s+/)[0]?.toLowerCase() === "mermaid";
+}
+
+function mermaidBlockHtml(text: string, presentation: MarkdownPresentation) {
+  const borderClass = presentation === "surface" ? "border-dls-border/70" : "border-border/70";
+  const backgroundClass = presentation === "surface" ? "bg-gray-1/80" : "bg-gray-2/60";
+  const buttonClass = "rounded-md px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
+
+  return `<div data-openwork-mermaid="" data-openwork-mermaid-state="source" aria-busy="false" class="my-4 overflow-hidden rounded-[18px] border ${borderClass} ${backgroundClass}"><div class="flex min-h-10 items-center gap-2 border-b ${borderClass} px-3 py-2"><span class="me-auto text-xs font-medium text-muted-foreground">Mermaid diagram</span><div role="group" aria-label="Diagram view" class="flex items-center gap-1"><button type="button" data-openwork-mermaid-view="rendered" class="${buttonClass}" aria-pressed="false" disabled>Rendered</button><button type="button" data-openwork-mermaid-view="source" class="${buttonClass}" aria-pressed="true">Source</button><button type="button" data-openwork-mermaid-download="" class="${buttonClass}" aria-label="Download diagram as SVG" hidden>Download SVG</button></div></div><div data-openwork-mermaid-rendered="" class="overflow-auto p-4 [&amp;&gt;svg]:mx-auto [&amp;&gt;svg]:h-auto [&amp;&gt;svg]:max-w-full" hidden></div><pre data-openwork-mermaid-source="" class="overflow-x-auto p-4 text-xs leading-6 text-foreground"><code class="language-mermaid">${escapeHtml(text)}</code></pre><p data-openwork-mermaid-status="" class="border-t ${borderClass} px-3 py-2 text-xs text-muted-foreground" aria-live="polite">Diagram source</p></div>`;
 }
 
 function parseShikiLanguage(lang: string) {
@@ -162,6 +215,31 @@ export function setCodeCopyButtonState(button: HTMLButtonElement, copied: boolea
   button.setAttribute("aria-label", copied ? "Code block copied" : "Copy code block");
 }
 
+export function codeWrapClassStates(wrapped: boolean) {
+  return {
+    "overflow-x-auto": !wrapped,
+    "overflow-x-hidden": wrapped,
+    "whitespace-pre-wrap": wrapped,
+    "break-words": wrapped,
+  };
+}
+
+export function setCodeWrapButtonState(button: HTMLButtonElement, wrapped: boolean) {
+  const codeBlock = button.closest("[data-openwork-code-block]");
+  const pre = codeBlock?.querySelector("pre");
+
+  for (const [className, enabled] of Object.entries(codeWrapClassStates(wrapped))) {
+    for (const container of codeBlock?.querySelectorAll("[data-openwork-code-scroll]") ?? []) {
+      container.classList.toggle(className, enabled);
+    }
+  }
+  pre?.classList.toggle("whitespace-pre-wrap", wrapped);
+  pre?.classList.toggle("break-words", wrapped);
+  button.setAttribute("aria-pressed", String(wrapped));
+  button.setAttribute("aria-label", wrapped ? "Disable word wrap" : "Enable word wrap");
+  button.title = wrapped ? "Disable word wrap" : "Enable word wrap";
+}
+
 function sanitizeMarkdownHtml(value: string) {
   if (typeof DOMPurify.sanitize !== "function") {
     return value;
@@ -173,6 +251,9 @@ function sanitizeMarkdownHtml(value: string) {
     // (and copy-as-TeX) half of every formula is stripped.
     ADD_TAGS: ["annotation", "semantics"],
     ADD_ATTR: [
+      "controls",
+      "playsinline",
+      "preload",
       "checked",
       "class",
       "data-openwork-math-error",
@@ -181,8 +262,12 @@ function sanitizeMarkdownHtml(value: string) {
       "data-openwork-code-copy-check-icon",
       "data-openwork-code-copy-icon",
       "data-openwork-code-copy-label",
+      "data-openwork-code-scroll",
+      "data-openwork-code-wrap",
       "aria-label",
+      "aria-pressed",
       "data-openwork-image-preview",
+      "data-openwork-inline-code-path",
       "data-openwork-link-href",
       "data-openwork-link-chevron",
       "data-openwork-shiki",
@@ -190,10 +275,12 @@ function sanitizeMarkdownHtml(value: string) {
       "disabled",
       "hidden",
       "loading",
-      "rel",
-      "start",
-      "style",
-      "target",
+       "rel",
+       "role",
+       "start",
+       "style",
+       "tabindex",
+       "target",
     ],
   });
 }
@@ -235,18 +322,31 @@ function markdownProfileForPresentation(presentation: MarkdownPresentation): Mar
     imagePresentation: "chat",
     tableHeaderClassName: "border border-border p-2 bg-muted text-left",
     tableCellClassName: "border border-border p-2 align-top",
-    shikiContainer: chatCodeBlockContainer(`<div class="overflow-x-auto px-4 pb-3 pt-11">%s</div>`, true),
+    shikiContainer: chatCodeBlockContainer(`<div data-openwork-code-scroll="" class="overflow-x-auto px-4 pb-3 pt-11">%s</div>`, true),
     shikiTheme: { kind: "dual", light: "github-light", dark: "github-dark" },
   };
 }
 
+function renderVideo(href: string, label: string) {
+  if (!/\.(?:mp4|webm|mov|m4v|ogv)(?:[?#].*)?$/i.test(href)) return null;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href) && !/^(?:https?|file):/i.test(href) && !/^[A-Za-z]:[\\/]/.test(href)) return null;
+  const remote = /^https?:/i.test(href);
+  const source = remote ? ` src="${escapeAttribute(safeHref(href))}"` : "";
+  const fileLink = remote
+    ? `href="${escapeAttribute(safeHref(href))}" target="_blank" rel="noopener noreferrer"`
+    : `href="#" data-openwork-inline-code-path="${escapeAttribute(href)}"`;
+  return `<span class="my-4 inline-block w-full max-w-lg align-top"><video data-openwork-video-path="${escapeAttribute(href)}"${source} controls playsinline preload="metadata" aria-label="${escapeAttribute(label)}" class="block max-h-80 w-full rounded-lg border border-border/70 bg-black"></video><span data-openwork-video-error="" hidden class="text-sm text-muted-foreground">Video preview unavailable. Open the file to play it.</span><a ${fileLink} class="text-sm text-indigo-10">${escapeHtml(label)}</a></span>`;
+}
+
 function renderLink(profile: MarkdownProfile, href: string, title: string | null | undefined, text: string) {
+  const video = profile.linkPresentation === "chat" ? renderVideo(href, href) : null;
+  if (video) return video;
   const safe = escapeAttribute(safeHref(href));
   const titleAttr = title ? ` title="${escapeAttribute(title)}"` : "";
 
   if (profile.linkPresentation === "chat") {
     const originalHref = escapeAttribute(href);
-    const isFilePath = !/^(https?|wss?|ftp|mailto|tel|file):/i.test(href);
+    const isFilePath = !/^(https?|wss?|ftp|mailto|tel):/i.test(href);
 
     if (isFilePath) {
       const fileIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 text-muted-foreground"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h5"/></svg>`;
@@ -267,6 +367,8 @@ function renderLink(profile: MarkdownProfile, href: string, title: string | null
 }
 
 function renderImage(profile: MarkdownProfile, href: string, title: string | null | undefined, text: string) {
+  const video = profile.linkPresentation === "chat" ? renderVideo(href, href) : null;
+  if (video) return video;
   const safe = escapeAttribute(safeHref(href));
   const titleAttr = title ? ` title="${escapeAttribute(title)}"` : "";
 
@@ -277,22 +379,36 @@ function renderImage(profile: MarkdownProfile, href: string, title: string | nul
   return `<img src="${safe}" alt="${escapeAttribute(text)}"${titleAttr} loading="lazy" decoding="async" class="my-4 max-w-full rounded-[18px] border border-dls-border/70">`;
 }
 
-function createMarkedOptions(profile: MarkdownProfile, isAsync: boolean) {
+function createMarkedOptions(profile: MarkdownProfile, presentation: MarkdownPresentation, isAsync: boolean, resolveReference?: ResolveSessionReference, unsafeReferenceTokens = new WeakSet<object>(), generatedHtmlTokens = new WeakSet<object>()) {
+  let suppressReferences = 0;
+  const withoutReferences = (render: () => string) => {
+    suppressReferences++;
+    try { return render(); } finally { suppressReferences--; }
+  };
+  const inline = (tokens: Token[], render: () => string) => containsInlineHtml(tokens) ? withoutReferences(render) : render();
   return {
     async: isAsync,
     breaks: false,
     gfm: true,
     pedantic: false,
     silent: true,
+    hooks: {
+      processAllTokens(tokens) {
+        if (resolveReference) markUnsafeReferenceTokens(tokens, unsafeReferenceTokens);
+        return tokens;
+      },
+    },
     renderer: {
-      html({ text }) {
-        return profile.rawHtmlMode === "shiki-only" && !text.includes('data-openwork-shiki="true"') ? "" : text;
+      html(token) {
+        const { text } = token;
+        if (generatedHtmlTokens.has(token)) return text;
+        return profile.rawHtmlMode === "shiki-only" && !text.includes('data-openwork-shiki="true"') ? "" : stripSessionReferenceAttributes(text);
       },
       paragraph({ tokens }) {
-        return `<p class="my-3 leading-relaxed">${this.parser.parseInline(tokens)}</p>`;
+        return `<p class="my-3 leading-relaxed">${inline(tokens, () => this.parser.parseInline(tokens))}</p>`;
       },
       heading({ tokens, depth }) {
-        return `<h${depth} class="${profile.headingClassName(depth)}">${this.parser.parseInline(tokens)}</h${depth}>`;
+        return `<h${depth} class="${profile.headingClassName(depth)}">${inline(tokens, () => this.parser.parseInline(tokens))}</h${depth}>`;
       },
       list(token) {
         const tag = token.ordered ? "ol" : "ul";
@@ -302,30 +418,52 @@ function createMarkedOptions(profile: MarkdownProfile, isAsync: boolean) {
         return `<${tag}${start} class="${profile.listClassName(token.ordered)}">${token.items.map((item) => this.listitem(item)).join("")}</${tag}>`;
       },
       listitem(item) {
-        const checkbox = item.task
-          ? `<input disabled="" type="checkbox"${item.checked ? " checked=\"\"" : ""}> `
-          : "";
-
-        return `<li class="my-1">${checkbox}${this.parser.parse(item.tokens)}</li>`;
+        // Marked includes the task checkbox in item.tokens; render it only once.
+        return `<li class="my-1">${this.parser.parse(item.tokens)}</li>`;
       },
       blockquote({ tokens }) {
         return `<blockquote class="${profile.blockquoteClassName}">${this.parser.parse(tokens)}</blockquote>`;
       },
       code({ text, lang }) {
+        if (isMermaidLanguage(lang)) return mermaidBlockHtml(text, presentation);
         return profile.codeBlockHtml(text, lang);
       },
-      codespan({ text }) {
-        return `<code class="${profile.codeSpanClassName}">${escapeHtml(text)}</code>`;
+      text(token) {
+        const tokens = token.type === "text" ? token.tokens : undefined;
+        if (tokens) return inline(tokens, () => this.parser.parseInline(tokens));
+        return resolveReference && !suppressReferences && !unsafeReferenceTokens.has(token) ? renderSessionReferenceText(token, resolveReference) : false;
+      },
+      codespan(token) {
+        const { text } = token;
+        const reference = !suppressReferences && !unsafeReferenceTokens.has(token) ? resolveReference?.(text) : undefined;
+        if (reference) return sessionReferenceHtml(reference);
+        const path = profile.linkPresentation === "chat" && !suppressReferences ? inlineCodeArtifactPath(text) : null;
+        const video = path ? renderVideo(path, path) : null;
+        if (video) return video;
+        const pathAttributes = path
+          ? ` data-openwork-inline-code-path="${escapeAttribute(path)}" role="button" tabindex="0" aria-label="Open ${escapeAttribute(path)}"`
+          : "";
+        const pathClassName = path ? " cursor-pointer transition-colors hover:bg-gray-3/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" : "";
+        return `<code${pathAttributes} class="${profile.codeSpanClassName}${pathClassName}">${escapeHtml(text)}</code>`;
       },
       del({ raw, tokens }) {
         if (!raw.startsWith("~~")) {
           return escapeHtml(raw);
         }
 
-        return `<del>${this.parser.parseInline(tokens)}</del>`;
+        return `<del>${inline(tokens, () => this.parser.parseInline(tokens))}</del>`;
       },
-      link({ href, title, tokens }) {
-        return renderLink(profile, href, title, this.parser.parseInline(tokens));
+      link(token) {
+        const { href, title, tokens } = token;
+        if (resolveReference && parseSessionReference(href)) {
+          const reference = !suppressReferences && !unsafeReferenceTokens.has(token) ? resolveReference(href) : undefined;
+          if (reference) return sessionReferenceHtml(reference);
+          // A recognized but unavailable internal destination must not fall
+          // through to file handling or the browser. Keep its original label.
+          const label = this.parser.parseInline(tokens, new TextRenderer());
+          return `<span title="Task reference unavailable">${new Renderer().text({ type: "text", raw: label, text: label })}</span>`;
+        }
+        return withoutReferences(() => renderLink(profile, href, title, this.parser.parseInline(tokens)));
       },
       image({ href, title, text }) {
         return renderImage(profile, href, title, text);
@@ -343,7 +481,7 @@ function createMarkedOptions(profile: MarkdownProfile, isAsync: boolean) {
         const tag = header ? "th" : "td";
         const className = header ? profile.tableHeaderClassName : profile.tableCellClassName;
 
-        return `<${tag}${alignAttribute(align)} class="${className}">${this.parser.parseInline(tokens)}</${tag}>`;
+        return `<${tag}${alignAttribute(align)} class="${className}">${inline(tokens, () => this.parser.parseInline(tokens))}</${tag}>`;
       },
       hr() {
         return `<hr class="my-6 border-none h-px bg-gray-4">`;
@@ -364,9 +502,53 @@ function markdownTransformers() {
   ];
 }
 
-function createMarkdownParsers(presentation: MarkdownPresentation) {
+function isCodeToken(token: Token): token is Tokens.Code {
+  return token.type === "code" && "text" in token && typeof token.text === "string";
+}
+
+async function highlightedCodeHtml(
+  token: Tokens.Code,
+  profile: MarkdownProfile,
+) {
+  const [rawLanguage = "text", ...props] = token.lang?.split(" ") ?? [];
+  const language = parseShikiLanguage(rawLanguage);
+  const html = profile.shikiTheme.kind === "dual"
+    ? await codeToHtml(token.text, {
+      lang: language,
+      meta: { __raw: props.join(" ") },
+      themes: {
+        light: profile.shikiTheme.light,
+        dark: profile.shikiTheme.dark,
+      },
+      transformers: markdownTransformers(),
+    })
+    : await codeToHtml(token.text, {
+      lang: language,
+      meta: { __raw: props.join(" ") },
+      theme: profile.shikiTheme.theme,
+      transformers: markdownTransformers(),
+    });
+
+  return profile.shikiContainer.replace("%s", html);
+}
+
+function highlightedCodeExtension(profile: MarkdownProfile, generatedHtmlTokens: WeakSet<object>): MarkedExtension<string, string> {
+  return {
+    async: true,
+    async walkTokens(token) {
+      if (!isCodeToken(token) || isMermaidLanguage(token.lang)) return;
+      const html = await highlightedCodeHtml(token, profile);
+      Object.assign(token, { type: "html", block: true, text: `${html}\n` });
+      generatedHtmlTokens.add(token);
+    },
+  };
+}
+
+function createMarkdownParsers(presentation: MarkdownPresentation, resolveReference?: ResolveSessionReference) {
   const profile = markdownProfileForPresentation(presentation);
-  const markdownParser = new Marked<string, string>(createMarkedOptions(profile, false)).use(
+  const unsafeReferenceTokens = new WeakSet<object>();
+  const generatedHtmlTokens = new WeakSet<object>();
+  const markdownParser = new Marked<string, string>(createMarkedOptions(profile, presentation, false, resolveReference, unsafeReferenceTokens)).use(
     markedEmoji({
       emojis: emojiAliases,
       renderer: (token) => escapeHtml(token.emoji),
@@ -375,60 +557,143 @@ function createMarkdownParsers(presentation: MarkdownPresentation) {
   );
   // Math must be registered on both parsers, otherwise formulas would flicker away
   // when a message containing a fenced code block upgrades to the Shiki render.
-  const highlightedMarkdownParser = new Marked<string, string>(createMarkedOptions(profile, true)).use(
+  const highlightedMarkdownParser = new Marked<string, string>(createMarkedOptions(profile, presentation, true, resolveReference, new WeakSet<object>(), generatedHtmlTokens)).use(
     markedEmoji({
       emojis: emojiAliases,
       renderer: (token) => escapeHtml(token.emoji),
     }),
     markdownMath(),
-    markedShiki({
-      async highlight(code, lang, props) {
-        const language = parseShikiLanguage(lang);
-
-        if (profile.shikiTheme.kind === "dual") {
-          return codeToHtml(code, {
-            lang: language,
-            meta: { __raw: props.join(" ") },
-            themes: {
-              light: profile.shikiTheme.light,
-              dark: profile.shikiTheme.dark,
-            },
-            transformers: markdownTransformers(),
-          });
-        }
-
-        return codeToHtml(code, {
-          lang: language,
-          meta: { __raw: props.join(" ") },
-          theme: profile.shikiTheme.theme,
-          transformers: markdownTransformers(),
-        });
-      },
-      container: profile.shikiContainer,
-    }),
+    highlightedCodeExtension(profile, generatedHtmlTokens),
   );
 
-  return { markdownParser, highlightedMarkdownParser };
+  return { markdownParser, highlightedMarkdownParser, unsafeReferenceTokens };
 }
 
 const chatParsers = createMarkdownParsers("chat");
 const surfaceParsers = createMarkdownParsers("surface");
 
-function parsersForPresentation(presentation: MarkdownPresentation) {
-  return presentation === "surface" ? surfaceParsers : chatParsers;
+// One parser pair per inventory revision, shared by all message blocks. Never
+// mutate the global parsers with a workspace/user resolver.
+const referenceParsers = new WeakMap<ResolveSessionReference, ReturnType<typeof createMarkdownParsers>>();
+function parsersForPresentation(presentation: MarkdownPresentation, resolveReference?: ResolveSessionReference) {
+  if (presentation === "surface") return surfaceParsers;
+  if (!resolveReference) return chatParsers;
+  let parsers = referenceParsers.get(resolveReference);
+  if (!parsers) {
+    parsers = createMarkdownParsers("chat", resolveReference);
+    referenceParsers.set(resolveReference, parsers);
+  }
+  return parsers;
 }
 
-export function renderMarkdownHtml(text: string, presentation: MarkdownPresentation = "chat") {
+export function renderMarkdownHtml(text: string, presentation: MarkdownPresentation = "chat", resolveReference?: ResolveSessionReference) {
   if (!text.trim()) {
     return "";
   }
 
-  const { markdownParser } = parsersForPresentation(presentation);
+  const { markdownParser } = parsersForPresentation(presentation, resolveReference);
   return sanitizeMarkdownHtml(markdownParser.parse(text, { async: false }));
 }
 
-export async function renderHighlightedMarkdownHtml(text: string, presentation: MarkdownPresentation = "chat") {
-  const { highlightedMarkdownParser } = parsersForPresentation(presentation);
+/**
+ * `dangerouslySetInnerHTML` payload for one top-level markdown block. The same
+ * object is returned for as long as that block's source is unchanged, so React
+ * leaves its DOM alone while later blocks keep streaming in.
+ */
+export type MarkdownBlockHtml = { readonly __html: string };
+
+export type StreamingMarkdownRenderer = {
+  /** Sanitized HTML for every top-level block of `text`, in document order. */
+  render: (text: string) => MarkdownBlockHtml[];
+  /** Drop the retained tokens once the message has settled. */
+  reset: () => void;
+};
+
+type StreamingMarkdownState = {
+  source: string;
+  tokens: Token[];
+  blocks: MarkdownBlockHtml[];
+};
+
+/**
+ * Blocks re-lexed on every append: the one still growing plus its predecessor,
+ * because a growing block can retroactively reshape the block before it (lazy
+ * list continuation, a setext underline, a table delimiter row).
+ */
+const STREAMING_RELEX_TAIL = 2;
+
+function hasReferenceDefinition(tokens: Token[]) {
+  return tokens.some((token) => token.type === "def");
+}
+
+/**
+ * Incremental markdown renderer for a message that is still streaming. A full
+ * `renderMarkdownHtml` re-lexes, re-parses, and re-sanitizes the whole answer
+ * for every token that arrives, so each frame costs as much as the text so far.
+ * This keeps the previous frame's top-level tokens and re-lexes only the tail
+ * of an appended source; settled blocks reuse their previous HTML payload.
+ *
+ * Reference-style link definitions resolve across blocks, so a source that
+ * contains one always takes the full lex.
+ */
+export function createStreamingMarkdownRenderer(presentation: MarkdownPresentation = "chat", resolveReference?: ResolveSessionReference): StreamingMarkdownRenderer {
+  const { markdownParser, unsafeReferenceTokens } = parsersForPresentation(presentation, resolveReference);
+  let state: StreamingMarkdownState | null = null;
+
+  const renderBlock = (token: Token): MarkdownBlockHtml => ({
+    __html: sanitizeMarkdownHtml(markdownParser.parser([token])),
+  });
+
+  const renderAll = (source: string, previous: StreamingMarkdownState | null): StreamingMarkdownState => {
+    const tokens = markdownParser.lexer(source);
+    if (resolveReference) markUnsafeReferenceTokens(tokens, unsafeReferenceTokens);
+    const htmlScopeChanged = resolveReference && (containsInlineHtml(tokens) || (previous && containsInlineHtml(previous.tokens)));
+    const reusable = previous && !htmlScopeChanged && !hasReferenceDefinition(tokens) && !hasReferenceDefinition(previous.tokens)
+      ? previous
+      : null;
+    const blocks = tokens.map((token, index) => {
+      const priorToken = reusable?.tokens[index];
+      const priorBlock = reusable?.blocks[index];
+      return priorToken && priorBlock && priorToken.raw === token.raw ? priorBlock : renderBlock(token);
+    });
+    return { source, tokens, blocks };
+  };
+
+  const renderAppended = (source: string, previous: StreamingMarkdownState): StreamingMarkdownState | null => {
+    const keep = previous.tokens.length - STREAMING_RELEX_TAIL;
+    if (keep <= 0 || hasReferenceDefinition(previous.tokens)) return null;
+
+    let offset = 0;
+    for (const token of previous.tokens.slice(0, keep)) offset += token.raw.length;
+    const tail = markdownParser.lexer(source.slice(offset));
+    if (hasReferenceDefinition(tail) || (resolveReference && (containsInlineHtml(tail) || containsInlineHtml(previous.tokens)))) return null;
+
+    return {
+      source,
+      tokens: [...previous.tokens.slice(0, keep), ...tail],
+      blocks: [...previous.blocks.slice(0, keep), ...tail.map(renderBlock)],
+    };
+  };
+
+  return {
+    render(text) {
+      // Marked normalizes line endings before lexing; mirror it so token raw
+      // lengths index into `source`.
+      const source = text.replace(/\r\n|\r/g, "\n");
+      if (state?.source === source) return state.blocks;
+
+      const appended = state && source.startsWith(state.source) ? renderAppended(source, state) : null;
+      state = appended ?? renderAll(source, state);
+      return state.blocks;
+    },
+    reset() {
+      state = null;
+    },
+  };
+}
+
+export async function renderHighlightedMarkdownHtml(text: string, presentation: MarkdownPresentation = "chat", resolveReference?: ResolveSessionReference) {
+  const { highlightedMarkdownParser } = parsersForPresentation(presentation, resolveReference);
   const html = await highlightedMarkdownParser.parse(text, { async: true });
   return sanitizeMarkdownHtml(html);
 }

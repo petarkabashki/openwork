@@ -1,3 +1,4 @@
+import { desktopConfigSchema, type DesktopConfig } from "@openwork/types/den/desktop-policies-runtime";
 import { existsSync } from "node:fs";
 import { importNodeSqlite, runtimeDbPath } from "./runtime-db.js";
 import type { ServerConfig } from "./types.js";
@@ -6,6 +7,7 @@ import { createWorkspaceKvStore, isRecord } from "./workspace-kv-store.js";
 export { runtimeDbPath, runtimeStorageDir } from "./runtime-db.js";
 
 export type RuntimeOpencodeConfig = {
+  managedPolicy?: DesktopConfig;
   default_agent?: string;
   plugin?: string[];
   disabled_providers?: string[];
@@ -17,6 +19,9 @@ export type RuntimeOpencodeConfig = {
 };
 
 export const ENGINE_GLOBAL_RUNTIME_CONFIG_ID = "__openwork_engine_global__";
+
+/** Reserved Connect MCP name; kept in sync with OPENWORK_CLOUD_MCP_NAME in cloud-mcp-health.ts. */
+const OPENWORK_CLOUD_MCP_RESERVED_NAME = "openwork-cloud";
 
 export function isEngineGlobalRuntimeConfigId(workspaceId: string): boolean {
   return workspaceId === ENGINE_GLOBAL_RUNTIME_CONFIG_ID;
@@ -35,6 +40,7 @@ function normalizeRuntimeOpencodeConfig(value: unknown): RuntimeOpencodeConfig {
   const provider = isRecord(value.provider) ? value.provider : undefined;
   return {
     ...(defaultAgent ? { default_agent: defaultAgent } : {}),
+    ...(value.managedPolicy !== undefined ? { managedPolicy: desktopConfigSchema.parse(value.managedPolicy) } : {}),
     ...(plugin ? { plugin } : {}),
     ...(disabledProviders ? { disabled_providers: disabledProviders } : {}),
     ...(mcp ? { mcp } : {}),
@@ -104,6 +110,13 @@ export async function readRuntimeMcpConfig(
   return runtimeMcpMap(await readRuntimeOpencodeConfig(config, workspaceId))[name] ?? null;
 }
 
+export async function readGlobalRuntimeMcpConfig(
+  config: ServerConfig,
+  name: string,
+): Promise<Record<string, unknown> | null> {
+  return await readRuntimeMcpConfig(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID, name);
+}
+
 export function runtimeExternalDirectory(config: RuntimeOpencodeConfig): Record<string, unknown> {
   const permission = isRecord(config.permission) ? config.permission : null;
   const externalDirectory = permission && isRecord(permission.external_directory) ? permission.external_directory : null;
@@ -135,13 +148,80 @@ export async function readRuntimeOpencodeConfig(config: ServerConfig, workspaceI
   return await runtimeOpencodeConfigStore.get(config, workspaceId) ?? {};
 }
 
+// App leases are process-local too. Retain entry tombstones so removal and
+// restoration cannot resurrect a lease; unrelated runtime writes do not touch it.
+const runtimeMcpRevisions = new WeakMap<ServerConfig, Map<string, Map<string, number>>>();
+
+/** Private generations for one named MCP's global and workspace runtime entries. */
+export function readRuntimeMcpConfigRevisions(config: ServerConfig, workspaceId: string, name: string): Array<number | null> {
+  const revisions = runtimeMcpRevisions.get(config);
+  return [ENGINE_GLOBAL_RUNTIME_CONFIG_ID, workspaceId].map(id => revisions?.get(id)?.get(name) ?? null);
+}
+
 export async function readGlobalRuntimeOpencodeConfig(config: ServerConfig): Promise<RuntimeOpencodeConfig> {
   return await readRuntimeOpencodeConfig(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID);
 }
 
+export type RuntimeOpencodeConfigRow = {
+  workspaceId: string;
+  value: RuntimeOpencodeConfig;
+  updatedAt: number;
+};
+
+function runtimeOpencodeConfigRow(value: unknown): RuntimeOpencodeConfigRow | null {
+  if (
+    !isRecord(value)
+    || typeof value.workspaceId !== "string"
+    || typeof value.configJson !== "string"
+    || typeof value.updatedAt !== "number"
+  ) return null;
+  return {
+    workspaceId: value.workspaceId,
+    value: parseRuntimeOpencodeConfig(value.configJson),
+    updatedAt: value.updatedAt,
+  };
+}
+
+/** Read all runtime config rows without creating or modifying the runtime DB. */
+export async function listRuntimeOpencodeConfigRows(config: ServerConfig): Promise<RuntimeOpencodeConfigRow[]> {
+  const path = runtimeDbPath(config);
+  if (!existsSync(path)) return [];
+  const sql = `
+    SELECT workspace_id AS workspaceId, config_json AS configJson, updated_at AS updatedAt
+    FROM runtime_opencode_configs
+  `;
+  try {
+    let rows: unknown[];
+    if (typeof process.versions.bun === "string") {
+      const { Database } = await import("bun:sqlite");
+      const sqlite = new Database(path, { readonly: true, create: false });
+      try {
+        rows = sqlite.query(sql).all();
+      } finally {
+        sqlite.close();
+      }
+    } else {
+      const { DatabaseSync } = await importNodeSqlite();
+      const sqlite = new DatabaseSync(path, { readOnly: true });
+      try {
+        rows = sqlite.prepare(sql).all();
+      } finally {
+        sqlite.close();
+      }
+    }
+    return rows.flatMap((row) => {
+      const parsed = runtimeOpencodeConfigRow(row);
+      return parsed ? [parsed] : [];
+    });
+  } catch (error) {
+    if (classifyReadonlySqliteFailure(error) === "table-missing") return [];
+    throw error;
+  }
+}
+
 export async function writeGlobalRuntimeOpencodeConfig(
   config: ServerConfig,
-  updater: (current: RuntimeOpencodeConfig) => RuntimeOpencodeConfig,
+  updater: (current: Omit<RuntimeOpencodeConfig, "managedPolicy">) => Omit<RuntimeOpencodeConfig, "managedPolicy">,
 ): Promise<{ config: RuntimeOpencodeConfig; changed: boolean }> {
   return await writeRuntimeOpencodeConfig(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID, updater);
 }
@@ -150,7 +230,7 @@ function uniqueStrings(items: string[]): string[] {
   return items.filter((item, index, list) => list.indexOf(item) === index);
 }
 
-function mergeRuntimeOpencodeConfigLayers(
+export function mergeRuntimeOpencodeConfigLayers(
   base: RuntimeOpencodeConfig,
   overlay: RuntimeOpencodeConfig,
 ): RuntimeOpencodeConfig {
@@ -166,6 +246,11 @@ function mergeRuntimeOpencodeConfigLayers(
     ...runtimeMcpMap(base),
     ...runtimeMcpMap(overlay),
   };
+  // The Connect MCP is account-scoped: the global row is authoritative, so a
+  // stale legacy per-workspace copy must not shadow it. Mirrors
+  // OPENWORK_CLOUD_MCP_NAME in cloud-mcp-health.ts (import would be cyclic).
+  const globalCloudMcp = runtimeMcpMap(base)[OPENWORK_CLOUD_MCP_RESERVED_NAME];
+  if (globalCloudMcp) mcp[OPENWORK_CLOUD_MCP_RESERVED_NAME] = globalCloudMcp;
   const basePermission = isRecord(base.permission) ? base.permission : {};
   const overlayPermission = isRecord(overlay.permission) ? overlay.permission : {};
   const externalDirectory = {
@@ -183,6 +268,7 @@ function mergeRuntimeOpencodeConfigLayers(
   };
 
   return normalizeRuntimeOpencodeConfig({
+    ...(base.managedPolicy ? { managedPolicy: base.managedPolicy } : {}),
     ...(base.default_agent || overlay.default_agent ? { default_agent: overlay.default_agent ?? base.default_agent } : {}),
     ...(plugin.length ? { plugin } : {}),
     ...(disabledProviders.length ? { disabled_providers: disabledProviders } : {}),
@@ -204,6 +290,82 @@ export async function readEffectiveRuntimeOpencodeConfig(
     readRuntimeOpencodeConfig(config, workspaceId),
   ]);
   return mergeRuntimeOpencodeConfigLayers(globalRuntime, workspaceRuntime);
+}
+
+/**
+ * One-time (idempotent) startup migration for the workspace-independent
+ * injected engine config file: fold per-workspace `permission.external_directory`
+ * (union), `disabled_providers` (union), and `plugin` (union) into the
+ * ENGINE_GLOBAL row, then remove those fields from the workspace rows. `mcp`
+ * stays per-workspace — the dynamic engine push owns its delivery. No-op on
+ * repeat runs and when the config is read-only.
+ */
+export async function migrateWorkspaceRuntimeConfigToEngineGlobal(
+  config: ServerConfig,
+): Promise<{ changed: boolean }> {
+  const rows = await listRuntimeOpencodeConfigRows(config);
+  const workspaceRows = rows.filter((row) =>
+    !isEngineGlobalRuntimeConfigId(row.workspaceId)
+    && (
+      runtimePluginList(row.value).length > 0
+      || runtimeDisabledProviderList(row.value).length > 0
+      || Object.keys(runtimeExternalDirectory(row.value)).length > 0
+      || Object.keys(runtimeProviderMap(row.value)).length > 0
+    ),
+  );
+  if (workspaceRows.length === 0 || config.readOnly) return { changed: false };
+
+  // Oldest write first so the newest workspace edit of a provider key wins;
+  // the global row (cloud-managed authority) wins over every legacy copy.
+  const rowsByAge = [...workspaceRows].sort((left, right) => left.updatedAt - right.updatedAt);
+  let changed = false;
+  const globalResult = await writeGlobalRuntimeOpencodeConfig(config, (current) => {
+    const plugin = uniqueStrings([
+      ...runtimePluginList(current),
+      ...workspaceRows.flatMap((row) => runtimePluginList(row.value)),
+    ]);
+    const disabledProviders = uniqueStrings([
+      ...runtimeDisabledProviderList(current),
+      ...workspaceRows.flatMap((row) => runtimeDisabledProviderList(row.value)),
+    ]);
+    const externalDirectory = {
+      ...workspaceRows.reduce<Record<string, unknown>>(
+        (union, row) => ({ ...union, ...runtimeExternalDirectory(row.value) }),
+        {},
+      ),
+      ...runtimeExternalDirectory(current),
+    };
+    const provider = {
+      ...rowsByAge.reduce<Record<string, unknown>>(
+        (union, row) => ({ ...union, ...runtimeProviderMap(row.value) }),
+        {},
+      ),
+      ...runtimeProviderMap(current),
+    };
+    return {
+      ...current,
+      ...(plugin.length ? { plugin } : {}),
+      ...(disabledProviders.length ? { disabled_providers: disabledProviders } : {}),
+      ...(Object.keys(provider).length ? { provider } : {}),
+      ...(Object.keys(externalDirectory).length
+        ? { permission: { ...(isRecord(current.permission) ? current.permission : {}), external_directory: externalDirectory } }
+        : {}),
+    };
+  });
+  changed = globalResult.changed;
+  for (const row of workspaceRows) {
+    const result = await writeRuntimeOpencodeConfig(config, row.workspaceId, (current) => {
+      const { plugin: _plugin, disabled_providers: _disabledProviders, provider: _provider, permission, ...rest } = current;
+      // Strip only external_directory; any other permission keys stay put.
+      const { external_directory: _externalDirectory, ...permissionRest } = isRecord(permission) ? permission : {};
+      return {
+        ...rest,
+        ...(Object.keys(permissionRest).length ? { permission: permissionRest } : {}),
+      };
+    });
+    changed = result.changed || changed;
+  }
+  return { changed };
 }
 
 export type RuntimeOpencodeConfigInspection = {
@@ -365,22 +527,70 @@ export async function inspectRuntimeOpencodeConfig(
   return (await inspectRuntimeOpencodeConfigState(config, workspaceId, options)).config;
 }
 
-export async function writeRuntimeOpencodeConfig(
+// All runtime writers share this queue. A provider refresh cannot overwrite a
+// newer Den policy, and ordinary config edits cannot replace managed policy.
+const runtimeWrites = new WeakMap<ServerConfig, Promise<unknown>>();
+function updateRuntimeConfig(
   config: ServerConfig,
   workspaceId: string,
   updater: (current: RuntimeOpencodeConfig) => RuntimeOpencodeConfig,
 ): Promise<{ config: RuntimeOpencodeConfig; changed: boolean }> {
-  const row = await runtimeOpencodeConfigStore.getRow(config, workspaceId);
-  const current = row ? row.value : {};
-  const next = normalizeRuntimeOpencodeConfig(updater(current));
-  const now = Date.now();
-  const configJson = runtimeOpencodeConfigStore.serialize(next);
-  if (row?.valueJson === configJson) {
-    return { config: next, changed: false };
-  }
-  await runtimeOpencodeConfigStore.setSerialized(config, workspaceId, configJson, now);
-  for (const listener of writeListeners) listener(config, workspaceId);
-  return { config: next, changed: true };
+  const pending = runtimeWrites.get(config) ?? Promise.resolve();
+  const result = pending.catch(() => undefined).then(async () => {
+    const row = await runtimeOpencodeConfigStore.getRow(config, workspaceId);
+    const next = normalizeRuntimeOpencodeConfig(updater(row?.value ?? {}));
+    const configJson = runtimeOpencodeConfigStore.serialize(next);
+    if (row?.valueJson === configJson) return { config: next, changed: false };
+    const updatedAt = Math.max(Date.now(), (row?.updatedAt ?? 0) + 1);
+    await runtimeOpencodeConfigStore.setSerialized(config, workspaceId, configJson, updatedAt);
+    // Compare persisted bytes rather than row.value: an updater may mutate its input.
+    const previousMcp = runtimeMcpMap(parseRuntimeOpencodeConfig(row?.valueJson ?? "{}"));
+    const nextMcp = runtimeMcpMap(next);
+    const changedMcpNames = [...new Set([...Object.keys(previousMcp), ...Object.keys(nextMcp)])]
+      .filter(name => JSON.stringify(previousMcp[name]) !== JSON.stringify(nextMcp[name]));
+    if (changedMcpNames.length) {
+      let workspaces = runtimeMcpRevisions.get(config);
+      if (!workspaces) {
+        workspaces = new Map();
+        runtimeMcpRevisions.set(config, workspaces);
+      }
+      let revisions = workspaces.get(workspaceId);
+      if (!revisions) {
+        revisions = new Map();
+        workspaces.set(workspaceId, revisions);
+      }
+      for (const name of changedMcpNames) revisions.set(name, updatedAt);
+    }
+    for (const listener of writeListeners) listener(config, workspaceId);
+    return { config: next, changed: true };
+  });
+  runtimeWrites.set(config, result);
+  return result;
+}
+
+export function writeRuntimeOpencodeConfig(
+  config: ServerConfig,
+  workspaceId: string,
+  updater: (current: Omit<RuntimeOpencodeConfig, "managedPolicy">) => Omit<RuntimeOpencodeConfig, "managedPolicy">,
+): Promise<{ config: RuntimeOpencodeConfig; changed: boolean }> {
+  return updateRuntimeConfig(config, workspaceId, (current) => {
+    const { managedPolicy, ...editable } = current;
+    return { ...updater(editable), managedPolicy };
+  });
+}
+
+/** Signing out ends enforcement: a cached policy is not device enrollment (#5131). */
+export function clearManagedDesktopPolicy(config: ServerConfig) {
+  return updateRuntimeConfig(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID, (current) => {
+    const { managedPolicy: _cleared, ...rest } = current;
+    return rest;
+  });
+}
+
+// Only the verified Den-session boundary may call this writer.
+export function writeManagedDesktopPolicy(config: ServerConfig, policy: DesktopConfig) {
+  const validated = desktopConfigSchema.parse(policy);
+  return updateRuntimeConfig(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID, (current) => ({ ...current, managedPolicy: validated }));
 }
 
 export function mergeOpencodeConfigs(

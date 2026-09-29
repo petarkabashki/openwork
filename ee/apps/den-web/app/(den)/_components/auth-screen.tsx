@@ -1,13 +1,17 @@
 "use client";
 
-import { Dithering } from "@paper-design/shaders-react";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { isSamePathname } from "../_lib/client-route";
 import { getMcpOAuthSelectOrganizationRoute } from "../_lib/mcp-oauth-route";
-import { useWebGlSupported } from "../_lib/use-webgl-supported";
 import { useDenFlow } from "../_providers/den-flow-provider";
 import { AuthPanel } from "./auth-panel";
+import { OnboardingTexture } from "./onboarding-texture";
+import { McpAppFact, McpStoryTiles, mcpStoryCopy } from "../../mcp/mcp-story";
+import { useMcpClient } from "../../mcp/use-mcp-client";
+import { SetupFrame } from "./setup-frame";
+import { SetupFacts, SetupPanelBody } from "./setup-frame-parts";
+import { TemporaryAuthNotice } from "./temporary-auth-notice";
 
 function SessionStatusPanel({ mode }: { mode: "checking" | "redirecting" }) {
   const status = mode === "checking"
@@ -27,8 +31,8 @@ function SessionStatusPanel({ mode }: { mode: "checking" | "redirecting" }) {
         <div className="rounded-[1.5rem] border border-[var(--dls-border)] bg-[var(--dls-hover)]/60 p-4">
           <div className="flex items-start gap-3">
             <span className="relative mt-1 flex h-2.5 w-2.5 shrink-0">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--dls-accent)] opacity-30" />
-              <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-[var(--dls-accent)]" />
+              <span className="absolute inline-flex h-full w-full motion-safe:animate-ping rounded-full bg-[var(--dls-text-primary)] opacity-30" />
+              <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-[var(--dls-text-primary)]" />
             </span>
             <div className="min-w-0">
               <p className="m-0 text-[14px] font-medium text-[var(--dls-text-primary)]">{status.title}</p>
@@ -44,13 +48,12 @@ function SessionStatusPanel({ mode }: { mode: "checking" | "redirecting" }) {
   );
 }
 
-export function AuthScreen() {
+export function AuthScreen({ agentSignIn = false }: { agentSignIn?: boolean }) {
   const router = useRouter();
   const pathname = usePathname();
   const routingRef = useRef(false);
-  const { user, sessionHydrated, desktopAuthRequested, webAuthRequested, resolveUserLandingRoute } = useDenFlow();
-  const webGlSupported = useWebGlSupported();
-  const hasResolvedSession = sessionHydrated && Boolean(user) && !desktopAuthRequested && !webAuthRequested;
+  const { user, runtimeConfigLoaded, sessionHydrated, desktopAuthRequested, setupPending, authError, webAuthRequested, resolveUserLandingRoute } = useDenFlow();
+  const hasResolvedSession = runtimeConfigLoaded && sessionHydrated && Boolean(user) && !authError && (!desktopAuthRequested || setupPending) && !webAuthRequested;
 
   useEffect(() => {
     if (!hasResolvedSession || routingRef.current) {
@@ -75,47 +78,71 @@ export function AuthScreen() {
       });
   }, [hasResolvedSession, pathname, resolveUserLandingRoute, router]);
 
-  return (
-    <section className="den-page flex min-h-[calc(100vh-2.5rem)] w-full items-center justify-center py-3 sm:py-4">
-      <div className="den-frame relative mx-auto w-full max-w-[600px] overflow-hidden" data-testid="auth-landing-frame">
-        <div className="grid lg:grid-cols-[1fr_5fr]">
-          <div className="relative hidden min-h-[520px] overflow-hidden lg:block" data-testid="auth-landing-visual">
-            <div className="absolute inset-0 z-0">
-              {webGlSupported ? (
-                <Dithering
-                  speed={0}
-                  shape="warp"
-                  type="4x4"
-                  size={2.5}
-                  scale={1}
-                  frame={30214.2}
-                  colorBack="#00000000"
-                  colorFront="#FEFEFE"
-                  style={{ backgroundColor: "#142033", width: "100%", height: "100%" }}
-                />
-              ) : (
-                <div className="h-full w-full bg-[#142033]" />
-              )}
-            </div>
-          </div>
+  if (agentSignIn) {
+    return <AgentSignInScreen status={!runtimeConfigLoaded || !sessionHydrated ? "checking" : hasResolvedSession ? "redirecting" : null} />;
+  }
 
-          <div className="flex flex-col justify-center border-[var(--dls-border)] px-5 py-6 sm:px-7 sm:py-8 md:px-9 md:py-10 lg:border-l" data-testid="auth-landing-form">
-            <div className="mb-6 flex items-center gap-2 lg:hidden" data-testid="auth-landing-mobile-brand">
-              <img src="/openwork-mark.svg" alt="OpenWork" className="h-7 w-auto" />
-              <span className="text-[1.15rem] font-semibold tracking-tight text-[var(--dls-text-primary)]">
-                OpenWork
-              </span>
-            </div>
-            {!sessionHydrated ? (
-              <SessionStatusPanel mode="checking" />
-            ) : hasResolvedSession ? (
-              <SessionStatusPanel mode="redirecting" />
-            ) : (
+  return (
+    <SetupFrame
+      step="account"
+      panelVisual={<OnboardingTexture />}
+      title="Good work starts here."
+      description="One account for your desktop, your tools, and your team."
+    >
+      <div data-testid="auth-landing-frame">
+        <div data-testid="auth-landing-form">
+          {!runtimeConfigLoaded || !sessionHydrated ? (
+            <SessionStatusPanel mode="checking" />
+          ) : hasResolvedSession ? (
+            <SessionStatusPanel mode="redirecting" />
+          ) : (
+            <div className="grid gap-5">
+              <TemporaryAuthNotice />
               <AuthPanel bare emailFirstFlow />
-            )}
-          </div>
+            </div>
+          )}
         </div>
       </div>
-    </section>
+    </SetupFrame>
+  );
+}
+
+/**
+ * Sign-up while an agent waits (A7): the story names the app that asked, and
+ * the panel keeps "Signing in for" above the sign-in so the person never
+ * loses track of why they are here.
+ */
+function AgentSignInScreen({ status }: { status: "checking" | "redirecting" | null }) {
+  const [oauthQuery, setOauthQuery] = useState("");
+  useEffect(() => {
+    setOauthQuery(window.location.search.replace(/^\?/, ""));
+  }, []);
+  const client = useMcpClient(oauthQuery);
+  const story = mcpStoryCopy(client);
+  return (
+    <SetupFrame
+      title={story.title}
+      description={story.description}
+      aside={<McpStoryTiles client={client} workspaceName={null} />}
+      panelVisual={<OnboardingTexture />}
+    >
+      <div data-testid="auth-landing-frame">
+        <div data-testid="auth-landing-form">
+          <SetupPanelBody>
+            <SetupFacts rows={[{ label: "Signing in for", value: <McpAppFact client={client} /> }]} />
+            {status ? (
+              <SessionStatusPanel mode={status} />
+            ) : (
+              <AuthPanel
+                bare
+                emailFirstFlow
+                socialFirst
+                emailStepContent={{ title: "Create your account.", copy: "Already have an account? Enter your email and we\u2019ll find it." }}
+              />
+            )}
+          </SetupPanelBody>
+        </div>
+      </div>
+    </SetupFrame>
   );
 }

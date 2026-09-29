@@ -1,5 +1,8 @@
 import { applyEdits, modify } from "jsonc-parser";
 import type { ProviderConfig } from "@opencode-ai/sdk/v2/client";
+import type { GatewayUsableModel } from "@openwork/types/den/gateway";
+import type { ModelOption, ModelRef } from "@/app/types";
+import { catalogFastVariants, CLOUD_MODEL_CONFIG_VERSION } from "@openwork/types/cloud-model-fast";
 
 import type {
   DenOrgLlmProvider,
@@ -27,6 +30,30 @@ const sameStringList = (a: string[], b: string[]) =>
 const escapeRegExp = (value: string) =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+const credentialEnvRank = (name: string) => {
+  const normalized = name.trim().toUpperCase();
+  if (/(^|_)API_KEY$/.test(normalized)) return 0;
+  if (/(^|_)ACCESS_KEY_ID$/.test(normalized)) return 1;
+  if (/(^|_)BEARER_TOKEN(_|$)/.test(normalized) || /(^|_)TOKEN$/.test(normalized)) return 2;
+  if (/(^|_)KEY$/.test(normalized)) return 3;
+  return null;
+};
+
+const selectPrimaryCredentialEnvName = (
+  envNames: string[],
+  availableNames: string[],
+) => {
+  const available = new Set(availableNames.filter((name) => name.trim().length > 0));
+  const orderedNames = envNames.filter((name) => available.has(name));
+  const ranked = orderedNames
+    .map((name, index) => ({ name, index, rank: credentialEnvRank(name) }))
+    .filter((entry): entry is { name: string; index: number; rank: number } => entry.rank !== null)
+    .sort((left, right) => left.rank - right.rank || left.index - right.index);
+  if (ranked[0]) return ranked[0].name;
+  if (envNames.length > 1 && envNames.some((name) => credentialEnvRank(name) !== null)) return null;
+  return orderedNames[0] ?? null;
+};
+
 const removeCloudProviderComment = (raw: string, providerId: string) =>
   raw.replace(
     new RegExp(
@@ -42,9 +69,9 @@ export const getCloudProviderEnv = (config: Record<string, unknown>) =>
 /**
  * Split a connect payload's credential into the opencode auth.json entry and
  * the env vars to upsert. Multi-env providers (`apiKeys`) set every value as
- * an env var and use the first env-ordered value as the auth entry, following
- * the models.dev convention that `env[0]` is the primary credential. Legacy
- * single-credential payloads (`apiKey`) keep today's auth-only behaviour.
+ * an env var, then choose the auth entry by credential-shaped env name rather
+ * than by position: Azure declares its resource name before its API key.
+ * Legacy single-credential payloads (`apiKey`) keep today's auth-only behaviour.
  */
 export const resolveCloudProviderCredentials = (
   provider: Pick<
@@ -62,7 +89,14 @@ export const resolveCloudProviderCredentials = (
     const value = apiKeys[name]?.trim();
     return value ? [{ key: name, value }] : [];
   });
-  const primaryApiKey = provider.apiKey?.trim() || envEntries[0]?.value || "";
+  const primaryCredentialEnvName = selectPrimaryCredentialEnvName(
+    envNames,
+    envEntries.map((entry) => entry.key),
+  );
+  const primaryApiKey =
+    provider.apiKey?.trim() ||
+    envEntries.find((entry) => entry.key === primaryCredentialEnvName)?.value ||
+    "";
   return { envEntries, primaryApiKey };
 };
 
@@ -72,13 +106,153 @@ export const getCloudManagedProviderId = (
 
 /**
  * A provider key in `opencode.jsonc` that is owned by the cloud-import system:
- * `lpr_*` keys (org-managed providers) and the `openwork` hosted provider.
+ * `lpr_*` keys (org-managed providers), `ipr_*` keys (providers routed through
+ * the OpenWork inference gateway) and the `openwork` hosted provider.
  * These keys are never hand-authored, so re-importing over an existing block
  * with one of these ids is a safe reconcile (recovers a lost import baseline)
  * rather than a clobber of a user's manual provider (#2346).
  */
 export const isCloudManagedProviderKey = (providerId: string) =>
-  /^lpr_/i.test(providerId) || providerId.trim() === "openwork";
+  /^(lpr|ipr)_/i.test(providerId) || providerId.trim() === "openwork";
+
+export const OPENWORK_GATEWAY_PROVIDER_SOURCE = "openwork_gateway";
+/** Badge copy for providers routed through the OpenWork inference gateway. */
+export const OPENWORK_GATEWAY_BADGE_LABEL = "via OpenWork Gateway";
+
+/**
+ * Runtime provider ids whose sync status reports the OpenWork inference
+ * gateway as source — the UI badges these "via OpenWork Gateway".
+ */
+/**
+ * A gateway provider the server sync skipped because this member has not yet
+ * authorized their own account (`member_auth_required`). Rendered as a
+ * "Connect" row in Settings > AI providers and the model picker.
+ */
+export type GatewayConnectProvider = {
+  cloudProviderId: string;
+  credentialSetId?: string;
+  models?: GatewayUsableModel[];
+  providerId: string;
+  name: string;
+  /** Legacy metadata only; never opened or sent to an authenticated endpoint. */
+  authUrl: string | null;
+};
+
+export const gatewayConnectProviderKey = (provider: { cloudProviderId: string; credentialSetId?: string }) =>
+  provider.credentialSetId ? `${provider.cloudProviderId}:${provider.credentialSetId}` : provider.cloudProviderId;
+
+export function isGatewaySetConnected(provider: GatewayConnectProvider, imported: Record<string, CloudImportedProvider>) {
+  const ready = imported[provider.cloudProviderId];
+  if (!ready) return false;
+  if (!provider.credentialSetId) return true;
+  const suffix = provider.credentialSetId.slice(4);
+  return ready.modelIds.some((id) => id.startsWith("gwm_") && id.split("_")[2] === suffix);
+}
+
+export const GATEWAY_MEMBER_AUTH_REQUIRED_REASON = "member_auth_required";
+
+/** Copy shown under a gateway provider that still needs the member's sign-in. */
+export const gatewayConnectCopy = (name: string) => `Sign in to ${name} to use it`;
+
+/** Skipped sync entries that need the member's own sign-in, in server order. */
+export const resolveGatewayConnectProviders = (
+  skippedProviders:
+    | Record<string, { cloudProviderId: string; credentialSetId?: string; models?: GatewayUsableModel[]; providerId: string; name: string; reason: string; authUrl?: string | null }>
+    | undefined
+    | null,
+): GatewayConnectProvider[] =>
+  Object.values(skippedProviders ?? {})
+    .filter((provider) => provider.reason === GATEWAY_MEMBER_AUTH_REQUIRED_REASON)
+    .map((provider) => ({
+      cloudProviderId: provider.cloudProviderId,
+      credentialSetId: provider.credentialSetId,
+      ...(provider.models === undefined ? {} : { models: provider.models }),
+      providerId: provider.providerId,
+      name: provider.name,
+      authUrl: provider.authUrl ?? null,
+    }));
+
+export function pendingGatewayModelOptions(providers: readonly GatewayConnectProvider[]): ModelOption[] {
+  return providers.flatMap((provider) => (provider.models ?? []).flatMap((model) => {
+    if (!provider.credentialSetId || model.credentialSetId !== provider.credentialSetId) return [];
+    return [{
+      providerID: provider.providerId, modelID: model.id, title: model.name,
+      description: provider.name, footer: "Sign-in required", source: "cloud",
+      behaviorTitle: "Reasoning", behaviorLabel: "Default", behaviorDescription: "",
+      behaviorValue: null, isFree: false,
+      gatewayAuthorization: { cloudProviderId: provider.cloudProviderId, credentialSetId: provider.credentialSetId },
+    } satisfies ModelOption];
+  }));
+}
+
+export function isGatewayModelReady(
+  provider: GatewayConnectProvider,
+  model: ModelRef,
+  snapshot: { importedCloudProviders: Record<string, CloudImportedProvider>; cloudProviderServerSync: { reloadPending: boolean; skippedProviders: Record<string, { cloudProviderId: string; credentialSetId?: string }> } | null; gatewayUsageProviderScope?: number | null },
+) {
+  return Boolean(provider.credentialSetId) && model.modelID.split("_")[2] === provider.credentialSetId?.slice(4)
+    && snapshot.gatewayUsageProviderScope != null && snapshot.cloudProviderServerSync?.reloadPending === false
+    && !snapshot.cloudProviderServerSync.skippedProviders[gatewayConnectProviderKey(provider)]
+    && snapshot.importedCloudProviders[provider.cloudProviderId]?.providerId === model.providerID
+    && snapshot.importedCloudProviders[provider.cloudProviderId]?.modelIds.includes(model.modelID) === true;
+}
+
+export const GATEWAY_CONNECT_POLL_INTERVAL_MS = 10_000;
+export const GATEWAY_CONNECT_POLL_ATTEMPTS = 60;
+export const GATEWAY_CONNECT_TIMEOUT_MESSAGE = "Sign-in has not been confirmed. Check the browser, then refresh AI Providers. If consent expired or was canceled, retry sign-in.";
+
+export async function connectGatewayProvider(input: {
+  provider: GatewayConnectProvider;
+  startOAuth: (providerId: string, credentialSetId?: string, signal?: AbortSignal) => Promise<{ authorizationUrl: string }>;
+  signal: AbortSignal;
+  openUrl: (url: string) => void | Promise<void>;
+  resync: () => Promise<unknown>;
+  /** Whether the provider is now present in the materialized provider map. */
+  isConnected: () => boolean;
+  wait?: (ms: number) => Promise<void>;
+  pollIntervalMs?: number;
+  attempts?: number;
+}): Promise<boolean> {
+  if (input.signal.aborted) return false;
+  const { authorizationUrl } = await input.startOAuth(input.provider.cloudProviderId, input.provider.credentialSetId, input.signal);
+  if (input.signal.aborted) return false;
+  await input.openUrl(authorizationUrl);
+  if (input.signal.aborted) return false;
+  const wait = input.wait ?? ((ms: number) => new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      input.signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    input.signal.addEventListener("abort", finish, { once: true });
+    if (input.signal.aborted) finish();
+  }));
+  const attempts = input.attempts ?? GATEWAY_CONNECT_POLL_ATTEMPTS;
+  const interval = input.pollIntervalMs ?? GATEWAY_CONNECT_POLL_INTERVAL_MS;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (input.signal.aborted) return false;
+    await wait(interval);
+    if (input.signal.aborted) return false;
+    try {
+      await input.resync();
+    } catch {
+      continue;
+    }
+    if (input.signal.aborted) return false;
+    if (input.isConnected()) return true;
+  }
+  return false;
+}
+
+export const resolveGatewayProviderIds = (
+  importedCloudProviders: Record<string, Pick<CloudImportedProvider, "providerId" | "source">> | undefined,
+): Set<string> =>
+  new Set(
+    Object.values(importedCloudProviders ?? {})
+      .filter((provider) => provider.source === OPENWORK_GATEWAY_PROVIDER_SOURCE)
+      .map((provider) => provider.providerId),
+  );
 
 
 export const getProviderModelIds = (
@@ -95,6 +269,8 @@ export const isCloudProviderOutOfSync = (
   provider: DenOrgLlmProvider,
   importedProvider: CloudImportedProvider,
 ) =>
+  (importedProvider.modelConfigVersion !== CLOUD_MODEL_CONFIG_VERSION
+    && provider.models.some((model) => catalogFastVariants(model.config, provider.providerConfig.npm) !== undefined)) ||
   importedProvider.providerId !== getCloudManagedProviderId(provider) ||
   importedProvider.sourceProviderId !== provider.providerId ||
   (importedProvider.source ?? null) !== provider.source ||
@@ -138,6 +314,8 @@ export const buildCloudProviderConfig = (
           (next as Record<string, unknown>)[key] = value;
         }
       }
+      const variants = catalogFastVariants(raw, provider.providerConfig.npm);
+      if (variants) Object.assign(next, { variants });
       return [model.id, next];
     }),
   );

@@ -1,211 +1,65 @@
 import { expect } from "vitest";
-import {
-  createOrgConnection,
-  evalIn,
-  go,
-  readUsableConnection,
-  waitFor,
-} from "@openwork/behaviors";
-import { app, eventually, mcpMock, needs, server, test, unmetNeeds } from "@openwork/testkit";
-import type { TestNeeds } from "@openwork/testkit";
+import { spec } from "@openwork/testkit";
+import { connectionsMenu } from "../worlds/chat.ts";
 
-const requirements: TestNeeds = {
-  optIn: ["OPENWORK_EVAL_E2E_TESTS"],
-};
-const missingRequirements = unmetNeeds(requirements, process.env);
-const title = missingRequirements.length > 0
-  ? `composer connections menu skipped — needs: ${missingRequirements.join(", ")}`
-  : "the composer connections menu scrolls through Den inventory and signs in on the row";
+const test = spec.world(connectionsMenu);
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const plusButton = { role: "button", label: "Add files, skills, connectors, and more" } as const;
+const menuSearch = { placeholder: "Search files, skills, connectors" } as const;
 
-test(title, async ({ evidence, place }) => {
-  needs(requirements);
-  await using den = await server({
-    place,
-    org: {
-      name: `Composer connections menu ${Date.now()}`,
-      admin: { name: "Sarah" },
-    },
-    mocks: { connector: mcpMock() },
+test("a member: I want to use a connector in this message", async ({ world, user, probe, step, evidence }) => {
+  const slack = world.connections.find((connection) => connection.name === "Slack");
+  if (!slack) throw new Error("The world has no Slack connection.");
+  const menuOpen = async () => (await probe.dom("[data-composer-plus-menu]")).elements.length > 0;
+
+  await step("1. before: the Connectors section lists each organization connector with its logo, and Slack asks me to sign in", async () => {
+    await user.click(plusButton);
+    await user.click({ role: "option", label: /^Connectors/ });
+    await user.see({ placeholder: "Search connectors" });
+    for (const connection of world.connections) await user.see({ role: "option", label: new RegExp(`^${connection.name}`) });
+    await user.see({ role: "button", label: "Connect Slack" });
+    await user.screenshot();
   });
 
-  const connections: Array<{ id: string; name: string }> = [];
-  for (let index = 1; index <= 14; index += 1) {
-    connections.push(await createOrgConnection(den.admin, {
-      name: `Composer connection ${String(index).padStart(2, "0")}`,
-      url: den.mocks.connector.mcpUrl,
-      authType: "oauth",
-      credentialMode: "per_member",
-      access: { orgWide: true },
-    }));
-  }
-
-  await using desktop = await app({ den, as: "admin", place });
-  await go(desktop, `/workspace/${desktop.workspaceId}/session`);
-  await waitFor(desktop, `Boolean(document.querySelector('button[title="Agents, commands, skills, plugins, and connections"]'))`, {
-    timeoutMs: 60_000,
-    label: "composer capability menu trigger",
+  await step("2. Connect on the Slack row signs me in without leaving the menu", async () => {
+    const connectStartedAt = new Date().toISOString();
+    await user.click({ role: "button", label: "Connect Slack" });
+    // TODO(primitive): read an OAuth authorization request from a mock connector.
+    const authorization = await world.den.mocks.connector.authorizeRequestSince(connectStartedAt);
+    expect(authorization.params.get("state")).toBeTruthy();
+    const connected = await probe.eventually(async () => {
+      const response = await probe.api(world.den.admin, "/v1/mcp-connections?scope=usable");
+      const serialized = JSON.stringify(response.body);
+      return serialized.includes(slack.id) && serialized.includes('"connectedForMe":true');
+    }, { within: 90_000, intervalMs: 1_000, label: "Den reports Slack connected for me", until: (value) => value });
+    expect(connected).toBe(true);
+    if (!(await menuOpen())) {
+      await user.click(plusButton);
+      await user.click({ role: "option", label: /^Connectors/ });
+    }
+    await probe.eventually(async () => (await probe.dom('[aria-label="Connect Slack"]')).elements.length, {
+      within: 90_000, intervalMs: 500, label: "the Slack row drops its Connect button", until: (count) => count === 0,
+    });
+    await user.notSee({ role: "button", label: "Connect Slack" });
+    evidence.recordAssertionEvidence("Signing in from the row connects Slack for me", `OAuth state issued; Den connectedForMe=${connected}; the row no longer offers Connect`, connected);
+    await user.screenshot();
   });
 
-  const opened = await evalIn(desktop, `(() => {
-    const trigger = document.querySelector('button[title="Agents, commands, skills, plugins, and connections"]');
-    if (!(trigger instanceof HTMLButtonElement)) return false;
-    trigger.click();
-    return true;
-  })()`);
-  expect(opened).toBe(true);
-  await waitFor(desktop, `[...document.querySelectorAll('button')]
-    .some((entry) => (entry.textContent ?? "").trim() === "Connections (MCPs)")`, {
-    timeoutMs: 20_000,
-    label: "composer capability menu",
+  await step("3. choosing Slack puts it in my message as a token", async () => {
+    await user.click({ role: "option", label: /^Slack/ });
+    await probe.eventually(menuOpen, { within: 5_000, intervalMs: 20, label: "the + menu closes", until: (open) => !open });
+    await user.notSee(menuSearch);
+    const tokens = await probe.dom("[data-composer-connector]");
+    expect(tokens.elements.map((element) => element.text)).toEqual(["Slack"]);
+    await user.screenshot();
   });
 
-  const connectionsSelected = await evalIn(desktop, `(() => {
-    const button = [...document.querySelectorAll('button')]
-      .find((entry) => (entry.textContent ?? "").trim() === "Connections (MCPs)");
-    if (!(button instanceof HTMLButtonElement)) return false;
-    button.click();
-    return true;
-  })()`);
-  expect(connectionsSelected).toBe(true);
-  await waitFor(desktop, `[...document.querySelectorAll('div')]
-    .filter((entry) => /^Composer connection \\d+$/.test((entry.textContent ?? "").trim()) && entry.children.length === 0)
-    .length >= 14`, {
-    timeoutMs: 60_000,
-    label: "all Den connections in the composer menu",
+  await step("after: HubSpot still asks for its own sign-in; connecting Slack did not connect it", async () => {
+    await user.click(plusButton);
+    await user.type(menuSearch, "hbspt");
+    await user.see({ role: "option", label: /^HubSpot/ });
+    await user.see({ role: "button", label: "Connect HubSpot" });
+    evidence.recordAssertionEvidence("Other connectors keep their own sign-in", "HubSpot still shows Connect after Slack was connected", true);
+    await user.screenshot();
   });
-
-  const overflow = await evalIn(desktop, `(() => {
-    const section = [...document.querySelectorAll('button')]
-      .find((entry) => (entry.textContent ?? "").trim() === "Connections (MCPs)");
-    const navigation = section?.parentElement;
-    const panel = navigation?.parentElement?.parentElement;
-    const titles = [...document.querySelectorAll('div')]
-      .filter((entry) => /^Composer connection \\d+$/.test((entry.textContent ?? "").trim()) && entry.children.length === 0);
-    const rows = titles.map((title) => ({ title, row: title.parentElement?.parentElement?.parentElement }))
-      .filter((entry) => entry.row instanceof HTMLElement);
-    const list = rows[0]?.row?.parentElement?.parentElement;
-    if (!(panel instanceof HTMLElement)
-      || !(navigation instanceof HTMLElement)
-      || !(list instanceof HTMLElement)
-      || rows.length < 14) return null;
-    list.scrollTop = 0;
-    const listRect = list.getBoundingClientRect();
-    const target = rows.findLast((entry) => entry.row instanceof HTMLElement
-      && entry.row.getBoundingClientRect().bottom > listRect.bottom);
-    if (!target || !(target.row instanceof HTMLElement)) return null;
-    return {
-      panelHeight: panel.clientHeight,
-      navigationOverflow: getComputedStyle(navigation).overflowY,
-      listOverflow: getComputedStyle(list).overflowY,
-      listClientHeight: list.clientHeight,
-      listScrollHeight: list.scrollHeight,
-      targetInitiallyBelow: target.row.getBoundingClientRect().bottom > listRect.bottom,
-      targetName: (target.title.textContent ?? "").trim(),
-    };
-  })()`);
-  expect(overflow).toMatchObject({
-    navigationOverflow: "auto",
-    listOverflow: "auto",
-    targetInitiallyBelow: true,
-  });
-  expect(isRecord(overflow) && typeof overflow.panelHeight === "number" && overflow.panelHeight).toBeGreaterThan(180);
-  expect(isRecord(overflow) && typeof overflow.listScrollHeight === "number" && typeof overflow.listClientHeight === "number"
-    ? overflow.listScrollHeight
-    : 0).toBeGreaterThan(isRecord(overflow) && typeof overflow.listClientHeight === "number" ? overflow.listClientHeight : 0);
-  const targetName = isRecord(overflow) && typeof overflow.targetName === "string" ? overflow.targetName : "";
-  const targetConnection = connections.find((connection) => connection.name === targetName);
-  expect(targetConnection).toBeDefined();
-  if (!targetConnection) throw new Error(`Could not map the overflow row ${JSON.stringify(targetName)} to a Den connection.`);
-  const targetId = targetConnection.id;
-
-  const scrolled = await evalIn(desktop, `(() => {
-    const title = [...document.querySelectorAll('div')]
-      .find((entry) => (entry.textContent ?? "").trim() === ${JSON.stringify(targetName)} && entry.children.length === 0);
-    const target = title?.parentElement?.parentElement?.parentElement;
-    const list = target?.parentElement?.parentElement;
-    if (!(list instanceof HTMLElement) || !(target instanceof HTMLElement)) return null;
-    list.scrollTop = list.scrollHeight;
-    const targetRect = target.getBoundingClientRect();
-    const listRect = list.getBoundingClientRect();
-    return {
-      scrollTop: list.scrollTop,
-      targetVisible: targetRect.top >= listRect.top && targetRect.bottom <= listRect.bottom,
-      actionVisible: [...target.querySelectorAll('button')]
-        .some((button) => (button.textContent ?? "").trim() === "Connect your account"),
-    };
-  })()`);
-  expect(scrolled).toMatchObject({ targetVisible: true, actionVisible: true });
-  expect(isRecord(scrolled) && typeof scrolled.scrollTop === "number" ? scrolled.scrollTop : 0).toBeGreaterThan(0);
-  evidence.recordAssertionEvidence(
-    "The composer menu has a definite height and an independently scrolling connection list",
-    `Overflow geometry before and after scrolling: ${JSON.stringify({ overflow, scrolled })}.`,
-    isRecord(overflow)
-      && typeof overflow.panelHeight === "number"
-      && overflow.panelHeight > 180
-      && overflow.navigationOverflow === "auto"
-      && overflow.listOverflow === "auto"
-      && overflow.targetInitiallyBelow === true
-      && isRecord(scrolled)
-      && scrolled.targetVisible === true,
-  );
-
-  const connectStartedAt = new Date().toISOString();
-  const connectClicked = await evalIn(desktop, `(() => {
-    const title = [...document.querySelectorAll('div')]
-      .find((entry) => (entry.textContent ?? "").trim() === ${JSON.stringify(targetName)} && entry.children.length === 0);
-    const row = title?.parentElement?.parentElement?.parentElement;
-    const action = row ? [...row.querySelectorAll('button')]
-      .find((button) => (button.textContent ?? "").trim() === "Connect your account") : null;
-    if (!(action instanceof HTMLButtonElement) || action.disabled) return false;
-    action.click();
-    return true;
-  })()`);
-  expect(connectClicked).toBe(true);
-  const authorization = await den.mocks.connector.authorizeRequestSince(connectStartedAt);
-  expect(authorization.params.get("state")).toBeTruthy();
-
-  const connected = await eventually(
-    async () => (await readUsableConnection(den.admin, targetId))?.connectedForMe === true,
-    {
-      within: 90_000,
-      intervalMs: 1_000,
-      label: "Den connection becomes ready after composer-row OAuth",
-      until: (value) => value,
-    },
-  );
-  expect(connected).toBe(true);
-  await waitFor(desktop, `(() => {
-    const title = [...document.querySelectorAll('div')]
-      .find((entry) => (entry.textContent ?? "").trim() === ${JSON.stringify(targetName)} && entry.children.length === 0);
-    const row = title?.parentElement?.parentElement?.parentElement;
-    return (row?.textContent ?? "").includes("Ready")
-      && ![...(row?.querySelectorAll('button') ?? [])]
-        .some((button) => (button.textContent ?? "").trim() === "Connect your account");
-  })()`, {
-    timeoutMs: 90_000,
-    label: "composer connection row changes from sign-in to ready",
-  });
-  const readyRow = await evalIn(desktop, `(() => {
-    const title = [...document.querySelectorAll('div')]
-      .find((entry) => (entry.textContent ?? "").trim() === ${JSON.stringify(targetName)} && entry.children.length === 0);
-    const row = title?.parentElement?.parentElement?.parentElement;
-    return {
-      hasReady: (row?.textContent ?? "").includes("Ready"),
-      hasSignIn: [...(row?.querySelectorAll('button') ?? [])]
-        .some((button) => (button.textContent ?? "").trim() === "Connect your account"),
-    };
-  })()`);
-  expect(readyRow).toEqual({ hasReady: true, hasSignIn: false });
-  evidence.recordAssertionEvidence(
-    "OAuth started from the composer row and the same Den connection became ready",
-    `Connection ${targetId} reached Den connectedForMe=true and row state ${JSON.stringify(readyRow)}.`,
-    connected === true
-      && isRecord(readyRow)
-      && readyRow.hasReady === true
-      && readyRow.hasSignIn === false,
-  );
 });

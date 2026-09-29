@@ -1,16 +1,17 @@
 import { expect, test as base } from "vitest";
+import { relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { enterTestEvidence } from "./ambient.ts";
 import { createTestEvidence } from "./test-evidence.ts";
 import type { TestEvidenceRecorder } from "./test-evidence.ts";
 import type { VisualEvidenceResult } from "./validate.ts";
 
-function slug(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || "test";
-}
-
 export const test = base.extend<{ evidence: TestEvidenceRecorder }>({
   evidence: [async ({ task }, use) => {
-    const testEvidence = createTestEvidence({ name: slug(task.name) });
+    const testEvidence = createTestEvidence({
+      name: task.name,
+      specFile: relative(fileURLToPath(new URL("../../../../", import.meta.url)), task.file.filepath).replaceAll("\\", "/"),
+    });
     const leaveTestEvidence = enterTestEvidence(testEvidence);
     try {
       await use(testEvidence);

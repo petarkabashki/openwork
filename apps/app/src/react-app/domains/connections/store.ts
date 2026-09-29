@@ -1,10 +1,13 @@
 import { useSyncExternalStore } from "react";
 
+import { desktopRestrictionNotice, type DesktopAppRestrictionChecker } from "../../../app/cloud/desktop-app-restrictions";
+
 import { applyEdits, modify, parse, printParseErrorCode } from "jsonc-parser";
 
 import { t } from "../../../i18n";
 import {
   getMcpServerName,
+  isBuiltInOpenWorkExtension,
   MCP_QUICK_CONNECT,
   type McpDirectoryInfo,
 } from "../../../app/constants";
@@ -24,6 +27,8 @@ import {
 } from "../../../app/lib/desktop";
 import { toSessionTransportDirectory } from "../../../app/lib/session-scope";
 import {
+  normalizeMcpServerCommand,
+  normalizeMcpSlug,
   parseMcpServersFromContent,
   removeMcpFromConfig,
   validateMcpServerName,
@@ -46,6 +51,11 @@ import type { OpenworkServerStore } from "./openwork-server-store";
 import { attemptSilentMcpReauth } from "./mcp-silent-reauth";
 import { AGENT_FDE_SERVE_TOKEN_KEY, readWorkspaceServeToken } from "./agent-fde-serve-token";
 import {
+  createMcpStatusSynchronizer,
+  resolveObservedMcpStatus,
+  type McpStatusRefreshToken,
+} from "./mcp-status-synchronization";
+import {
   CLOUD_MCP_SERVER_NAME,
   readCloudMcpUserState,
 } from "./cloud-mcp-user-state";
@@ -64,6 +74,22 @@ type SetStateAction<T> = T | ((current: T) => T);
 // den-api): when the two were equal, the marker was stale the instant it
 // was written and every sync tick re-wrote the MCP config.
 const CLOUD_MCP_REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000;
+const LOCAL_OPENWORK_SERVER_RECOVERY_TIMEOUT_MS = 30_000;
+
+async function withLocalOpenworkServerRecoveryTimeout<T>(
+  task: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(t("mcp.connect_failed"))), timeoutMs);
+  });
+  try {
+    return await Promise.race([task, timeout]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
 
 export type ConnectionsStoreSnapshot = {
   mcpServers: McpServerEntry[];
@@ -88,6 +114,7 @@ export type McpConnectResult =
   | { ok: false; error: string };
 
 export function createConnectionsStore(options: {
+  checkDesktopAppRestriction: DesktopAppRestrictionChecker;
   client: () => Client | null;
   setClient: (value: Client | null) => void;
   projectDir: () => string;
@@ -97,6 +124,7 @@ export function createConnectionsStore(options: {
   openworkServer: OpenworkServerStore;
   runtimeWorkspaceId: () => string | null;
   ensureRuntimeWorkspaceId?: () => Promise<string | null | undefined>;
+  localOpenworkServerRecoveryTimeoutMs?: number;
   setProjectDir?: (value: string) => void;
   developerMode: () => boolean;
   markReloadRequired?: (reason: ReloadReason, trigger?: ReloadTrigger) => void;
@@ -108,6 +136,8 @@ export function createConnectionsStore(options: {
   let lastWorkspaceContextKey = "";
   let lastProjectDir = "";
   let snapshot: ConnectionsStoreSnapshot;
+  const mcpStatusSynchronizer = createMcpStatusSynchronizer();
+  const authStatusPolls = new Set<string>();
 
   let state: MutableState = {
     mcpServers: [],
@@ -196,11 +226,23 @@ export function createConnectionsStore(options: {
   };
 
   const resolveMcpOpenworkTarget = async (mode: "read" | "write") => {
-    const openworkSnapshot = getOpenworkSnapshot();
-    const openworkClient = openworkSnapshot.openworkServerClient;
-    const openworkWorkspaceId = await resolveOpenworkWorkspaceId();
+    let openworkSnapshot = getOpenworkSnapshot();
+    let openworkClient = openworkSnapshot.openworkServerClient;
+    let openworkWorkspaceId = await resolveOpenworkWorkspaceId();
+    if ((!openworkClient || !openworkWorkspaceId || openworkSnapshot.openworkServerStatus !== "connected")
+      && isDesktopRuntime()
+      && options.workspaceType() === "local") {
+      openworkClient = await withLocalOpenworkServerRecoveryTimeout(
+        options.openworkServer.ensureLocalOpenworkServerClient(),
+        options.localOpenworkServerRecoveryTimeoutMs ?? LOCAL_OPENWORK_SERVER_RECOVERY_TIMEOUT_MS,
+      );
+      openworkSnapshot = getOpenworkSnapshot();
+      openworkWorkspaceId = options.runtimeWorkspaceId()?.trim()
+        || (await options.ensureRuntimeWorkspaceId?.())?.trim()
+        || options.selectedWorkspaceId().trim()
+        || null;
+    }
     const hasOpenworkTarget =
-      openworkSnapshot.openworkServerStatus === "connected" &&
       Boolean(openworkClient && openworkWorkspaceId);
     const canUseOpenworkServer =
       hasOpenworkTarget &&
@@ -214,10 +256,12 @@ export function createConnectionsStore(options: {
   };
 
   const filterConfiguredStatuses = (status: McpStatusMap, entries: McpServerEntry[]) => {
-    const configured = new Set(entries.map((entry) => entry.name));
-    return Object.fromEntries(
-      Object.entries(status).filter(([name]) => configured.has(name)),
-    ) as McpStatusMap;
+    const next: McpStatusMap = {};
+    for (const entry of entries) {
+      const resolved = resolveObservedMcpStatus(status, entry);
+      if (resolved && resolved.status !== "disconnected") next[entry.name] = resolved;
+    }
+    return next;
   };
 
   const readMcpConfigFile = async (scope: "project" | "global"): Promise<OpencodeConfigFile | null> => {
@@ -326,24 +370,46 @@ export function createConnectionsStore(options: {
 
     if (!canTryOpenworkServer || !openworkClient || !openworkWorkspaceId) return null;
 
-    const response = await openworkClient.listMcp(openworkWorkspaceId);
+    let response = await openworkClient.listMcp(openworkWorkspaceId);
+    // Upgrade the enabled bundled helper when a local workspace is opened.
+    // Never enable a disabled entry, rewrite a custom command, or target a remote worker.
+    if (isDesktopRuntime() && options.workspaceType() === "local") {
+      const computer = response.items.find((entry) => entry.name === "computer-use");
+      const config = computer?.config;
+      const command = config?.command;
+      if (config?.type === "local" && config.enabled !== false && Array.isArray(command)
+        && typeof command[0] === "string" && command[0].endsWith("/ComputerUse")
+        && ((command.length === 2 && command[1] === "mcp") || (command.length === 3 && command[1] === "relay"))) {
+        const currentCommand = await resolveDesktopCommand("getComputerUseMcpCommand", false);
+        const bundled = currentCommand && (command[0] === currentCommand[0]
+          || command[0].endsWith("/OpenWork Computer Use.app/Contents/MacOS/ComputerUse"));
+        if (bundled && JSON.stringify(command) !== JSON.stringify(currentCommand)) {
+          const writable = await resolveWritableOpenworkTarget();
+          if (writable.canUseOpenworkServer && writable.openworkClient && writable.openworkWorkspaceId === openworkWorkspaceId
+            && !mcpMutationDenied(true)) {
+            await writable.openworkClient.addMcp(openworkWorkspaceId, { name: "computer-use", config: { ...config, command: currentCommand } });
+            response = await openworkClient.listMcp(openworkWorkspaceId);
+          }
+        }
+      }
+    }
     const next = response.items.map((entry) => ({
       name: entry.name,
-      config: entry.config as McpServerEntry["config"],
+      // The server relays opencode.json entries verbatim; fold a Claude-style
+      // string command into one list before any reader touches it.
+      config: normalizeMcpServerCommand(entry.config as McpServerEntry["config"]),
       source: entry.source,
       managedOAuth: entry.managedOAuth,
     }));
     const engineSync = response.engineSync ?? null;
 
     let nextStatuses: McpStatusMap = {};
-    const activeClient = options.client();
-    if (activeClient && projectDir) {
-      try {
-        const status = unwrap(await activeClient.mcp.status({ directory: projectDir }));
-        nextStatuses = filterConfiguredStatuses(status as McpStatusMap, next);
-      } catch {
-        nextStatuses = {};
-      }
+    // Read through the same workspace mount as configuration. The chat client
+    // can still point at the previous/default workspace during restoration.
+    try {
+      nextStatuses = filterConfiguredStatuses(await openworkClient.getMcpStatus(openworkWorkspaceId), next);
+    } catch {
+      nextStatuses = {};
     }
 
     for (const entry of next) {
@@ -396,7 +462,8 @@ export function createConnectionsStore(options: {
     const mcpResource = extensionResource(entry.extensionManifest, "mcp");
     if (mcpResource?.localCommandRef === "openwork.computerUseMcp") {
       const command = await resolveDesktopCommand("getComputerUseMcpCommand", false);
-      return command ?? entry.command;
+      if (!command) throw new Error("Computer Use requires the bundled OpenWork helper on macOS.");
+      return command;
     }
     if (mcpResource?.localCommandRef === "openwork.uiMcp" || entry.serverName === "openwork-ui") {
       const command = await resolveDesktopCommand("getOpenworkUiMcpCommand");
@@ -465,7 +532,11 @@ export function createConnectionsStore(options: {
    * transport — silently, never opening a browser or modal. Mirrors
    * syncCloudControlMcp, but for user-added connectors.
    */
-  async function healUnhealthyMcpEntries(servers: McpServerEntry[], statuses: McpStatusMap) {
+  async function healUnhealthyMcpEntries(
+    servers: McpServerEntry[],
+    statuses: McpStatusMap,
+    refreshToken: McpStatusRefreshToken,
+  ) {
     if (disposed || snapshot.mcpAuthModalOpen || snapshot.mcpConnectingName) return;
     const activeClient = options.client();
     const projectDir = options.projectDir().trim();
@@ -476,26 +547,22 @@ export function createConnectionsStore(options: {
       servers,
       statuses,
     }).catch(() => false);
-    if (!attempted || disposed) return;
-    try {
-      const status = unwrap(await activeClient.mcp.status({ directory: projectDir }));
-      setStateField(
-        "mcpStatuses",
-        filterConfiguredStatuses(status as McpStatusMap, snapshot.mcpServers),
-      );
-    } catch {
-      // Post-heal status refresh is best-effort; the next refresh picks it up.
-    }
+    if (!attempted || disposed || !mcpStatusSynchronizer.isCurrent(refreshToken)) return;
+    // Re-enter the ordered refresh path. A self-heal launched from an older
+    // snapshot must never publish its late status over a newer OAuth result.
+    await refreshMcpServers();
   }
 
   async function refreshMcpServers() {
     if (disposed) return;
 
+    const refreshToken = mcpStatusSynchronizer.beginRefresh(getWorkspaceContextKey());
+    const isCurrentRefresh = () => !disposed && mcpStatusSynchronizer.isCurrent(refreshToken);
     const projectDir = options.projectDir().trim();
     const isRemoteWorkspace = options.workspaceType() === "remote";
 
     try {
-      setStateField("mcpStatus", null);
+      if (isCurrentRefresh()) setStateField("mcpStatus", null);
       const serverResult = await listMcpFromOpenworkServer(projectDir);
       if (serverResult) {
         // Surface engine registration failures instead of leaving users
@@ -503,17 +570,24 @@ export function createConnectionsStore(options: {
         const failedNames = serverResult.engineSync?.status === "failed"
           ? serverResult.engineSync.failures.map((failure) => failure.name).join(", ")
           : "";
+        const projectedStatuses = mcpStatusSynchronizer.project(
+          refreshToken,
+          serverResult.nextStatuses,
+          serverResult.next,
+        );
+        if (!projectedStatuses) return;
         mutateState((current) => ({
           ...current,
           mcpServers: serverResult.next,
           mcpLastUpdatedAt: Date.now(),
-          mcpStatuses: serverResult.nextStatuses,
+          mcpStatuses: projectedStatuses,
           managedOAuthAvailable: serverResult.managedOAuthAvailable,
+          // The Library's own empty state explains an empty server list.
           mcpStatus: failedNames
             ? `Some MCPs could not be registered with the engine: ${failedNames}. They may appear disconnected — try reloading the engine.`
-            : serverResult.next.length ? null : "No MCP servers configured yet.",
+            : null,
         }));
-        void healUnhealthyMcpEntries(serverResult.next, serverResult.nextStatuses);
+        void healUnhealthyMcpEntries(serverResult.next, projectedStatuses, refreshToken);
         return;
       }
     } catch (error) {
@@ -521,6 +595,7 @@ export function createConnectionsStore(options: {
         message: error instanceof Error ? error.message : String(error),
       });
       const serverTarget = await resolveMcpOpenworkTarget("read").catch(() => null);
+      if (!isCurrentRefresh()) return;
       if (isRemoteWorkspace || serverTarget?.hasOpenworkTarget) {
         mutateState((current) => ({
           ...current,
@@ -533,6 +608,7 @@ export function createConnectionsStore(options: {
     }
 
     if (isRemoteWorkspace) {
+      if (!isCurrentRefresh()) return;
       mutateState((current) => ({
         ...current,
         mcpStatus: "OpenWork server unavailable. MCP config is read-only.",
@@ -543,6 +619,7 @@ export function createConnectionsStore(options: {
     }
 
     if (!isDesktopRuntime()) {
+      if (!isCurrentRefresh()) return;
       mutateState((current) => ({
         ...current,
         mcpStatus: "MCP configuration is only available for local workspaces.",
@@ -553,6 +630,7 @@ export function createConnectionsStore(options: {
     }
 
     if (!projectDir) {
+      if (!isCurrentRefresh()) return;
       mutateState((current) => ({
         ...current,
         mcpStatus: "Pick a workspace folder to load MCP servers.",
@@ -563,7 +641,7 @@ export function createConnectionsStore(options: {
     }
 
     try {
-      setStateField("mcpStatus", null);
+      if (isCurrentRefresh()) setStateField("mcpStatus", null);
       recordPerfLog(options.developerMode(), "mcp.refresh", "desktop-project-fallback", {
         projectDir,
       });
@@ -604,6 +682,7 @@ export function createConnectionsStore(options: {
       });
 
       if (!globalConfig.exists && !projectConfig.exists && runtimeServers.length === 0) {
+        if (!isCurrentRefresh()) return;
         mutateState((current) => ({
           ...current,
           mcpServers: [],
@@ -624,15 +703,18 @@ export function createConnectionsStore(options: {
         }
       }
 
+      const projectedStatuses = mcpStatusSynchronizer.project(refreshToken, nextStatuses, next);
+      if (!projectedStatuses) return;
       mutateState((current) => ({
         ...current,
         mcpServers: next,
         mcpLastUpdatedAt: Date.now(),
-        mcpStatuses: nextStatuses,
-        mcpStatus: next.length ? null : "No MCP servers configured yet.",
+        mcpStatuses: projectedStatuses,
+        mcpStatus: null,
       }));
-      void healUnhealthyMcpEntries(next, nextStatuses);
+      void healUnhealthyMcpEntries(next, projectedStatuses, refreshToken);
     } catch (error) {
+      if (!isCurrentRefresh()) return;
       mutateState((current) => ({
         ...current,
         mcpServers: [],
@@ -642,7 +724,31 @@ export function createConnectionsStore(options: {
     }
   }
 
+  function mcpMutationDenied(builtIn: boolean) {
+    const restriction = builtIn ? "allowBuiltInExtensions" : "allowManageExtensions";
+    if (!options.checkDesktopAppRestriction({ restriction })) return null;
+    const message = desktopRestrictionNotice(restriction);
+    setStateField("mcpStatus", message);
+    return message;
+  }
+
+  function builtInMcp(name: string) {
+    return MCP_QUICK_CONNECT.find((entry) =>
+      isBuiltInOpenWorkExtension(entry) && getMcpServerName(entry) === name,
+    );
+  }
+
   async function connectMcp(entry: McpDirectoryInfo): Promise<McpConnectResult> {
+    const builtIn = builtInMcp(getMcpServerName(entry));
+    // Use catalog configuration for built-ins; caller-supplied metadata must
+    // not turn an arbitrary URL or command into an allowed built-in.
+    if (builtIn) entry = builtIn;
+    // Cloud repair uses the signed-in organization's reconciler below, not
+    // caller-supplied MCP configuration. Existing service access stays usable.
+    if (entry.managedBy !== "openwork-connect") {
+      const error = mcpMutationDenied(Boolean(builtIn));
+      if (error) return { ok: false, error };
+    }
     const startedAt = perfNow();
     const openworkSnapshot = getOpenworkSnapshot();
     const isRemoteWorkspace =
@@ -739,7 +845,7 @@ export function createConnectionsStore(options: {
         if (!canUseOpenworkServer || !openworkClient || !openworkWorkspaceId) {
           throw new Error("OpenWork server is required to repair agent access to connected services.");
         }
-        const context = await resolveCloudMcpOperationContext(entry.url);
+        const context = await resolveCloudMcpOperationContext(null);
         if (!context) {
           throw new Error("Sign in to OpenWork Cloud and choose an organization first.");
         }
@@ -862,10 +968,11 @@ export function createConnectionsStore(options: {
       }
 
       if (entryType === "local") {
-        if (!entry.command?.length) {
+        const command = await resolveLocalMcpCommand(entry);
+        if (!command?.length) {
           throw new Error("Missing MCP command.");
         }
-        mcpEntryConfig["command"] = await resolveLocalMcpCommand(entry);
+        mcpEntryConfig["command"] = command;
         const environment = await resolveLocalMcpEnvironment(entry, resolvedProjectDir);
         if (environment) {
           mcpEntryConfig["environment"] = environment;
@@ -924,7 +1031,6 @@ export function createConnectionsStore(options: {
         // `/opencode` route it can resolve to an internal `local_*` workspace
         // id that the OpenWork server does not expose, producing a confusing
         // `workspace_not_found` after the config write already succeeded.
-        setStateField("mcpStatuses", filterConfiguredStatuses(snapshot.mcpStatuses, snapshot.mcpServers));
       } else {
         if (!activeClient || !resolvedProjectDir) {
           throw new Error(t("mcp.connect_server_first"));
@@ -943,30 +1049,20 @@ export function createConnectionsStore(options: {
                 type: "local" as const,
                 command: (mcpEntryConfig["command"] as string[]) ?? entry.command!,
                 enabled: true,
-                // mcpEntryConfig["environment"] is set above (see
-                // resolveLocalMcpEnvironment) for entries like agent-fde that
-                // need a deterministic env var to resolve their workspace.
-                // It was already written into the project's opencode.json,
-                // but this hot-add call is what actually spawns the process
-                // on first connect -- omitting it here left MCP_LAUNCH_WORKSPACE
-                // unset for the live spawn, so agent-fde refused immediately
-                // with "Connection closed" even though the on-disk config
-                // was correct. Confirmed by reproducing both call shapes
-                // directly against a running opencode server.
+                // The hot-add call is what spawns the process on first connect;
+                // the file write above only matters on a later engine start.
                 ...(mcpEntryConfig["environment"]
                   ? { environment: mcpEntryConfig["environment"] as Record<string, string> }
                   : {}),
               };
 
-        const status = unwrap(
+        unwrap(
           await activeClient.mcp.add({
             directory: resolvedProjectDir,
             name: slug,
             config: mcpAddConfig,
           }),
         );
-
-        setStateField("mcpStatuses", status as McpStatusMap);
       }
       options.markReloadRequired?.("mcp", { type: "mcp", name: slug, action });
       await refreshMcpServers();
@@ -1194,15 +1290,6 @@ export function createConnectionsStore(options: {
         await activeClient.mcp.auth.remove({ directory: resolvedProjectDir, name: safeName });
       }
 
-      try {
-        if (activeClient && resolvedProjectDir) {
-          const status = unwrap(await activeClient.mcp.status({ directory: resolvedProjectDir }));
-          setStateField("mcpStatuses", status as McpStatusMap);
-        }
-      } catch {
-        // ignore
-      }
-
       await refreshMcpServers();
       setStateField("mcpStatus", t("mcp.logout_success").replace("{server}", safeName));
     } catch (error) {
@@ -1214,6 +1301,7 @@ export function createConnectionsStore(options: {
   }
 
   async function removeMcp(name: string) {
+    if (mcpMutationDenied(Boolean(builtInMcp(name)))) return;
     try {
       setStateField("mcpStatus", null);
 
@@ -1285,7 +1373,7 @@ export function createConnectionsStore(options: {
 
     if (disposed) return;
     // Only clear the reloading banner if it's still ours. refreshMcpServers
-    // may have already replaced it with a real message (e.g. "No MCP servers").
+    // may have already replaced it with a real message (e.g. a registration failure).
     if (snapshot.mcpStatus === t("mcp.reloading_status")) {
       setStateField("mcpStatus", null);
     }
@@ -1296,6 +1384,7 @@ export function createConnectionsStore(options: {
   // this never gets called when the server is unavailable. Reload UX comes
   // from the existing reload-required popup; no extra banner here.
   async function setMcpEnabled(name: string, enabled: boolean) {
+    if (mcpMutationDenied(Boolean(builtInMcp(name)))) return;
     try {
       const { openworkClient, openworkWorkspaceId, canUseOpenworkServer } =
         await resolveWritableOpenworkTarget();
@@ -1331,6 +1420,40 @@ export function createConnectionsStore(options: {
       mcpAuthEntry: null,
       mcpAuthNeedsReload: false,
     }));
+  }
+
+  function recordMcpAuthenticated(name: string) {
+    const workspaceContextKey = getWorkspaceContextKey();
+    mcpStatusSynchronizer.recordAuthenticated(workspaceContextKey, name);
+    const normalizedName = normalizeMcpSlug(name);
+    const configuredName = state.mcpServers.find((entry) => (
+      normalizeMcpSlug(entry.id ?? entry.name) === normalizedName
+      || normalizeMcpSlug(entry.name) === normalizedName
+    ))?.name ?? name;
+    mutateState((current) => ({
+      ...current,
+      mcpStatuses: {
+        ...current.mcpStatuses,
+        [configuredName]: { status: "connected" },
+      },
+    }));
+
+    const pollKey = `${workspaceContextKey}\n${normalizedName}`;
+    if (authStatusPolls.has(pollKey)) return;
+    authStatusPolls.add(pollKey);
+    void (async () => {
+      const delays = [0, 250, 500, 1_000, 2_000, 4_000];
+      try {
+        for (const delay of delays) {
+          if (disposed || !mcpStatusSynchronizer.isPending(workspaceContextKey, name)) return;
+          if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+          if (disposed) return;
+          await refreshMcpServers();
+        }
+      } finally {
+        authStatusPolls.delete(pollKey);
+      }
+    })();
   }
 
   async function completeMcpAuthModal() {
@@ -1431,6 +1554,7 @@ export function createConnectionsStore(options: {
       return snapshot.mcpAuthNeedsReload;
     },
     closeMcpAuthModal,
+    recordMcpAuthenticated,
     completeMcpAuthModal,
   };
 }

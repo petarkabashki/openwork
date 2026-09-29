@@ -1,3 +1,5 @@
+import { declarativeDeleteSchema, declarativeResponses, externalKeyParamsSchema, isDuplicateEntry } from "../declarative.js"
+import { findMarketplaceByExternalKey } from "./store.js"
 import type { Context, Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
@@ -116,8 +118,7 @@ import { isPluginArchOrgAdmin, requirePluginArchCapability, type PluginArchActor
 import { pluginArchRoutePaths } from "./contracts.js"
 import { ensureOrganizationAdmin, orgAccessFailureStatus } from "../shared.js"
 import { isAgentOAuthClientConnection, listMemberUsableConnectionFacts } from "../mcp-connections.js"
-import { codemodeScriptsEnabled } from "../../../capability-sources/codemode-rollout.js"
-import { listProgramLibraryItems } from "../../../program-library.js"
+import { listWorkflowLibraryItems } from "../../../workflow-library.js"
 import {
   PluginArchRouteFailure,
   addPluginMembership,
@@ -225,6 +226,7 @@ function actorContext(c: OrgContext): PluginArchActorContext {
   }
 
   return {
+    ...(c.get("apiKey") ? { apiKey: true } : {}),
     memberTeams: c.get("memberTeams") ?? [],
     organizationContext,
     session: c.get("session"),
@@ -275,7 +277,7 @@ export function isAgentPluginMcpOAuthClientSetup(input: { apiKey?: string | null
   return isAgentPluginMcpSecretSetup(input)
 }
 
-function withPluginArchOrgContext(app: Hono<any>, method: "delete" | "get" | "patch" | "post", path: string, ...handlers: unknown[]) {
+function withPluginArchOrgContext(app: Hono<any>, method: "delete" | "get" | "patch" | "post" | "put", path: string, ...handlers: unknown[]) {
   const routeHandler = handlers.pop() as unknown
   const routeMiddlewares = handlers as unknown[]
   const routeApp = app as unknown as Record<string, (...args: unknown[]) => unknown>
@@ -378,8 +380,9 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     jsonValidator(configObjectCreateSchema),
     describeRoute({
       tags: ["Config Objects"],
-      summary: "Create config object",
-      description: "Creates a new private config object and initial immutable version.",
+      summary: "Create a skill, agent, or other config object; optionally add it to an existing plugin",
+      description: "Creates a config object and initial immutable version. Pass pluginIds to add the new component to existing plugins without creating a duplicate plugin; omit pluginIds for a private standalone object. Skills require complete SKILL.md in input.rawSourceText.",
+      ...{ "x-mcp-search-aliases": ["add skill to existing plugin", "create skill in plugin", "add component to plugin"] },
       responses: {
         201: jsonResponse("Config object created successfully.", configObjectMutationResponseSchema),
         400: jsonResponse("The config object creation request was invalid.", invalidRequestSchema),
@@ -390,7 +393,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const context = actorContext(c)
-        await requirePluginArchCapability(context, "config_object.create", false)
+        await requirePluginArchCapability(context, "config_object.create")
         const body = validJson<any>(c)
         const item = await createConfigObject({
           context,
@@ -477,28 +480,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
       }
     })
 
-  withPluginArchOrgContext(app, "get", pluginArchRoutePaths.configObjectVersion,
-    paramValidator(configObjectVersionParamsSchema),
-    describeRoute({
-      tags: ["Config Objects"],
-      summary: "Get config object version",
-      description: "Returns one immutable config object version.",
-      responses: {
-        200: jsonResponse("Config object version returned successfully.", configObjectVersionDetailResponseSchema),
-        400: jsonResponse("The version path parameters were invalid.", invalidRequestSchema),
-        401: jsonResponse("The caller must be signed in to view config object versions.", unauthorizedSchema),
-        404: jsonResponse("The config object version could not be found.", notFoundSchema),
-      },
-    }),
-    async (c: OrgContext) => {
-      try {
-        const params = validParam<any>(c)
-        return c.json({ item: await getConfigObjectVersion({ configObjectId: params.configObjectId, context: actorContext(c), versionId: params.versionId }) })
-      } catch (error) {
-        return routeErrorResponse(c, error)
-      }
-    })
-
+  // Registered before :versionId so "latest" is not validated as a version id.
   withPluginArchOrgContext(app, "get", pluginArchRoutePaths.configObjectLatestVersion,
     paramValidator(configObjectParamsSchema),
     describeRoute({
@@ -516,6 +498,28 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
       try {
         const params = validParam<any>(c)
         return c.json({ item: await getLatestConfigObjectVersion({ configObjectId: params.configObjectId, context: actorContext(c) }) })
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "get", pluginArchRoutePaths.configObjectVersion,
+    paramValidator(configObjectVersionParamsSchema),
+    describeRoute({
+      tags: ["Config Objects"],
+      summary: "Get config object version",
+      description: "Returns one immutable config object version.",
+      responses: {
+        200: jsonResponse("Config object version returned successfully.", configObjectVersionDetailResponseSchema),
+        400: jsonResponse("The version path parameters were invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to view config object versions.", unauthorizedSchema),
+        404: jsonResponse("The config object version could not be found.", notFoundSchema),
+      },
+    }),
+    async (c: OrgContext) => {
+      try {
+        const params = validParam<any>(c)
+        return c.json({ item: await getConfigObjectVersion({ configObjectId: params.configObjectId, context: actorContext(c), versionId: params.versionId }) })
       } catch (error) {
         return routeErrorResponse(c, error)
       }
@@ -703,7 +707,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     }),
     async (c: OrgContext) => {
       const query = validQuery<any>(c)
-      return c.json(await listPlugins({ context: actorContext(c), cursor: query.cursor, limit: query.limit, q: query.q, status: query.status }))
+      return c.json(await listPlugins({ context: actorContext(c), cursor: query.cursor, includeAccess: query.includeAccess, includeTotal: query.includeTotal, includeFacets: query.includeFacets, limit: query.limit, q: query.q, name: query.name, status: query.status, teamId: query.teamId, memberId: query.memberId, ownerId: query.ownerId }))
     })
 
   withPluginArchOrgContext(app, "post", pluginArchRoutePaths.plugins,
@@ -711,7 +715,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "Create plugin",
-      description: "Creates a plugin and can also create components, share org-wide, and publish to a marketplace in one request.",
+      description: "Creates a plugin and can also create components, share org-wide, and publish to a marketplace in one request. An mcp component may carry the same connection setup as the Connections page (authentication, credential mode, API key, OAuth app), or instead reference an existing organization connection by connectionId, so its server is configured immediately. Connection setup is for owners and admins; other members may reference only a connection they added themselves.",
       responses: {
         201: jsonResponse("Plugin created successfully.", pluginMutationResponseSchema),
         400: jsonResponse("The plugin creation request was invalid.", invalidRequestSchema),
@@ -724,17 +728,25 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
       try {
         const context = actorContext(c)
         const body = validJson<PluginCreateBody>(c)
-        await requirePluginArchCapability(context, "plugin.create", body.orgWide === true || Boolean(body.marketplaceId))
+        await requirePluginArchCapability(context, "plugin.create")
         if (body.orgWide === true && !isPluginArchOrgAdmin(context)) {
           throw new PluginArchAuthorizationError(403, "forbidden", "Only organization owners and admins can create org-wide plugins.")
         }
         if ((body.components?.length ?? 0) > 0) {
-          await requirePluginArchCapability(context, "config_object.create", false)
+          await requirePluginArchCapability(context, "config_object.create")
+        }
+        const sessionId = c.get("session")?.id
+        if (body.components?.some((component) => component.connection && isAgentPluginMcpSecretSetup({
+          apiKey: component.connection.apiKey,
+          oauthClient: component.connection.oauthClient,
+          sessionId,
+        }))) {
+          return c.json({ error: "invalid_request", message: "Plugin MCP credentials cannot be set from the agent. Add them in the OpenWork Cloud dashboard under Connections." }, 400)
         }
         return c.json({
           ok: true,
           item: await createPluginBundle({
-            components: body.components?.map((component) => ({ type: component.type, value: component.input })),
+            components: body.components?.map((component) => ({ connection: component.connection, connectionId: component.connectionId, type: component.type, value: component.input })),
             context,
             description: body.description,
             marketplaceId: body.marketplaceId,
@@ -848,7 +860,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "Add plugin config object",
-      description: "Adds a config object to a plugin. Programs require manager access because this can expand their audience through Plugin and Marketplace grants.",
+      description: "Adds a config object to a plugin. Workflows require manager access because this can expand their audience through Plugin and Marketplace grants.",
       responses: {
         201: jsonResponse("Plugin membership created successfully.", pluginMembershipMutationResponseSchema),
         400: jsonResponse("The plugin membership request was invalid.", invalidRequestSchema),
@@ -872,7 +884,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "Remove plugin config object",
-      description: "Removes one config object from a plugin. Programs require manager access because this revokes inherited Plugin or Marketplace access.",
+      description: "Removes one config object from a plugin. Workflows require manager access because this revokes inherited Plugin or Marketplace access.",
       responses: {
         204: emptyResponse("Plugin membership removed successfully."),
         400: jsonResponse("The plugin membership path parameters were invalid.", invalidRequestSchema),
@@ -907,7 +919,13 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const params = validParam<any>(c)
-        return c.json(await listPluginMemberships({ context: actorContext(c), includeConfigObjects: true, onlyActive: true, pluginId: params.pluginId }))
+        return c.json(await listPluginMemberships({
+          context: actorContext(c),
+          includeConfigObjects: true,
+          legacyWorkflowObjectType: true,
+          onlyActive: true,
+          pluginId: params.pluginId,
+        }))
       } catch (error) {
         return routeErrorResponse(c, error)
       }
@@ -1036,7 +1054,7 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "List my library",
-      description: "Lists the Programs, Remote MCP Apps, plugins, and connections the caller can use, with every applicable access edge. Programs and Remote MCP Apps remain config objects contained by their parent OpenWork Connect Plugin.",
+      description: "Lists the Workflows, Remote MCP Apps, plugins, and connections the caller can use, with every applicable access edge. Workflows and Remote MCP Apps remain config objects contained by their parent OpenWork Connect Plugin.",
       responses: {
         200: jsonResponse("Effective member library returned successfully.", meLibraryListResponseSchema),
         401: jsonResponse("The caller must be signed in to view their library.", unauthorizedSchema),
@@ -1045,15 +1063,13 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     async (c: OrgContext) => {
       try {
         const context = actorContext(c)
-        const [pluginItems, connections, programItems] = await Promise.all([
+        const [pluginItems, connections, workflowItems] = await Promise.all([
           listMeLibraryPluginItems({ context }),
           listMemberUsableConnectionFacts({ context }),
-          codemodeScriptsEnabled(context.organizationContext.organization.metadata)
-            ? listProgramLibraryItems({ context })
-            : Promise.resolve([]),
+          listWorkflowLibraryItems({ context }),
         ])
         const connectionItems = await listMeLibraryConnectionItems({ connections, context })
-        const items = [...pluginItems, ...connectionItems, ...programItems]
+        const items = [...pluginItems, ...connectionItems, ...workflowItems]
         items.sort((left, right) => {
           const byName = left.name.localeCompare(right.name)
           return byName !== 0 ? byName : left.id.localeCompare(right.id)
@@ -1133,6 +1149,81 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
         const params = validParam<any>(c)
         await deleteResourceAccessGrant({ context: actorContext(c), grantId: params.grantId, resourceId: params.pluginId, resourceKind: "plugin" })
         return c.body(null, 204)
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "get", "/v1/marketplaces/by-key/:externalKey",
+    paramValidator(externalKeyParamsSchema),
+    describeRoute({ tags: ["Marketplaces"], summary: "Read marketplace by stable key",
+      description: "Reads the marketplace identified by the stable externalKey assigned through declarative provisioning.",
+      responses: { 200: jsonResponse("Marketplace configuration.", marketplaceDetailResponseSchema), 404: jsonResponse("Resource not found.", notFoundSchema) } }),
+    async (c: OrgContext) => {
+      try {
+        const context = actorContext(c)
+        const { externalKey } = validParam<z.infer<typeof externalKeyParamsSchema>>(c)
+        const row = await findMarketplaceByExternalKey(context, externalKey)
+        if (!row) return c.json({ error: "marketplace_not_found" }, 404)
+        return c.json({ item: await getMarketplaceDetail(context, row.id) })
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "put", "/v1/marketplaces/by-key/:externalKey",
+    paramValidator(externalKeyParamsSchema),
+    jsonValidator(marketplaceCreateSchema),
+    describeRoute({
+      tags: ["Marketplaces"],
+      summary: "Apply marketplace by stable key",
+      description: "Creates or replaces marketplace metadata. Omitted description and logo are cleared. Memberships and access grants are managed separately. Archived marketplaces must be explicitly restored before applying.",
+      responses: declarativeResponses(marketplaceMutationResponseSchema),
+    }),
+    async (c: OrgContext) => {
+      try {
+        const permission = ensureOrganizationAdmin(c, "Only organization admins can manage declarative resources.")
+        if (!permission.ok) return c.json(permission.response, orgAccessFailureStatus(permission.response))
+        if (c.req.header("If-Match") || c.req.header("If-None-Match")) return c.json({ error: "unsupported_precondition" }, 400)
+        const context = actorContext(c)
+        const { externalKey } = validParam<z.infer<typeof externalKeyParamsSchema>>(c)
+        const body = validJson<z.infer<typeof marketplaceCreateSchema>>(c)
+        const input = { context, name: body.name, description: body.description ?? null, logoUrl: body.logoUrl ?? null }
+        const replace = async (row: NonNullable<Awaited<ReturnType<typeof findMarketplaceByExternalKey>>>) => {
+          if (row.status !== "active") return c.json({ error: "marketplace_inactive", message: "Restore this marketplace before applying its configuration." }, 409)
+          return c.json({ ok: true, item: await updateMarketplace({ ...input, marketplaceId: row.id }) })
+        }
+        const existing = await findMarketplaceByExternalKey(context, externalKey)
+        if (existing) return replace(existing)
+        await requirePluginArchCapability(context, "marketplace.create")
+        try {
+          return c.json({ ok: true, item: await createMarketplace({ ...input, externalKey }) }, 201)
+        } catch (error) {
+          if (!isDuplicateEntry(error)) throw error
+          const winner = await findMarketplaceByExternalKey(context, externalKey)
+          if (!winner) throw error
+          return replace(winner)
+        }
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "delete", "/v1/marketplaces/by-key/:externalKey",
+    paramValidator(externalKeyParamsSchema),
+    describeRoute({ tags: ["Marketplaces"], summary: "Delete marketplace by stable key",
+      description: "Deletes the marketplace identified by its stable externalKey. Idempotent: deleting a key that does not exist is reported as already removed.",
+      responses: { 200: jsonResponse("Idempotent deletion result.", declarativeDeleteSchema) } }),
+    async (c: OrgContext) => {
+      try {
+        const permission = ensureOrganizationAdmin(c, "Only organization admins can manage declarative resources.")
+        if (!permission.ok) return c.json(permission.response, orgAccessFailureStatus(permission.response))
+        const context = actorContext(c)
+        const { externalKey } = validParam<z.infer<typeof externalKeyParamsSchema>>(c)
+        const existing = await findMarketplaceByExternalKey(context, externalKey)
+        if (!existing) return c.json({ ok: true, deleted: false })
+        await setMarketplaceLifecycle({ context, marketplaceId: existing.id, action: "delete" })
+        return c.json({ ok: true, deleted: true })
       } catch (error) {
         return routeErrorResponse(c, error)
       }

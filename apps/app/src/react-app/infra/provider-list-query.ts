@@ -1,8 +1,9 @@
-import { useQuery, type QueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import type { Client, ModelRef, ProviderListItem } from "../../app/types";
 import { unwrap } from "../../app/lib/opencode";
-import { dispatchNewProviders } from "../../app/lib/provider-events";
+import { dispatchNewProviders, subscribeProviderCatalogChanges } from "../../app/lib/provider-events";
 import type { ProviderListResponse } from "@opencode-ai/sdk/v2/client";
 
 export const PROVIDER_LIST_CACHE_MS = 5 * 60 * 1000;
@@ -21,6 +22,10 @@ export type ConnectedProviderSnapshotChange = {
   next: ConnectedProviderSnapshot;
 };
 
+// Bounded module-scope cache: snapshots are keyed by (baseUrl, directory) and
+// would otherwise accumulate for every workspace ever opened in this app run.
+// Recording refreshes a key's recency; the oldest keys are evicted past the cap.
+const CONNECTED_PROVIDER_SNAPSHOT_LIMIT = 16;
 const connectedProviderSnapshots = new Map<string, ConnectedProviderSnapshot>();
 const connectedProviderSnapshotChanges = new Map<string, ConnectedProviderSnapshotChange>();
 
@@ -111,8 +116,17 @@ function recordConnectedProviderSnapshot(
   const previous = connectedProviderSnapshots.get(key) ?? null;
   const next = getConnectedProviderSnapshot(value);
   const changed = previous !== null && JSON.stringify(previous) !== JSON.stringify(next);
+  // Delete before set so a refreshed key moves to the newest insertion slot.
+  connectedProviderSnapshots.delete(key);
+  connectedProviderSnapshotChanges.delete(key);
   connectedProviderSnapshots.set(key, next);
   connectedProviderSnapshotChanges.set(key, { changed, previous, next });
+  while (connectedProviderSnapshots.size > CONNECTED_PROVIDER_SNAPSHOT_LIMIT) {
+    const oldest = connectedProviderSnapshots.keys().next().value;
+    if (oldest === undefined) break;
+    connectedProviderSnapshots.delete(oldest);
+    connectedProviderSnapshotChanges.delete(oldest);
+  }
   if (changed) {
     dispatchConnectedProviderChanges(previous, next);
   }
@@ -183,7 +197,8 @@ export function ensureProviderListQuery(
     queryFn: () => fetchProviderList(input),
     gcTime: PROVIDER_LIST_CACHE_MS,
   };
-  if (input.force) {
+  const state = queryClient.getQueryState(options.queryKey);
+  if (input.force || state?.status === "error" || state?.isInvalidated || state?.fetchStatus === "fetching") {
     return queryClient.fetchQuery({
       ...options,
       staleTime: 0,
@@ -201,6 +216,11 @@ export function useProviderListQuery(input: {
   directory?: string | null;
   enabled?: boolean;
 }) {
+  const queryClient = useQueryClient();
+  useEffect(() => subscribeProviderCatalogChanges((scope) => {
+    if (scope.baseUrl !== input.baseUrl || (scope.directory ?? "") !== (input.directory ?? "")) return;
+    void queryClient.invalidateQueries({ queryKey: providerListQueryKey(scope) });
+  }), [input.baseUrl, input.directory, queryClient]);
   return useQuery({
     queryKey: providerListQueryKey(input),
     enabled: Boolean(input.client) && (input.enabled ?? true),

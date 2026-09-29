@@ -2,14 +2,14 @@
 import type * as React from "react";
 import {
   ArrowLeft,
-  BrainCircuit,
   Bug,
   Cable,
   ChevronDown,
   CloudCog,
   Cog,
   FolderLock,
-  Info,
+  Gauge,
+  Keyboard,
   Paintbrush,
   Puzzle,
   RefreshCcw,
@@ -42,11 +42,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { t } from "../../../../i18n";
+import { isSettingsTabAllowed } from "../../../../app/cloud/desktop-app-restrictions";
 import type { PlatformCapabilities } from "../../../../app/lib/platform-capabilities";
 import type { SettingsTab } from "../../../../app/types";
 import { cn } from "@/lib/utils";
 import { usePlatform } from "../../../kernel/platform";
-import { useOrgRestrictions } from "../../cloud/desktop-config-provider";
+import { useCheckDesktopRestriction } from "../../cloud/desktop-config-provider";
 import {
   SettingsContent,
   SettingsPanel,
@@ -59,7 +60,6 @@ import {
   SettingsPanelToolbarMessage,
   SettingsPanelToolbarStatus,
 } from "./panel";
-import { useFeatureFlagsPreferences } from "../state/feature-flags-preferences";
 import { SidebarDestination } from "../../session/sidebar/sidebar-destination";
 
 export function getSettingsTabIcon(tab: SettingsTab) {
@@ -72,6 +72,8 @@ export function getSettingsTabIcon(tab: SettingsTab) {
       return FolderLock;
     case "cloud-account":
       return UserCircle;
+    case "usage":
+      return Gauge;
     case "connect":
       return Cable;
     case "cloud-marketplaces":
@@ -80,8 +82,6 @@ export function getSettingsTabIcon(tab: SettingsTab) {
       return CloudCog;
     case "skills":
       return Sparkles;
-    case "memory":
-      return BrainCircuit;
     case "extensions":
       return Puzzle;
     case "environment":
@@ -90,6 +90,8 @@ export function getSettingsTabIcon(tab: SettingsTab) {
       return Wrench;
     case "appearance":
       return Paintbrush;
+    case "shortcuts":
+      return Keyboard;
     case "updates":
       return RefreshCcw;
     case "recovery":
@@ -105,12 +107,16 @@ export function getSettingsTabLabel(tab: SettingsTab) {
   switch (tab) {
     case "ai":
       return "AI Providers";
+    case "ollama":
+      return "Ollama";
     case "preferences":
       return "Preferences";
     case "permissions":
       return "Permissions";
     case "cloud-account":
       return t("settings.tab_cloud_account");
+    case "usage":
+      return "Usage";
     case "connect":
       return t("settings.tab_connect");
     case "cloud-marketplaces":
@@ -119,8 +125,6 @@ export function getSettingsTabLabel(tab: SettingsTab) {
       return t("settings.tab_cloud_providers");
     case "skills":
       return t("settings.tab_skills");
-    case "memory":
-      return t("memory.tab_label");
     case "extensions":
       return t("settings.tab_extensions");
     case "environment":
@@ -129,6 +133,8 @@ export function getSettingsTabLabel(tab: SettingsTab) {
       return t("settings.tab_advanced");
     case "appearance":
       return t("settings.tab_appearance");
+    case "shortcuts":
+      return "Keyboard shortcuts";
     case "updates":
       return t("settings.tab_updates");
     case "recovery":
@@ -146,12 +152,16 @@ export function getSettingsTabDescription(tab: SettingsTab) {
   switch (tab) {
     case "ai":
       return "Connect services that provide AI models";
+    case "ollama":
+      return "Connect to Ollama and manage local models";
     case "preferences":
       return "Default model, reasoning, and compaction";
     case "permissions":
       return "Authorized folders and file access";
     case "cloud-account":
       return t("settings.tab_description_cloud_account");
+    case "usage":
+      return "How much of your limits is left";
     case "connect":
       return t("settings.tab_description_connect");
     case "cloud-marketplaces":
@@ -160,8 +170,6 @@ export function getSettingsTabDescription(tab: SettingsTab) {
       return t("settings.tab_description_cloud_providers");
     case "skills":
       return t("settings.tab_description_skills");
-    case "memory":
-      return t("memory.tab_description");
     case "extensions":
       return t("settings.tab_description_extensions");
     case "environment":
@@ -170,6 +178,8 @@ export function getSettingsTabDescription(tab: SettingsTab) {
       return t("settings.tab_description_advanced");
     case "appearance":
       return t("settings.tab_description_appearance");
+    case "shortcuts":
+      return "Keys that switch to the models you use most";
     case "updates":
       return t("settings.tab_description_updates");
     case "recovery":
@@ -189,17 +199,17 @@ export function getWorkspaceSettingsTabs(): SettingsTab[] {
 
 export function getGlobalSettingsTabs(
   developerMode: boolean,
-  capabilities: Pick<PlatformCapabilities, "autoUpdate" | "localRuntimeControl">,
+  capabilities: Pick<PlatformCapabilities, "autoUpdate">,
 ): SettingsTab[] {
-  const tabs: SettingsTab[] = ["ai", "appearance", "environment"];
+  const tabs: SettingsTab[] = ["ai", "ollama", "appearance", "shortcuts", "environment"];
   if (capabilities.autoUpdate) tabs.push("updates");
-  if (capabilities.localRuntimeControl) tabs.push("recovery");
   if (developerMode) tabs.push("debug");
   return tabs;
 }
 
 export const CLOUD_SETTINGS_TABS: SettingsTab[] = [
   "cloud-account",
+  "usage",
 ];
 
 export function isSettingsTabBeta(_tab: SettingsTab) {
@@ -232,13 +242,30 @@ function SettingsSidebarTabLabel({ tab }: { tab: SettingsTab }) {
   );
 }
 
+export type SettingsNavGroups = {
+  hub: SettingsTab[];
+  workspace: SettingsTab[];
+  global: SettingsTab[];
+  cloud: SettingsTab[];
+};
+
 /**
- * Cloud settings tabs, gated by client-only preview flags. The Memory tab is
- * surfaced only when `featureFlags.memory` is on (C-4). Both settings nav
- * surfaces (sidebar + compact section menu) must use this so they can't drift.
+ * Every settings navigation surface (sidebar + compact section menu) reads its
+ * tabs from here so platform capabilities, preview flags, and the
+ * `allowControlSettings` desktop policy cannot drift between them. When the
+ * organization blocks settings control, only the Cloud group remains.
  */
-export function getCloudSettingsTabs(memoryEnabled: boolean): SettingsTab[] {
-  return memoryEnabled ? ["cloud-account", "memory"] : CLOUD_SETTINGS_TABS;
+export function useSettingsNavGroups(developerMode: boolean): SettingsNavGroups {
+  const platform = usePlatform();
+  const checkRestriction = useCheckDesktopRestriction();
+  const allowed = (tabs: SettingsTab[]) =>
+    tabs.filter((tab) => isSettingsTabAllowed({ tab, checkRestriction }));
+  return {
+    hub: allowed(["general"]),
+    workspace: allowed(getWorkspaceSettingsTabs()),
+    global: allowed(getGlobalSettingsTabs(developerMode, platform.capabilities)),
+    cloud: allowed(CLOUD_SETTINGS_TABS),
+  };
 }
 
 type SettingsPageProps = {
@@ -266,12 +293,39 @@ type SettingsSidebarProps = Pick<SettingsPageProps, "activeTab" | "onSelectTab" 
   onSelectWorkspace: (workspaceId: string) => void;
 };
 
+function SettingsSidebarGroup(props: {
+  label: string;
+  tabs: SettingsTab[];
+  activeTab: SettingsTab;
+  onSelectTab: (tab: SettingsTab) => void;
+}) {
+  if (props.tabs.length === 0) return null;
+  return (
+    <SidebarGroup>
+      <SidebarGroupLabel>{props.label}</SidebarGroupLabel>
+      <SidebarGroupContent>
+        <SidebarMenu>
+          {props.tabs.map((tab) => {
+            const Icon = getSettingsTabIcon(tab);
+            return (
+              <SidebarDestination
+                key={tab}
+                active={isSettingsTabActive(props.activeTab, tab)}
+                icon={Icon}
+                label={getSettingsTabLabel(tab)}
+                labelContent={<SettingsSidebarTabLabel tab={tab} />}
+                onSelect={() => props.onSelectTab(tab)}
+              />
+            );
+          })}
+        </SidebarMenu>
+      </SidebarGroupContent>
+    </SidebarGroup>
+  );
+}
+
 export function SettingsSidebar(props: SettingsSidebarProps) {
-  const platform = usePlatform();
-  const { memoryEnabled } = useFeatureFlagsPreferences();
-  const workspaceTabs = getWorkspaceSettingsTabs();
-  const globalTabs = getGlobalSettingsTabs(props.developerMode, platform.capabilities);
-  const cloudTabs = getCloudSettingsTabs(memoryEnabled);
+  const groups = useSettingsNavGroups(props.developerMode);
 
   return (
     <Sidebar collapsible="icon" className="mac:**:data-[sidebar=sidebar]:bg-transparent">
@@ -311,120 +365,48 @@ export function SettingsSidebar(props: SettingsSidebarProps) {
       </SidebarHeader>
       <SidebarContent>
         {/* Top-level hub entry */}
-        <SidebarGroup>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              <SidebarMenuItem>
-                <SidebarMenuButton
-                  type="button"
-                  isActive={isSettingsTabActive(props.activeTab, "general")}
-                  aria-current={isSettingsTabActive(props.activeTab, "general") ? "page" : undefined}
-                  tooltip={getSettingsTabLabel("general")}
-                  onClick={() => props.onSelectTab("general")}
-                >
-                  <Cog />
-                  <span>{getSettingsTabLabel("general")}</span>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {groups.hub.length > 0 ? (
+          <SidebarGroup>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    type="button"
+                    isActive={isSettingsTabActive(props.activeTab, "general")}
+                    aria-current={isSettingsTabActive(props.activeTab, "general") ? "page" : undefined}
+                    tooltip={getSettingsTabLabel("general")}
+                    onClick={() => props.onSelectTab("general")}
+                  >
+                    <Cog />
+                    <span>{getSettingsTabLabel("general")}</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ) : null}
 
-        <SidebarGroup>
-          <SidebarGroupLabel>{t("settings.group_workspace")}</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {workspaceTabs.map((tab) => {
-                const Icon = getSettingsTabIcon(tab);
-                return (
-                  <SidebarDestination
-                    key={tab}
-                    active={isSettingsTabActive(props.activeTab, tab)}
-                    icon={Icon}
-                    label={getSettingsTabLabel(tab)}
-                    labelContent={<SettingsSidebarTabLabel tab={tab} />}
-                    onSelect={() => props.onSelectTab(tab)}
-                  />
-                );
-              })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        <SidebarGroup>
-          <SidebarGroupLabel>{t("settings.group_global")}</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {globalTabs.map((tab) => {
-                const Icon = getSettingsTabIcon(tab);
-                return (
-                  <SidebarDestination
-                    key={tab}
-                    active={isSettingsTabActive(props.activeTab, tab)}
-                    icon={Icon}
-                    label={getSettingsTabLabel(tab)}
-                    labelContent={<SettingsSidebarTabLabel tab={tab} />}
-                    onSelect={() => props.onSelectTab(tab)}
-                  />
-                );
-              })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        <SidebarGroup>
-          <SidebarGroupLabel>{t("settings.group_cloud")}</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {cloudTabs.map((tab) => {
-                const Icon = getSettingsTabIcon(tab);
-                return (
-                  <SidebarDestination
-                    key={tab}
-                    active={isSettingsTabActive(props.activeTab, tab)}
-                    icon={Icon}
-                    label={getSettingsTabLabel(tab)}
-                    labelContent={<SettingsSidebarTabLabel tab={tab} />}
-                    onSelect={() => props.onSelectTab(tab)}
-                  />
-                );
-              })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        <SettingsSidebarGroup
+          label={t("settings.group_workspace")}
+          tabs={groups.workspace}
+          activeTab={props.activeTab}
+          onSelectTab={props.onSelectTab}
+        />
+        <SettingsSidebarGroup
+          label={t("settings.group_global")}
+          tabs={groups.global}
+          activeTab={props.activeTab}
+          onSelectTab={props.onSelectTab}
+        />
+        <SettingsSidebarGroup
+          label={t("settings.group_cloud")}
+          tabs={groups.cloud}
+          activeTab={props.activeTab}
+          onSelectTab={props.onSelectTab}
+        />
       </SidebarContent>
       <SidebarRail />
     </Sidebar>
-  );
-}
-
-function DesktopPolicyBanner() {
-  const config = useOrgRestrictions();
-
-  // Show the banner when the org has any active desktop policy restriction
-  // (a boolean set to false) or any white-label branding override.
-  const hasRestriction = Object.entries(config).some(
-    ([key, value]) => typeof value === "boolean" && value === false && key !== "allowedDesktopVersions",
-  );
-  const hasBranding = Boolean(config.brandAppName ?? config.brandLogoUrl ?? config.brandAccentColor);
-
-  if (!hasRestriction && !hasBranding) return null;
-
-  return (
-    <div
-      data-testid="desktop-policy-banner"
-      className="flex items-start gap-2.5 rounded-xl border border-indigo-6/30 bg-indigo-2/50 px-3.5 py-2.5 text-sm dark:border-indigo-7/25 dark:bg-indigo-3/30"
-    >
-      <Info className="mt-0.5 size-4 shrink-0 text-indigo-11" />
-      <div className="min-w-0 flex-1">
-        <p className="font-medium text-indigo-12">
-          {t("settings.desktop_policy_active_title")}
-        </p>
-        <p className="mt-0.5 text-xs text-indigo-11">
-          {t("settings.desktop_policy_active_body")}
-        </p>
-      </div>
-    </div>
   );
 }
 
@@ -440,9 +422,8 @@ export function SettingsPageHeading({ activeTab }: Pick<SettingsPageProps, "acti
 export function SettingsPage(props: SettingsPageProps) {
   return (
     <SettingsContent>
-      <SettingsPanel>
+      {props.activeTab !== "extensions" ? <SettingsPanel>
         <SettingsPageHeading activeTab={props.activeTab} />
-        <DesktopPolicyBanner />
 
         {props.showUpdateToolbar && props.activeTab === "general" ? (
           <SettingsPanelToolbar>
@@ -469,7 +450,7 @@ export function SettingsPage(props: SettingsPageProps) {
             ) : null}
           </SettingsPanelToolbar>
         ) : null}
-      </SettingsPanel>
+      </SettingsPanel> : null}
 
       {props.children}
     </SettingsContent>

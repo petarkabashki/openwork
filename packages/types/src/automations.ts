@@ -12,15 +12,15 @@ const timezoneSchema = z.string().trim().min(1).max(120).refine((timezone) => {
   }
 }, "Expected a valid IANA timezone")
 
-export const automationStateSchema = z.enum(["active", "inactive", "needs_attention", "archived"])
+export const automationStateSchema = z.enum(["active", "inactive", "needs_attention", "archived"]).meta({ ref: "AutomationState" })
 export type AutomationState = z.infer<typeof automationStateSchema>
 
 export const automationRunStatusSchema = z.enum([
   "queued", "claimed", "running", "succeeded", "failed", "cancelled", "skipped",
-])
+]).meta({ ref: "AutomationRunStatus" })
 export type AutomationRunStatus = z.infer<typeof automationRunStatusSchema>
 
-export const automationRunTriggerSchema = z.enum(["scheduled", "recovery", "manual"])
+export const automationRunTriggerSchema = z.enum(["scheduled", "recovery", "manual"]).meta({ ref: "AutomationRunTrigger" })
 export type AutomationRunTrigger = z.infer<typeof automationRunTriggerSchema>
 
 export const automationScheduleSchema = z.discriminatedUnion("kind", [
@@ -92,11 +92,12 @@ export const automationNeedsAttentionReasonSchema = z.object({
     "model_access_lost",
     "provider_unavailable",
     "connect_access_unavailable",
+    "openwork_web_access_required",
     "execution_runtime_unavailable",
   ]),
   message: z.string().trim().min(1).max(2_000),
   occurredAt: timestampSchema,
-})
+}).meta({ ref: "AutomationNeedsAttentionReason" })
 export type AutomationNeedsAttentionReason = z.infer<typeof automationNeedsAttentionReasonSchema>
 
 export const automationSchema = z.object({
@@ -114,8 +115,18 @@ export const automationSchema = z.object({
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
   archivedAt: nullableTimestampSchema,
-})
+}).meta({ ref: "Automation" })
 export type Automation = z.infer<typeof automationSchema>
+
+/**
+ * The workspace an Automation is pinned to at creation/update time.
+ *
+ * Before this field existed, both executors resolved the runner's *currently
+ * active* workspace at run time, so activating a different workspace silently
+ * retargeted every automation. A pinned id makes targeting explicit; null
+ * keeps the legacy active-workspace fallback for existing records.
+ */
+export const automationWorkspaceIdSchema = z.string().trim().min(1).max(240)
 
 export const automationRevisionSchema = z.object({
   id: idSchema,
@@ -126,10 +137,11 @@ export const automationRevisionSchema = z.object({
   model: automationModelSchema,
   action: automationActionSchema.optional(),
   executionTarget: z.enum(["desktop", "cloud"]).optional(),
+  workspaceId: automationWorkspaceIdSchema.nullable().optional(),
   maximumRuntimeMs: z.number().int().min(10_000).max(60 * 60 * 1_000),
   digest: z.string().trim().min(16).max(128),
   createdAt: timestampSchema,
-})
+}).meta({ ref: "AutomationRevision" })
 export type AutomationRevision = z.infer<typeof automationRevisionSchema>
 
 export const automationErrorSchema = z.object({
@@ -138,6 +150,7 @@ export const automationErrorSchema = z.object({
     "model_access_lost",
     "provider_unavailable",
     "connect_access_unavailable",
+    "openwork_web_access_required",
     "execution_runtime_unavailable",
     "execution_failed",
     "execution_timed_out",
@@ -148,14 +161,14 @@ export const automationErrorSchema = z.object({
   ]),
   message: z.string().trim().min(1).max(2_000),
   retryable: z.boolean(),
-})
+}).meta({ ref: "AutomationError" })
 export type AutomationError = z.infer<typeof automationErrorSchema>
 
 export const automationUsageSchema = z.object({
   inputTokens: z.number().int().nonnegative().nullable(),
   outputTokens: z.number().int().nonnegative().nullable(),
   costMicros: z.number().int().nonnegative().nullable(),
-})
+}).meta({ ref: "AutomationUsage" })
 export type AutomationUsage = z.infer<typeof automationUsageSchema>
 
 export const automationExecutionThreadSchema = z.object({
@@ -168,7 +181,7 @@ export const automationExecutionThreadSchema = z.object({
   /** Native OpenCode session identity for agent runs. */
   nativeThreadId: idSchema.nullable().optional(),
   workspaceId: idSchema.nullable().optional(),
-})
+}).meta({ ref: "AutomationExecutionThread" })
 export type AutomationExecutionThread = z.infer<typeof automationExecutionThreadSchema>
 
 /** Creation surface fixes execution placement: Desktop stays local; Web runs in Cloud. */
@@ -176,20 +189,39 @@ export const automationExecutionTargetSchema = z.enum(["desktop", "cloud"])
 export type AutomationExecutionTarget = z.infer<typeof automationExecutionTargetSchema>
 
 export const AUTOMATION_MODEL_ATTENTION_CAPABILITY = "model_attention_v1" as const
+export const REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY = "remote_session_v1"
 export const AUTOMATION_MODEL_ATTENTION_CAPABILITY_HEADER = "x-openwork-automation-model-attention" as const
-export const automationDesktopRunnerCapabilitySchema = z.literal(AUTOMATION_MODEL_ATTENTION_CAPABILITY)
+export const automationDesktopRunnerCapabilitySchema = z.enum([
+  AUTOMATION_MODEL_ATTENTION_CAPABILITY,
+  REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
+])
 export type AutomationDesktopRunnerCapability = z.infer<typeof automationDesktopRunnerCapabilitySchema>
 
 export const automationDesktopRunnerRegistrationSchema = z.object({
   runnerId: idSchema.min(8),
   protocolVersion: z.literal(1),
   supportedExecutionTargets: z.array(z.literal("desktop")).length(1),
-  capabilities: z.array(automationDesktopRunnerCapabilitySchema).max(1).default([]),
+  capabilities: z.array(automationDesktopRunnerCapabilitySchema).max(2).default([]),
   appVersion: z.string().trim().min(1).max(80),
   platform: z.enum(["darwin", "win32", "linux"]),
   concurrency: z.number().int().min(1).max(4),
 })
 export type AutomationDesktopRunnerRegistration = z.infer<typeof automationDesktopRunnerRegistrationSchema>
+
+/**
+ * How long a desktop counts as connected after it was last seen. Registration
+ * refreshes presence every few minutes and idle event streams deliberately do
+ * not write to the database, so this is generous enough to survive an idle
+ * desktop and short enough to catch one that was closed.
+ */
+export const AUTOMATION_DESKTOP_RUNNER_PRESENCE_WINDOW_MS = 10 * 60_000
+
+/** Whether a Desktop Automation has anywhere to run right now. */
+export const automationDesktopRunnerPresenceSchema = z.object({
+  connected: z.boolean(),
+  lastSeenAt: timestampSchema.nullable(),
+}).meta({ ref: "AutomationDesktopRunnerPresence" })
+export type AutomationDesktopRunnerPresence = z.infer<typeof automationDesktopRunnerPresenceSchema>
 
 export const automationRunnerNotificationSchema = z.object({
   type: z.enum(["automation_work_available", "automation_cancellation_available"]),
@@ -197,14 +229,63 @@ export const automationRunnerNotificationSchema = z.object({
 }).strict()
 export type AutomationRunnerNotification = z.infer<typeof automationRunnerNotificationSchema>
 
-export const automationRunnerWorkItemSchema = z.object({
-  runId: idSchema,
-  executionTarget: z.literal("desktop"),
-})
+export const automationRunnerWorkItemSchema = z.union([
+  // The automation-run item shape predates remote-session commands and is
+  // consumed by released desktop runners: it must keep every field it has
+  // always carried.
+  z.object({ runId: idSchema, executionTarget: z.literal("desktop") }),
+  z.object({ kind: z.literal("remote_session_create"), commandId: idSchema }),
+])
 export const automationRunnerWorkResponseSchema = z.object({
-  items: z.array(automationRunnerWorkItemSchema).max(4),
+  items: z.array(automationRunnerWorkItemSchema).max(9),
 })
 export type AutomationRunnerWorkResponse = z.infer<typeof automationRunnerWorkResponseSchema>
+
+export const remoteSessionCommandAssignmentSchema = z.object({
+  commandId: idSchema,
+  kind: z.literal("remote_session_create"),
+  title: z.string().trim().min(1).max(120),
+  prompt: z.string().min(1).max(100_000).nullable(),
+  model: z.object({
+    providerId: idSchema,
+    modelId: idSchema,
+    variant: z.string().trim().min(1).max(60).nullable(),
+  }).nullable(),
+  expiresAt: timestampSchema,
+})
+export const remoteSessionCommandClaimResponseSchema = z.object({
+  assignment: remoteSessionCommandAssignmentSchema,
+})
+const remoteSessionCommandResultSummarySchema = z.string().max(4096).optional()
+const remoteSessionCommandErrorSchema = z.object({
+  code: z.string().trim().min(1).max(60),
+  message: z.string().trim().min(1).max(2000),
+})
+export const remoteSessionCommandCompleteRequestSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("delivered"),
+    sessionId: z.string().trim().min(1).max(240),
+    workspaceId: z.string().trim().min(1).max(240),
+    resultSummary: remoteSessionCommandResultSummarySchema,
+    error: z.never().optional(),
+  }),
+  z.object({
+    status: z.literal("failed"),
+    sessionId: z.never().optional(),
+    workspaceId: z.never().optional(),
+    resultSummary: remoteSessionCommandResultSummarySchema,
+    error: remoteSessionCommandErrorSchema,
+  }),
+])
+export type RemoteSessionCommandCompleteRequest = z.infer<typeof remoteSessionCommandCompleteRequestSchema>
+export const remoteSessionCommandCompleteResponseSchema = z.object({
+  command: z.object({
+    id: idSchema,
+    status: z.enum(["delivered", "failed"]),
+    sessionId: z.string().max(240).nullable(),
+    workspaceId: z.string().max(240).nullable(),
+  }),
+})
 
 export const automationDesktopRunnerAssignmentSchema = z.object({
   executionTarget: z.literal("desktop"),
@@ -216,6 +297,8 @@ export const automationDesktopRunnerAssignmentSchema = z.object({
   timeoutMs: z.number().int().min(10_000).max(60 * 60 * 1_000),
   leaseExpiresAt: timestampSchema,
   attempt: z.number().int().positive(),
+  /** Pinned target workspace; absent for records created before pinning existed. */
+  workspaceId: automationWorkspaceIdSchema.nullable().optional(),
 })
 export type AutomationDesktopRunnerAssignment = z.infer<typeof automationDesktopRunnerAssignmentSchema>
 
@@ -257,7 +340,7 @@ export const automationRunnerTokenResponseSchema = z.object({
   token: z.string().trim().min(32).max(512),
   expiresAt: timestampSchema,
   eventsPath: z.literal("/v1/automation-runners/events"),
-})
+}).meta({ ref: "AutomationRunnerTokenResponse" })
 export type AutomationRunnerTokenResponse = z.infer<typeof automationRunnerTokenResponseSchema>
 
 export const automationRunSchema = z.object({
@@ -286,12 +369,12 @@ export const automationRunSchema = z.object({
   usage: automationUsageSchema,
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
-})
+}).meta({ ref: "AutomationRun" })
 export type AutomationRun = z.infer<typeof automationRunSchema>
 
 export const automationRunEventTypeSchema = z.enum([
   "user", "assistant", "capability_search", "capability_execution", "usage", "warning", "terminal",
-])
+]).meta({ ref: "AutomationRunEventType" })
 export type AutomationRunEventType = z.infer<typeof automationRunEventTypeSchema>
 
 export const automationRunEventSchema = z.object({
@@ -302,7 +385,7 @@ export const automationRunEventSchema = z.object({
   type: automationRunEventTypeSchema,
   payload: z.record(z.string(), z.unknown()),
   createdAt: timestampSchema,
-})
+}).meta({ ref: "AutomationRunEvent" })
 export type AutomationRunEvent = z.infer<typeof automationRunEventSchema>
 
 const legacyCreateAutomationSchema = z.object({
@@ -310,6 +393,7 @@ const legacyCreateAutomationSchema = z.object({
   instructions: z.string().trim().min(1).max(100_000),
   schedule: automationScheduleSchema,
   model: automationModelSchema,
+  workspaceId: automationWorkspaceIdSchema.nullable().optional(),
 })
 
 const actionCreateAutomationSchema = z.object({
@@ -358,6 +442,8 @@ export const automationProposalSchema = z.object({
   instructions: z.string().trim().min(1).max(100_000),
   schedule: automationScheduleSchema,
   model: automationModelSchema.optional(),
+  /** Workspace the proposing conversation ran in; the renderer pins it on create. */
+  workspaceId: automationWorkspaceIdSchema.optional(),
 })
 export type AutomationProposal = z.infer<typeof automationProposalSchema>
 
@@ -369,6 +455,8 @@ export const updateAutomationSchema = z.object({
   action: automationActionSchema.optional(),
   /** Accepted for round-tripping; execution placement itself is immutable. */
   executionTarget: automationExecutionTargetSchema.optional(),
+  /** Re-pin to a different workspace; null clears the pin (legacy active-workspace fallback). */
+  workspaceId: automationWorkspaceIdSchema.nullable().optional(),
 }).strict().refine(
   (input) => Object.keys(input).length > 0,
   "At least one behavior-changing field is required",
@@ -382,14 +470,14 @@ export const automationListSchema = z.object({
     latestRun: automationRunSchema.nullable(),
   })),
   nextCursor: z.string().nullable(),
-})
+}).meta({ ref: "AutomationList" })
 export type AutomationList = z.infer<typeof automationListSchema>
 
 export const automationDetailSchema = z.object({
   automation: automationSchema,
   revision: automationRevisionSchema,
   latestRun: automationRunSchema.nullable(),
-})
+}).meta({ ref: "AutomationDetail" })
 export type AutomationDetail = z.infer<typeof automationDetailSchema>
 
 export const automationRunReceiptSchema = z.object({
@@ -397,7 +485,7 @@ export const automationRunReceiptSchema = z.object({
   automation: automationSchema,
   revision: automationRevisionSchema,
   events: z.array(automationRunEventSchema),
-})
+}).meta({ ref: "AutomationRunReceipt" })
 export type AutomationRunReceipt = z.infer<typeof automationRunReceiptSchema>
 
 export const AUTOMATION_MAXIMUM_ATTEMPTS = 2

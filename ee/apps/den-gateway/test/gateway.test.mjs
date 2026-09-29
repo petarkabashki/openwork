@@ -4,6 +4,13 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createGatewayApp } from "../src/app.ts"
 import { resolveGatewayBuildVersion } from "../src/env.ts"
+import {
+  buildMcpAppSandboxCsp,
+  MCP_APP_SANDBOX_PROXY_CSS,
+  MCP_APP_SANDBOX_PROXY_HTML,
+  MCP_APP_SANDBOX_PROXY_SCRIPT,
+  parseMcpAppSandboxCsp,
+} from "../../../../apps/server/src/mcp-app-sandbox.ts"
 
 const silentLogger = {
   log() {},
@@ -75,6 +82,7 @@ function readyResolvePayload(url, input = {}) {
     url,
     clientToken: input.clientToken ?? "client-token",
     hostToken: input.hostToken ?? "host-token",
+    expiresAt: input.expiresAt ?? new Date(Date.now() + 60_000).toISOString(),
   }
 }
 
@@ -245,7 +253,147 @@ describe("den-gateway static UI", () => {
   })
 })
 
+describe("den-gateway MCP App sandbox", () => {
+  test("serves fixed public assets without resolving an instance, SPA injection, or token leakage", async () => {
+    const root = await makeWebRoot()
+    const upstream = startUpstream()
+    const denApi = startDenApi(() => readyResolvePayload(serverBase(upstream.server)))
+    const gateway = startGateway({ webRoot: root, denApiBase: serverBase(denApi.server), gatewayKey: "gateway-secret" })
+    const base = serverBase(gateway)
+    const assets = [
+      ["html", "text/html; charset=utf-8", MCP_APP_SANDBOX_PROXY_HTML],
+      ["js", "text/javascript; charset=utf-8", MCP_APP_SANDBOX_PROXY_SCRIPT],
+      ["css", "text/css; charset=utf-8", MCP_APP_SANDBOX_PROXY_CSS],
+    ]
+
+    for (const [extension, mime, expectedBody] of assets) {
+      for (const headers of [{}, { Authorization: "Bearer den-token", Cookie: "ow_session=cookie-secret", "X-OpenWork-Host-Token": "browser-host-token" }]) {
+        const response = await fetch(`${base}/mcp-apps/sandbox.${extension}?token=query-secret`, { headers })
+        const body = await response.text()
+        expect(response.status).toBe(200)
+        expect(response.headers.get("content-type")).toBe(mime)
+        expect(response.headers.get("cache-control")).toBe("no-store")
+        expect(response.headers.get("x-content-type-options")).toBe("nosniff")
+        expect(body).toBe(expectedBody)
+        expect(body).not.toContain("OpenWork App")
+        expect(body).not.toContain("__OPENWORK_GATEWAY__")
+        expect(body).not.toContain("__OPENWORK_BOOTSTRAP__")
+        const exposed = body + JSON.stringify(Object.fromEntries(response.headers))
+        for (const secret of ["den-token", "client-token", "host-token", "gateway-secret", "cookie-secret", "query-secret"]) {
+          expect(exposed).not.toContain(secret)
+        }
+        if (extension === "html") {
+          expect(response.headers.get("content-security-policy")).toBe(buildMcpAppSandboxCsp(parseMcpAppSandboxCsp(null)))
+          expect(response.headers.get("content-security-policy")).toContain("connect-src 'none'")
+          expect(response.headers.get("referrer-policy")).toBe("strict-origin")
+        }
+      }
+      const head = await fetch(`${base}/mcp-apps/sandbox.${extension}`, { method: "HEAD" })
+      expect(head.status).toBe(200)
+      expect(head.headers.get("content-type")).toBe(mime)
+      expect(await head.text()).toBe("")
+    }
+    expect(denApi.observed.calls).toBe(0)
+    expect(upstream.observed.requests).toHaveLength(0)
+  })
+
+  test("uses the shared CSP parser and builder without reflecting unsafe query values", async () => {
+    let fetchCalls = 0
+    const gateway = startGateway({
+      webRoot: "",
+      fetchImpl: async () => {
+        fetchCalls += 1
+        throw new Error("Sandbox assets must not use upstream fetch")
+      },
+    })
+    const declarations = [
+      JSON.stringify({
+        connectDomains: ["https://api.example", "https://bad.example; script-src *", "https://user:query-secret@api.example"],
+        resourceDomains: ["https://cdn.example"],
+        frameDomains: ["https://frame.example"],
+        baseUriDomains: ["https://base.example"],
+      }),
+      "{invalid-json",
+      "null",
+      "x".repeat(8193),
+    ]
+    for (const declaration of declarations) {
+      const response = await fetch(`${serverBase(gateway)}/mcp-apps/sandbox.html?csp=${encodeURIComponent(declaration)}`)
+      const csp = response.headers.get("content-security-policy")
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe(MCP_APP_SANDBOX_PROXY_HTML)
+      expect(csp).toBe(buildMcpAppSandboxCsp(parseMcpAppSandboxCsp(declaration)))
+      expect(csp).toContain("default-src 'none'")
+      expect(csp).toContain("object-src 'none'")
+      expect(csp).toContain("form-action 'none'")
+      expect(csp).not.toContain("bad.example")
+      expect(csp).not.toContain("query-secret")
+      if (declaration === declarations[0]) {
+        expect(csp).toContain("connect-src https://api.example")
+        expect(csp).toContain("script-src 'self' 'unsafe-inline' https://cdn.example")
+        expect(csp).toContain("frame-src 'self' https://frame.example")
+        expect(csp).toContain("base-uri https://base.example")
+      } else {
+        expect(csp).toContain("connect-src 'none'")
+      }
+    }
+    expect(fetchCalls).toBe(0)
+  })
+
+  test("never falls back to the SPA or filesystem for unknown sandbox assets or unsupported methods", async () => {
+    const root = await makeWebRoot()
+    await mkdir(join(root, "mcp-apps"))
+    await writeFile(join(root, "mcp-apps", "untrusted.html"), "untrusted sandbox asset")
+    const upstream = startUpstream()
+    const denApi = startDenApi(() => readyResolvePayload(serverBase(upstream.server)))
+    const gateway = startGateway({ webRoot: root, denApiBase: serverBase(denApi.server), gatewayKey: "gateway-secret" })
+    for (const [method, path] of [
+      ["GET", "/mcp-apps"],
+      ["GET", "/mcp-apps/"],
+      ["GET", "/mcp-apps/missing.js"],
+      ["GET", "/mcp-apps/untrusted.html"],
+      ["GET", "/mcp-apps/sandbox.html/extra"],
+      ["POST", "/mcp-apps/sandbox.html"],
+      ["POST", "/mcp-apps/sandbox.js"],
+      ["POST", "/mcp-apps/sandbox.css"],
+    ]) {
+      const response = await fetch(`${serverBase(gateway)}${path}`, {
+        method,
+        headers: { Authorization: "Bearer den-token", Accept: "text/html", "Sec-Fetch-Mode": "navigate" },
+      })
+      expect(response.status).toBe(404)
+      expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8")
+      await expect(response.json()).resolves.toEqual({ error: "not_found" })
+    }
+    expect(denApi.observed.calls).toBe(0)
+    expect(upstream.observed.requests).toHaveLength(0)
+  })
+})
+
 describe("den-gateway proxy", () => {
+  test("passes through Den's Web access denial without resolving an instance", async () => {
+    let instanceCalls = 0
+    const gateway = startGateway({
+      denApiBase: "https://den.example",
+      gatewayKey: "gateway-secret",
+      fetchImpl: async (url) => {
+        if (new URL(url).pathname === "/v1/cloud/gateway/resolve") {
+          return Response.json({ error: "openwork_web_access_required" }, { status: 403 })
+        }
+        instanceCalls += 1
+        return new Response("unexpected")
+      },
+    })
+
+    const response = await fetch(`${serverBase(gateway)}/status`, {
+      headers: { Authorization: "Bearer den-token" },
+    })
+
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({ error: "gateway_resolve_rejected" })
+    expect(instanceCalls).toBe(0)
+  })
+
   test("retries one connect-phase failure and passes through success", async () => {
     const injected = injectedInstanceFetch((_url, _init, call) => {
       if (call === 1) {
@@ -468,6 +616,41 @@ describe("den-gateway proxy", () => {
     ])
   })
 
+  test("never caches a ready resolution beyond its signed-preview safety time", async () => {
+    const upstream = startUpstream()
+    let now = 1_000
+    let resolveResponses = 0
+    const denApi = startDenApi(() => {
+      resolveResponses += 1
+      return readyResolvePayload(serverBase(upstream.server), {
+        clientToken: `client-token-${resolveResponses}`,
+        hostToken: `host-token-${resolveResponses}`,
+        expiresAt: new Date(resolveResponses === 1 ? 1_500 : 10_000).toISOString(),
+      })
+    })
+    const gateway = startGateway({
+      denApiBase: serverBase(denApi.server),
+      gatewayKey: "gateway-secret",
+      resolveTtlMs: 15_000,
+      now: () => now,
+    })
+    const base = serverBase(gateway)
+    const headers = { Authorization: "Bearer den-expiry-bound" }
+
+    expect((await fetch(`${base}/status`, { headers })).status).toBe(200)
+    now = 1_400
+    expect((await fetch(`${base}/capabilities`, { headers })).status).toBe(200)
+    now = 1_501
+    expect((await fetch(`${base}/whoami`, { headers })).status).toBe(200)
+
+    expect(denApi.observed.calls).toBe(2)
+    expect(upstream.observed.requests.map((request) => request.authorization)).toEqual([
+      "Bearer client-token-1",
+      "Bearer client-token-1",
+      "Bearer client-token-2",
+    ])
+  })
+
   test("proxies namespaced allowlist subpaths", async () => {
     const upstream = startUpstream()
     const denApi = startDenApi(() => readyResolvePayload(serverBase(upstream.server)))
@@ -476,7 +659,7 @@ describe("den-gateway proxy", () => {
     const headers = { Authorization: "Bearer den-api", Accept: "application/json" }
 
     const requests = [
-      ["POST", "/files/sessions/abc/read-batch"],
+      ["POST", "/files/sessions/abc/ops"],
       ["POST", "/workspaces/local"],
       ["POST", "/workspaces/ws_1/activate"],
       ["GET", "/env/keys"],
@@ -489,7 +672,7 @@ describe("den-gateway proxy", () => {
     }
 
     expect(upstream.observed.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
-      "POST /files/sessions/abc/read-batch",
+      "POST /files/sessions/abc/ops",
       "POST /workspaces/local",
       "POST /workspaces/ws_1/activate",
       "GET /env/keys",
@@ -511,11 +694,11 @@ describe("den-gateway proxy", () => {
     expect(await navigation.text()).toContain("OpenWork App")
     expect(upstream.observed.requests).toHaveLength(0)
 
-    const api = await fetch(`${base}/workspace/ws_1/sessions`, {
+    const api = await fetch(`${base}/workspace/ws_1/opencode/session`, {
       headers: { Authorization: "Bearer den-workspace", Accept: "application/json" },
     })
     expect(api.status).toBe(200)
-    expect(upstream.observed.requests[0].path).toBe("/workspace/ws_1/sessions")
+    expect(upstream.observed.requests[0].path).toBe("/workspace/ws_1/opencode/session")
   })
 
   test("proxies workspace opencode SSE without buffering", async () => {
@@ -560,21 +743,60 @@ describe("den-gateway proxy", () => {
     expect(upstream.observed.requests).toHaveLength(1)
   })
 
-  test("returns non-ready JSON status and does not proxy", async () => {
+  test("returns a typed retryable error for a non-ready workspace and does not proxy", async () => {
     const upstream = startUpstream()
-    const denApi = startDenApi(() => ({ status: "waking", url: null, clientToken: null, hostToken: null }))
+    const denApi = startDenApi(() => ({ status: "waking", url: null, clientToken: null, hostToken: null, expiresAt: null }))
     const gateway = startGateway({ denApiBase: serverBase(denApi.server), gatewayKey: "gateway-secret" })
 
     const base = serverBase(gateway)
     const response = await fetch(`${base}/status`, { headers: { Authorization: "Bearer den-token" } })
     const second = await fetch(`${base}/status`, { headers: { Authorization: "Bearer den-token" } })
 
-    expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toEqual({ status: "waking" })
-    expect(second.status).toBe(200)
-    await expect(second.json()).resolves.toEqual({ status: "waking" })
+    expect(response.status).toBe(503)
+    expect(response.headers.get("retry-after")).toBe("5")
+    await expect(response.json()).resolves.toEqual({ error: "workspace_not_ready", status: "waking" })
+    expect(second.status).toBe(503)
+    await expect(second.json()).resolves.toEqual({ error: "workspace_not_ready", status: "waking" })
     expect(upstream.observed.requests).toHaveLength(0)
     expect(denApi.observed.calls).toBe(2)
+  })
+
+  test("forwards safe startup diagnostics without exposing runtime credentials", async () => {
+    const upstream = startUpstream()
+    const denApi = startDenApi(() => ({
+      status: "failed",
+      url: null,
+      clientToken: null,
+      hostToken: null,
+      expiresAt: null,
+      failure: {
+        code: "runtime_health_timeout",
+        stage: "recovery",
+        reference: "cwf_test-reference",
+        occurredAt: "2026-08-28T12:00:00.000Z",
+      },
+    }))
+    const gateway = startGateway({ denApiBase: serverBase(denApi.server), gatewayKey: "gateway-secret" })
+
+    const response = await fetch(`${serverBase(gateway)}/workspaces`, {
+      headers: { Authorization: "Bearer browser-session-secret" },
+    })
+    const body = await response.json()
+
+    expect(response.status).toBe(503)
+    expect(body).toEqual({
+      error: "workspace_not_ready",
+      status: "failed",
+      failure: {
+        code: "runtime_health_timeout",
+        stage: "recovery",
+        reference: "cwf_test-reference",
+        occurredAt: "2026-08-28T12:00:00.000Z",
+      },
+    })
+    expect(JSON.stringify(body)).not.toContain("browser-session-secret")
+    expect(JSON.stringify(body)).not.toContain("clientToken")
+    expect(upstream.observed.requests).toHaveLength(0)
   })
 
   test("streams SSE without buffering and strips stale compression headers", async () => {

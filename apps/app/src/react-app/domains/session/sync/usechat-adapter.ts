@@ -1,6 +1,6 @@
 /** @jsxImportSource react */
 import type { UIMessage } from "ai";
-import type { FilePart, Part, ToolPart } from "@opencode-ai/sdk/v2/client";
+import type { FilePart, Part, TextPart, ToolPart } from "@opencode-ai/sdk/v2/client";
 
 import type { OpenworkSessionSnapshot } from "../../../../app/lib/openwork-server";
 import { SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX } from "../../../../app/types";
@@ -120,26 +120,68 @@ function mapSnapshotToolParts(part: ToolPart): UIMessage["parts"] {
   return [mapped];
 }
 
-export function snapshotToUIMessages(snapshot: OpenworkSessionSnapshot): UIMessage[] {
-  return snapshot.messages.flatMap((message) => {
+/** Recover display-only attachments without sending unsupported binary parts to the model. */
+export function attachmentNoteToUIParts(part: TextPart): UIMessage["parts"] {
+  if (!part.synthetic || part.ignored) return [];
+  const attachments = part.metadata?.openworkAttachments;
+  if (!Array.isArray(attachments)) return [];
+  return attachments.flatMap<UIMessage["parts"][number]>((attachment: unknown, index) => {
+    if (!attachment || typeof attachment !== "object"
+      || !("filename" in attachment) || typeof attachment.filename !== "string"
+      || !("mime" in attachment) || typeof attachment.mime !== "string"
+      || !("url" in attachment) || typeof attachment.url !== "string"
+      || !attachment.url.startsWith("file://")) return [];
+    return [{
+      type: "file",
+      filename: attachment.filename,
+      mediaType: attachment.mime,
+      url: attachment.url,
+      providerMetadata: { opencode: { partId: `${part.id}:attachment:${index}` } },
+    }];
+  });
+}
+
+export function textPartToUIPart(part: TextPart): UIMessage["parts"][number] | null {
+  if (part.synthetic || part.ignored) return null;
+  const composerToken = part.metadata?.openworkComposerToken;
+  return {
+    type: "text",
+    text: part.text,
+    state: "done",
+    providerMetadata: { opencode: {
+      partId: part.id,
+      ...(typeof composerToken === "string" ? { composerToken } : {}),
+    } },
+  };
+}
+
+type SnapshotMessages = OpenworkSessionSnapshot["messages"];
+const snapshotMessagesCache = new WeakMap<SnapshotMessages, UIMessage[]>();
+const snapshotMessageCache = new WeakMap<SnapshotMessages[number], UIMessage[]>();
+
+// Query snapshots are immutable. Share the projection between rendering and
+// hydration; a refreshed tail can also reuse unchanged historical messages.
+// Callers must copy before applying live updates to these cached messages.
+export function snapshotToUIMessages(snapshot: Pick<OpenworkSessionSnapshot, "messages">): UIMessage[] {
+  const cached = snapshotMessagesCache.get(snapshot.messages);
+  if (cached) return cached;
+  const messages = snapshot.messages.flatMap((message) => {
+    const cachedMessage = snapshotMessageCache.get(message);
+    if (cachedMessage) return cachedMessage;
     const created = message.info.time?.created;
     const time = message.info.time;
     const completed = time && "completed" in time ? time.completed : undefined;
+    const parentID = "parentID" in message.info ? message.info.parentID : undefined;
     const uiMessage = {
       id: message.info.id,
       role: message.info.role,
-      ...(typeof created === "number"
-        ? { metadata: { opencode: { created, ...(typeof completed === "number" ? { completed } : {}) } } }
+      ...(typeof created === "number" || typeof parentID === "string"
+        ? { metadata: { opencode: { ...(typeof created === "number" ? { created } : {}), ...(typeof completed === "number" ? { completed } : {}), ...(typeof parentID === "string" ? { parentID } : {}) } } }
         : {}),
       parts: message.parts.flatMap<UIMessage["parts"][number]>((part) => {
         if (part.type === "text") {
-          if (part.synthetic || part.ignored) return [];
-          return [{
-            type: "text",
-            text: getTextPartValue(part),
-            state: "done" as const,
-            providerMetadata: { opencode: { partId: part.id } },
-          }];
+          const mapped = textPartToUIPart(part);
+          return mapped ? [mapped] : attachmentNoteToUIParts(part);
         }
         if (part.type === "reasoning") {
           return [{
@@ -177,9 +219,14 @@ export function snapshotToUIMessages(snapshot: OpenworkSessionSnapshot): UIMessa
     // error still gets its own message. An empty assistant carcass for the
     // errored turn is dropped so the error reads as that turn's outcome.
     const error = message.info.role === "assistant" && "error" in message.info ? message.info.error : undefined;
-    if (!error) return [uiMessage];
-
-    const errorMessage = createSessionErrorUIMessage(message.info.id, presentOpencodeSessionError(error), { created });
-    return uiMessage.parts.length > 0 ? [uiMessage, errorMessage] : [errorMessage];
+    let result: UIMessage[] = [uiMessage];
+    if (error) {
+      const errorMessage = createSessionErrorUIMessage(message.info.id, presentOpencodeSessionError(error), { created });
+      result = uiMessage.parts.length > 0 ? [uiMessage, errorMessage] : [errorMessage];
+    }
+    snapshotMessageCache.set(message, result);
+    return result;
   });
+  snapshotMessagesCache.set(snapshot.messages, messages);
+  return messages;
 }

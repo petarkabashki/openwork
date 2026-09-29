@@ -1,4 +1,9 @@
-import { readFile, writeFile, rm, stat } from "node:fs/promises";
+import { createV2SessionHomes, nativeSession, nativeSessionDirectory } from "./opencode-v2-session-home.js";
+import { createNativeCloudMcpResolver, createRoutedCloudMcpRegistrar } from "./cloud-mcp-v2.js";
+import { managedDesktopPolicy } from "./managed-desktop-policy.js";
+import { createTaskRecovery, setTaskRecovery } from "./task-recovery.js";
+import { managedPolicyActionSchema } from "./managed-policy-rules.js";
+import { readFile, realpath, writeFile, rm, stat } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
@@ -7,28 +12,42 @@ import type { ApprovalRequest, Capabilities, ServerConfig, WorkspaceInfo, Actor,
 import { agentContextDiagnosticsRequestSchema } from "./agent-context-diagnostics-schema.js";
 import { ApprovalService } from "./approvals.js";
 import {
+  BoundedSseFrameBuffer,
   EnginePool,
   enginePoolForConfig,
   isEngineConnectionFailure,
-  managedEnginePoolForConfig,
   setEnginePoolForConfig,
   type EnginePoolConnection,
   type EngineEventProxyLease,
   type EngineSpawnTemplate,
+  rolloverOutcomeApplied,
+  type RolloverOutcome,
+  type RolloverReason,
 } from "./engine-pool.js";
 import { withEngineDirectoryFence } from "./engine-directory-fence.js";
+import {
+  clearEngineInstanceReaperForConfig,
+  EngineInstanceReaper,
+  engineInstanceReaperForConfig,
+  setEngineInstanceReaperForConfig,
+  type TrackedEngineInstance,
+} from "./engine-instance-reaper.js";
 import { shouldDeferInPlaceEngineReload } from "./engine-reload-defer.js";
 import { LatestTrailingWorkQueue } from "./latest-trailing-work-queue.js";
 import { buildEngineAuthProbeHeader } from "./engine-registry.js";
 import { addPlugin, listPlugins, normalizePluginSpec, removePlugin } from "./plugins.js";
 import { sanitizePortableOpencodeConfig } from "./portable-opencode.js";
 import { addMcp, listMcp, removeMcp, setMcpEnabled } from "./mcp.js";
+import { buildOpenWorkV2Instructions, OPENWORK_V2_INSTRUCTION_KEY } from "./opencode-v2-instructions.js";
 import {
   callMcpAppTool,
+  listMcpAppCatalog,
   McpAppHostError,
   resolveConnectMcpAppResource,
   resolveMcpAppResource,
   resolveSameServerMcpAppResource,
+  releaseMcpAppLaunch,
+  type McpAppLaunchContext,
 } from "./mcp-app-host.js";
 import { CONNECT_MCP_SERVER_NAME_PREFIX } from "./connect-mcp-server-catalog.js";
 import {
@@ -38,7 +57,6 @@ import {
   MCP_APP_SANDBOX_PROXY_SCRIPT,
   parseMcpAppSandboxCsp,
 } from "./mcp-app-sandbox.js";
-import { exportExtensions } from "./extensions-export.js";
 import { deleteSkill, listSkills, renderSkillContentForResponse, upsertSkill } from "./skills.js";
 import { deleteCommand, listCommands, repairCommands, upsertCommand } from "./commands.js";
 import { ApiError, formatError } from "./errors.js";
@@ -47,6 +65,12 @@ import { recordAudit, readAuditEntries, readLastAudit } from "./audit.js";
 import { ReloadEventStore } from "./events.js";
 import { computeReloadFingerprint } from "./reload-fingerprint.js";
 import { startReloadWatchers } from "./reload-watcher.js";
+import {
+  redactLogAttributes,
+  redactServerLogFileRecord,
+  resolveServerLogFileSink,
+  type ServerLogFileSink,
+} from "./server-log-file.js";
 import { opencodeConfigPath, openworkConfigPath, projectCommandsDir, projectSkillsDir } from "./workspace-files.js";
 import { ensureDir, exists, hashToken, shortId } from "./utils.js";
 import { defaultWorkspaceOpenworkConfig, ensureWorkspaceFiles, readRawOpencodeConfig } from "./workspace-init.js";
@@ -62,39 +86,26 @@ import {
 } from "./desktop-cloud-sync.js";
 import { installCloudPlugin, readCloudPluginResolved, readInstalledCloudPlugins, removeCloudPlugin } from "./cloud-plugins.js";
 import { resolveClaudePluginBundle } from "./claude-plugin-bundle.js";
-import {
-  applyMaterializedBlueprintSessions,
-  normalizeBlueprintSessionTemplates,
-  readMaterializedBlueprintSessions,
-  sanitizeOpenworkTemplateConfig,
-} from "./blueprint-sessions.js";
 import { resolveWorkspaceOpencodeConnection } from "./opencode-connection.js";
-import { seedOpencodeSessionMessages } from "./opencode-db.js";
 import { listPortableFiles } from "./portable-files.js";
 import {
-  buildWorkspaceImportPreview,
-  normalizeWorkspaceImportPayload,
-  publicWorkspaceImportPreview,
-  summarizeWorkspaceImportApplied,
-  summarizeWorkspaceImportPreview,
-  type WorkspaceImportPlan,
-  workspaceImportPreviewApprovalPaths,
-} from "./workspace-import-preview.js";
-import {
   collectWorkspaceExportWarnings,
+  sanitizeOpenworkTemplateConfig,
   stripSensitiveWorkspaceExportData,
   type WorkspaceExportSensitiveMode,
 } from "./workspace-export-safety.js";
 import { serve, type ServeResult } from "./serve-node.js";
 import { serveStaticUi } from "./static-ui.js";
-import { externalFetch, loopbackFetch } from "./server-fetch.js";
+import { externalFetch, loopbackFetch, transferResponseBody } from "./server-fetch.js";
 import { registerCoreRoutes } from "./routes/core.js";
 import { registerFileRoutes } from "./routes/files.js";
 import { registerOperationRoutes } from "./routes/operations.js";
 import { addRoute, matchRoute, type AuthMode, type RequestContext, type Route } from "./routes/registry.js";
-import { registerSessionRoutes } from "./routes/sessions.js";
+import { registerSessionGroupRoutes } from "./routes/session-groups.js";
+import { registerUiControlRoutes } from "./routes/ui-control.js";
 import { registerWorkspaceRoutes } from "./routes/workspaces.js";
 import { registerCloudMcpRoutes } from "./routes/cloud-mcp.js";
+import { UiControlMailbox } from "./ui-control.js";
 import { captureServerException, isExpectedRequestCancellation } from "./telemetry.js";
 import {
   completeLocalManagedMcpAuthorization,
@@ -110,15 +121,22 @@ import {
 } from "./local-managed-mcp.js";
 import {
   markOpenworkCloudMcpStale,
+  migrateOpenworkCloudMcpRuntimeConfig,
+  OPENWORK_CLOUD_MCP_NAME,
   reconcilePersistedOpenworkCloudMcp,
+  removeOpenworkCloudMcpDesiredConfig,
   type CloudMcpHealth,
 } from "./cloud-mcp-health.js";
 import { runAgentContextDiagnostics } from "./agent-context-diagnostics.js";
-import { createAgentDiagnosticsEngineFetch } from "./agent-context-engine-inspection.js";
+import { createAgentDiagnosticsEngineFetch, validateEffectiveEngineSnapshot } from "./agent-context-engine-inspection.js";
+import { selectGoverningAgent, summarizeEffectivePermissions } from "./effective-permissions.js";
+import { readWorkspaceRunMode, setWorkspaceRunMode, type WorkspaceRunModeState } from "./workspace-run-mode.js";
 import { sanitizeDiagnosticString } from "./diagnostic-sanitizer.js";
 import {
   mergeOpencodeConfigs,
   mergeRuntimeProviderUpdate,
+  migrateWorkspaceRuntimeConfigToEngineGlobal,
+  readEffectiveRuntimeOpencodeConfig,
   readGlobalRuntimeOpencodeConfig,
   readRuntimeOpencodeConfig,
   runtimeDisabledProviderList,
@@ -136,9 +154,10 @@ import {
   writeOpenworkWorkspaceConfig,
 } from "./openwork-workspace-config-store.js";
 import { buildOpenworkRuntimeConfigObject, openworkRuntimeConfigFilePath, writeOpenworkRuntimeConfigFile } from "./openwork-runtime-config.js";
-import { readLegacyConfigSweepState } from "./legacy-config-sweep.js";
-import { findManagedEngineWorkspace } from "./workspaces.js";
+import { findManagedEngineWorkspace, managedEngineRootWorkspace } from "./workspaces.js";
+import { startThreadApprovalReplayer, type ThreadApprovalReplayer } from "./thread-approvals.js";
 import { CloudProviderSync, parseCloudProviderDenSession } from "./cloud-provider-sync.js";
+import { createEngineV2Preview, type EngineV2Preview } from "./engine-v2-preview.js";
 import pkg from "../package.json" with { type: "json" };
 import constants from "../../../constants.json" with { type: "json" };
 
@@ -151,20 +170,25 @@ export {
 const SERVER_VERSION = pkg.version;
 const OPENCODE_VERSION = constants.opencodeVersion.trim().replace(/^v/, "");
 
-const OPENWORK_VOICE_REALTIME_MODEL = "gpt-realtime-2";
-const OPENWORK_VOICE_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 let desktopCloudSyncQueue: Promise<void> = Promise.resolve();
 const agentDiagnosticsLastRunByServer = new WeakMap<ServerConfig, Map<string, number>>();
 const agentDiagnosticsInFlightByServer = new WeakMap<ServerConfig, Set<string>>();
+const commandAdmissionsByServer = new WeakMap<ServerConfig, Map<string, { fingerprint: string; admittedAt: number }>>();
 const AGENT_DIAGNOSTICS_RATE_LIMIT_CAPACITY = 1_000;
 const AGENT_DIAGNOSTICS_MAX_IN_FLIGHT_PER_SERVER = 16;
 const AGENT_DIAGNOSTICS_MAX_REQUEST_BYTES = 256 * 1024;
 const AGENT_DIAGNOSTICS_DEFAULT_BODY_DEADLINE_MS = 2_000;
 const AGENT_DIAGNOSTICS_ERROR_FLUSH_MS = 25;
+const COMMAND_ADMISSION_CAPACITY = 10_000;
+const COMMAND_ADMISSION_TTL_MS = 24 * 60 * 60 * 1_000;
 
 function rethrowMcpAppHostError(error: unknown): never {
   if (!(error instanceof McpAppHostError)) throw error;
-  const status = error.code === "invalid_tool_name" || error.code.startsWith("invalid_resource")
+  const status = error.code === "mcp_auth_required"
+    ? 401
+    : error.code === "mcp_access_denied"
+      ? 403
+      : error.code === "invalid_tool_name" || error.code.startsWith("invalid_resource")
     ? 400
     : error.code === "tool_not_found" || error.code === "server_unavailable"
       ? 404
@@ -229,131 +253,8 @@ function reserveAgentDiagnosticsRun(
   };
 }
 
-const OPENWORK_VOICE_REALTIME_TOOLS = [
-  {
-    type: "function",
-    name: "openwork_snapshot",
-    description: "Read the current OpenWork UI control snapshot: route, status, narration, and visible action metadata.",
-    parameters: { type: "object", properties: {}, additionalProperties: false },
-  },
-  {
-    type: "function",
-    name: "openwork_list_actions",
-    description: "List semantic OpenWork UI actions. Call this before openwork_execute_action when you do not know the exact action id.",
-    parameters: { type: "object", properties: {}, additionalProperties: false },
-  },
-  {
-    type: "function",
-    name: "openwork_execute_action",
-    description: "Execute a semantic OpenWork UI action by id. Prefer this over screen coordinates or DOM guessing.",
-    parameters: {
-      type: "object",
-      properties: {
-        actionId: { type: "string", description: "The action id from openwork_list_actions, such as composer.set_text or composer.send." },
-        args: { type: "object", description: "Optional JSON arguments for the action.", additionalProperties: true },
-      },
-      required: ["actionId"],
-      additionalProperties: false,
-    },
-  },
-];
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function readStringField(value: unknown, key: string): string {
-  if (!isRecord(value)) return "";
-  const field = value[key];
-  return typeof field === "string" ? field.trim() : "";
-}
-
-const LEGACY_RUNTIME_CONFIG_KEYS = ["plugin", "mcp", "permission", "provider"] as const;
-const USER_OPENCODE_RUNTIME_CONFIG_KEYS = ["default_agent", "plugin", "mcp", "disabled_providers", "provider"] as const;
-
-type LegacyRuntimeConfigKey = typeof LEGACY_RUNTIME_CONFIG_KEYS[number];
-type UserOpencodeRuntimeConfigKey = typeof USER_OPENCODE_RUNTIME_CONFIG_KEYS[number];
-
-function legacyRuntimeConfigFromOpenworkConfig(openwork: Record<string, unknown>): {
-  config: RuntimeOpencodeConfig;
-  keys: LegacyRuntimeConfigKey[];
-} {
-  const keys: LegacyRuntimeConfigKey[] = [];
-  const plugin = Array.isArray(openwork.plugin) ? openwork.plugin.filter((item) => typeof item === "string") : [];
-  const mcp: Record<string, Record<string, unknown>> = {};
-  if (isRecord(openwork.mcp)) {
-    for (const [name, value] of Object.entries(openwork.mcp)) {
-      if (isRecord(value)) mcp[name] = value;
-    }
-  }
-  const permission = isRecord(openwork.permission) ? openwork.permission : null;
-  const externalDirectory = permission && isRecord(permission.external_directory) ? permission.external_directory : null;
-  const provider = isRecord(openwork.provider) ? openwork.provider : null;
-
-  if (plugin.length) keys.push("plugin");
-  if (Object.keys(mcp).length) keys.push("mcp");
-  if (externalDirectory && Object.keys(externalDirectory).length) keys.push("permission");
-  if (provider && Object.keys(provider).length) keys.push("provider");
-
-  return {
-    keys,
-    config: {
-      ...(plugin.length ? { plugin } : {}),
-      ...(Object.keys(mcp).length ? { mcp } : {}),
-      ...(externalDirectory ? { permission: { external_directory: externalDirectory } } : {}),
-      ...(provider ? { provider } : {}),
-    },
-  };
-}
-
-function removeLegacyRuntimeConfig(openwork: Record<string, unknown>): Record<string, unknown> {
-  const next = { ...openwork };
-  for (const key of LEGACY_RUNTIME_CONFIG_KEYS) {
-    delete next[key];
-  }
-  return next;
-}
-
-function userRuntimeConfigFromOpencodeConfig(opencode: Record<string, unknown>): {
-  config: RuntimeOpencodeConfig;
-  keys: UserOpencodeRuntimeConfigKey[];
-} {
-  const keys: UserOpencodeRuntimeConfigKey[] = [];
-  const defaultAgent = opencode.default_agent === "openwork" ? "openwork" : undefined;
-  const plugin = Array.isArray(opencode.plugin) ? opencode.plugin.filter((item) => typeof item === "string") : undefined;
-  const mcp: Record<string, Record<string, unknown>> = {};
-  if (isRecord(opencode.mcp)) {
-    for (const [name, value] of Object.entries(opencode.mcp)) {
-      if (isRecord(value)) mcp[name] = value;
-    }
-  }
-  const disabledProviders = Array.isArray(opencode.disabled_providers)
-    ? opencode.disabled_providers.filter((item) => typeof item === "string")
-    : undefined;
-  const provider = isRecord(opencode.provider) ? opencode.provider : undefined;
-
-  if (defaultAgent) keys.push("default_agent");
-  if (Array.isArray(opencode.plugin)) keys.push("plugin");
-  if (Object.keys(mcp).length) keys.push("mcp");
-  if (Array.isArray(opencode.disabled_providers)) keys.push("disabled_providers");
-  if (isRecord(opencode.provider)) keys.push("provider");
-
-  return {
-    keys,
-    config: {
-      ...(defaultAgent ? { default_agent: defaultAgent } : {}),
-      ...(plugin?.length ? { plugin } : {}),
-      ...(Object.keys(mcp).length ? { mcp } : {}),
-      ...(disabledProviders?.length ? { disabled_providers: disabledProviders } : {}),
-      ...(provider && Object.keys(provider).length ? { provider } : {}),
-    },
-  };
-}
-
-async function removeUserRuntimeConfigFromOpencode(workspaceRoot: string, keys: UserOpencodeRuntimeConfigKey[]): Promise<void> {
-  if (!keys.length) return;
-  const updates = Object.fromEntries(keys.map((key) => [key, undefined]));
-  await updateJsoncTopLevel(opencodeConfigPath(workspaceRoot), updates);
 }
 
 function runtimeConfigKeys(config: RuntimeOpencodeConfig): string[] {
@@ -403,10 +304,12 @@ function parseRuntimeProviderPatchPayload(body: Record<string, unknown>): Record
 
 function resolveEngineRuntimeWorkspace(config: ServerConfig): WorkspaceInfo {
   const workspace = findManagedEngineWorkspace(config.workspaces) ?? config.workspaces[0];
-  if (!workspace) {
-    throw new ApiError(400, "workspace_missing", "At least one workspace is required for engine runtime config");
-  }
-  return workspace;
+  if (workspace) return workspace;
+  // A managed engine runs before the first workspace exists. Engine-wide
+  // maintenance (provider credentials, reloads) targets its root directory.
+  const pool = enginePoolForConfig(config);
+  if (pool) return managedEngineRootWorkspace(pool.cwd());
+  throw new ApiError(400, "workspace_missing", "At least one workspace is required for engine runtime config");
 }
 
 function redactBearerTokens(value: string): string {
@@ -462,110 +365,6 @@ function userOpencodeConfigKeys(config: Record<string, unknown>): string[] {
   return Object.keys(config).filter((key) => key !== "$schema").sort();
 }
 
-function mergeLegacyRuntimeConfig(
-  current: RuntimeOpencodeConfig,
-  legacy: RuntimeOpencodeConfig,
-): RuntimeOpencodeConfig {
-  const currentPermission = isRecord(current.permission) ? current.permission : {};
-  const legacyPermission = isRecord(legacy.permission) ? legacy.permission : {};
-  const currentExternalDirectory = isRecord(currentPermission.external_directory) ? currentPermission.external_directory : {};
-  const legacyExternalDirectory = isRecord(legacyPermission.external_directory) ? legacyPermission.external_directory : {};
-  return {
-    default_agent: current.default_agent ?? legacy.default_agent,
-    plugin: [
-      ...(Array.isArray(current.plugin) ? current.plugin.filter((item) => typeof item === "string") : []),
-      ...(Array.isArray(legacy.plugin) ? legacy.plugin.filter((item) => typeof item === "string") : []),
-    ].filter((item, index, list) => list.indexOf(item) === index),
-    disabled_providers: [
-      ...(Array.isArray(current.disabled_providers) ? current.disabled_providers.filter((item) => typeof item === "string") : []),
-      ...(Array.isArray(legacy.disabled_providers) ? legacy.disabled_providers.filter((item) => typeof item === "string") : []),
-    ].filter((item, index, list) => list.indexOf(item) === index),
-    mcp: {
-      ...(isRecord(legacy.mcp) ? legacy.mcp : {}),
-      ...(isRecord(current.mcp) ? current.mcp : {}),
-    },
-    permission: {
-      ...legacyPermission,
-      ...currentPermission,
-      external_directory: {
-        ...legacyExternalDirectory,
-        ...currentExternalDirectory,
-      },
-    },
-    provider: {
-      ...(isRecord(legacy.provider) ? legacy.provider : {}),
-      ...(isRecord(current.provider) ? current.provider : {}),
-    },
-  };
-}
-
-async function resolveOpenAiRealtimeApiKey(env: EnvService): Promise<string> {
-  const records = await env.list();
-  const storedKey =
-    records.find((entry) => entry.key === "OPENAI_REALTIME_API_KEY")?.value.trim() ||
-    records.find((entry) => entry.key === "OPENAI_API_KEY")?.value.trim() ||
-    "";
-  if (storedKey) return storedKey;
-
-  return process.env.OPENWORK_OPENAI_REALTIME_API_KEY?.trim() ||
-    process.env.OPENAI_REALTIME_API_KEY?.trim() ||
-    process.env.OPENAI_API_KEY?.trim() ||
-    "";
-}
-
-async function resolveOpenWorkModelsVoiceConfig(env: EnvService): Promise<{ baseUrl: string; apiKey: string } | null> {
-  const records = await env.list();
-  const apiKey =
-    records.find((entry) => entry.key === "OPENWORK_API_KEY")?.value.trim() ||
-    records.find((entry) => entry.key === "OPENWORK_MODELS_API_KEY")?.value.trim() ||
-    process.env.OPENWORK_API_KEY?.trim() ||
-    process.env.OPENWORK_MODELS_API_KEY?.trim() ||
-    "";
-  if (!apiKey) return null;
-
-  const baseUrl =
-    records.find((entry) => entry.key === "OPENWORK_INFERENCE_BASE_URL")?.value.trim() ||
-    records.find((entry) => entry.key === "OPENWORK_MODELS_BASE_URL")?.value.trim() ||
-    process.env.OPENWORK_INFERENCE_BASE_URL?.trim() ||
-    process.env.OPENWORK_MODELS_BASE_URL?.trim() ||
-    "";
-  if (!baseUrl) return null;
-  return { apiKey, baseUrl: baseUrl.replace(/\/+$/, "") };
-}
-
-function openworkVoiceRealtimeInstructions(sessionContext: string) {
-  const trimmedContext = sessionContext.trim();
-  const contextSection = trimmedContext
-    ? `
-
-# Current Session Context
-
-Use this recent transcript context to answer questions about what was last discussed and to resolve references such as "this" or "that" when continuing the existing session. Do not treat it as a new user request.
-
-${trimmedContext}`
-    : "";
-  return `# Role and Objective
-
-You are OpenWork Voice Mode, a voice-first control layer inside OpenWork.
-Help the user control OpenWork by using the semantic OpenWork UI tools.
-
-# Tool Policy
-
-- Prefer openwork_snapshot, openwork_list_actions, and openwork_execute_action over visual guessing.
-- If the user asks to write or draft something, use composer.set_text.
-- If the user asks to send or run the current prompt, use composer.send.
-- For navigation, settings, session, transcript, and composer work, inspect the action list first if the action id is unknown.
-- Do not claim an action completed until the tool succeeds.
-- Ask for confirmation before destructive actions such as deleting a session.
-
-# Voice Style
-
-- Be concise, calm, and direct.
-- If audio is unclear, ask the user to repeat it instead of guessing.
-- Ignore background speech that is not addressed to OpenWork.
-- Summarize tool results briefly and offer the next useful step.${contextSection}`;
-}
-
 function enqueueDesktopCloudSync<T>(operation: () => Promise<T>): Promise<T> {
   const run = desktopCloudSyncQueue.then(operation);
   desktopCloudSyncQueue = run.then(
@@ -575,162 +374,17 @@ function enqueueDesktopCloudSync<T>(operation: () => Promise<T>): Promise<T> {
   return run;
 }
 
-function readOpenAiClientSecret(payload: unknown): { clientSecret: string; expiresAt: number | null } {
-  if (!isRecord(payload)) return { clientSecret: "", expiresAt: null };
-  const clientSecret = payload.client_secret;
-  if (typeof clientSecret === "string") return { clientSecret, expiresAt: null };
-  if (isRecord(clientSecret)) {
-    const value = typeof clientSecret.value === "string" ? clientSecret.value : "";
-    const expiresAt = typeof clientSecret.expires_at === "number" ? clientSecret.expires_at : null;
-    return { clientSecret: value, expiresAt };
-  }
-  const value = typeof payload.value === "string" ? payload.value : "";
-  return { clientSecret: value, expiresAt: null };
-}
-
-async function createOpenAiRealtimeVoiceSession(env: EnvService, input: unknown) {
-  const managedVoice = await resolveOpenWorkModelsVoiceConfig(env);
-  if (managedVoice) {
-    try {
-      return await createManagedVoiceSession(managedVoice, input);
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 503) {
-        const fallbackKey = await resolveOpenAiRealtimeApiKey(env);
-        if (fallbackKey) {
-          console.warn("[voice] OpenWork Models broker returned 503 — falling back to direct OpenAI Realtime.");
-          return createDirectOpenAiVoiceSession(fallbackKey, input);
-        }
-        throw new ApiError(
-          503,
-          "openwork_models_voice_unavailable",
-          "OpenWork Models voice is active but the server is not fully configured. Ask your admin to add an OpenAI key, or save your own OPENAI_API_KEY in Environment settings.",
-        );
-      }
-      throw error;
-    }
-  }
-
-  const apiKey = await resolveOpenAiRealtimeApiKey(env);
-  if (!apiKey) {
-    throw new ApiError(
-      400,
-      "openai_api_key_missing",
-      "OpenAI API key missing. Save OPENAI_API_KEY in OpenWork Environment Variables or configure the Voice Mode extension.",
-    );
-  }
-
-  return createDirectOpenAiVoiceSession(apiKey, input);
-}
-
-async function createManagedVoiceSession(config: { baseUrl: string; apiKey: string }, input: unknown) {
-  const response = await externalFetch(`${config.baseUrl}/voice/realtime/session`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(input ?? {}),
-  });
-  const text = await response.text();
-  let payload: unknown = null;
-  try {
-    payload = text ? JSON.parse(text) : null;
-  } catch {
-    payload = null;
-  }
-  if (!response.ok) {
-    const errorPayload = isRecord(payload) && isRecord(payload.error) ? payload.error : null;
-    const message = typeof errorPayload?.message === "string" ? errorPayload.message : response.statusText;
-    throw new ApiError(response.status, "openwork_models_voice_failed", message || "OpenWork Models could not create a voice session");
-  }
-  if (
-    !isRecord(payload) ||
-    payload.ok !== true ||
-    typeof payload.clientSecret !== "string" ||
-    typeof payload.model !== "string" ||
-    !Array.isArray(payload.tools) ||
-    payload.tools.some((tool) => typeof tool !== "string")
-  ) {
-    throw new ApiError(502, "openwork_models_voice_invalid_response", "OpenWork Models did not return a usable Realtime session payload");
-  }
-  return {
-    ok: true,
-    clientSecret: payload.clientSecret,
-    expiresAt: typeof payload.expiresAt === "number" ? payload.expiresAt : null,
-    model: payload.model,
-    transcriptionModel: typeof payload.transcriptionModel === "string" ? payload.transcriptionModel : OPENWORK_VOICE_TRANSCRIPTION_MODEL,
-    tools: payload.tools,
-    ...(typeof payload.source === "string" ? { source: payload.source } : {}),
-  };
-}
-
-async function createDirectOpenAiVoiceSession(apiKey: string, input: unknown) {
-  const model = readStringField(input, "model") || OPENWORK_VOICE_REALTIME_MODEL;
-  const sessionContext = readStringField(input, "sessionContext").slice(0, 6_000);
-  const response = await externalFetch("https://api.openai.com/v1/realtime/client_secrets", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      session: {
-        type: "realtime",
-        model,
-        output_modalities: ["audio"],
-        audio: {
-          input: {
-            transcription: { model: OPENWORK_VOICE_TRANSCRIPTION_MODEL, language: "en" },
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.58,
-              silence_duration_ms: 320,
-              prefix_padding_ms: 300,
-              create_response: true,
-              interrupt_response: true,
-            },
-          },
-        },
-        instructions: openworkVoiceRealtimeInstructions(sessionContext),
-        tool_choice: "auto",
-        tools: OPENWORK_VOICE_REALTIME_TOOLS,
-      },
-    }),
-  });
-
-  const text = await response.text();
-  let payload: unknown = null;
-  try {
-    payload = text ? JSON.parse(text) : null;
-  } catch {
-    payload = null;
-  }
-
-  if (!response.ok) {
-    const errorPayload = isRecord(payload) && isRecord(payload.error) ? payload.error : null;
-    const message = typeof errorPayload?.message === "string" ? errorPayload.message : response.statusText;
-    throw new ApiError(response.status, "openai_realtime_failed", message || "Failed to create OpenAI Realtime session");
-  }
-
-  const { clientSecret, expiresAt } = readOpenAiClientSecret(payload);
-  if (!clientSecret) {
-    throw new ApiError(502, "openai_realtime_invalid_response", "OpenAI did not return a usable Realtime client secret");
-  }
-
-  return {
-    ok: true,
-    clientSecret,
-    expiresAt,
-    model,
-    transcriptionModel: OPENWORK_VOICE_TRANSCRIPTION_MODEL,
-    tools: OPENWORK_VOICE_REALTIME_TOOLS.map((tool) => tool.name),
-  };
-}
-
 const reloadBaselineRefreshers = new WeakMap<
   ServerConfig,
   (workspaceId: string, reasons?: ReloadReason[]) => Promise<void>
 >();
+
+/** The env store owned by a running server, for code that only holds its config. */
+const envServicesByConfig = new WeakMap<ServerConfig, EnvService>();
+
+export function envServiceForConfig(config: ServerConfig): EnvService | null {
+  return envServicesByConfig.get(config) ?? null;
+}
 
 type LogLevel = "info" | "warn" | "error";
 
@@ -762,9 +416,12 @@ function toUnixNano(): string {
   return (BigInt(Date.now()) * 1_000_000n).toString();
 }
 
-function isBrokenLogPipeError(error: unknown): boolean {
+function isUnavailableLogOutputError(error: unknown): boolean {
   if (!isRecord(error)) return false;
-  return error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED";
+  // Redirected stdout can run out of space just like the optional file sink.
+  // Logging must not turn an otherwise successful request into a server crash.
+  return error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED"
+    || error.code === "ENOSPC" || error.code === "EDQUOT" || error.code === "EIO";
 }
 
 let stdoutLogWritesDisabled = false;
@@ -774,7 +431,7 @@ function ensureStdoutErrorHandler() {
   if (stdoutErrorHandlerInstalled) return;
   stdoutErrorHandlerInstalled = true;
   process.stdout.on("error", (error: unknown) => {
-    if (isBrokenLogPipeError(error)) {
+    if (isUnavailableLogOutputError(error)) {
       stdoutLogWritesDisabled = true;
       return;
     }
@@ -790,7 +447,11 @@ function writeStdoutLogLine(line: string) {
   process.stdout.write(`${line}\n`);
 }
 
-export function createServerLogger(config: ServerConfig, writeLine: ServerLogWriter = writeStdoutLogLine): ServerLogger {
+export function createServerLogger(
+  config: ServerConfig,
+  writeLine: ServerLogWriter = writeStdoutLogLine,
+  fileSink: ServerLogFileSink | null = resolveServerLogFileSink(),
+): ServerLogger {
   const runId = process.env.OPENWORK_RUN_ID ?? shortId();
   const host = hostname().trim();
   const resource: Record<string, string> = {
@@ -812,7 +473,7 @@ export function createServerLogger(config: ServerConfig, writeLine: ServerLogWri
     try {
       writeLine(line);
     } catch (error) {
-      if (isBrokenLogPipeError(error)) {
+      if (isUnavailableLogOutputError(error)) {
         logWritesDisabled = true;
         if (writeLine === writeStdoutLogLine) {
           stdoutLogWritesDisabled = true;
@@ -824,20 +485,27 @@ export function createServerLogger(config: ServerConfig, writeLine: ServerLogWri
   };
 
   const emit = (level: LogLevel, message: string, attributes?: LogAttributes) => {
-    const merged = { ...baseAttributes, ...(attributes ?? {}) };
-    if (config.logFormat === "json") {
-      const record = {
-        timeUnixNano: toUnixNano(),
-        severityText: level.toUpperCase(),
-        severityNumber: LOG_LEVEL_NUMBERS[level],
-        body: message,
-        attributes: merged,
-        resource,
-      };
-      writeLogLine(JSON.stringify(record));
-      return;
+    const merged = redactLogAttributes({ ...baseAttributes, ...(attributes ?? {}) });
+    const record = {
+      timeUnixNano: toUnixNano(),
+      severityText: level.toUpperCase(),
+      severityNumber: LOG_LEVEL_NUMBERS[level],
+      body: message,
+      attributes: merged,
+      resource,
+    };
+    // The file sink is structured regardless of the stdout format: it exists
+    // so rollover reasons and reload triggers survive a packaged app.
+    if (fileSink) {
+      const secrets = [
+        config.token,
+        config.hostToken,
+        config.opencodePassword ?? "",
+        ...config.workspaces.map((workspace) => workspace.opencodePassword ?? ""),
+      ];
+      fileSink.write(JSON.stringify(redactServerLogFileRecord(record, secrets)));
     }
-    writeLogLine(message);
+    writeLogLine(config.logFormat === "json" ? JSON.stringify(record) : message);
   };
 
   return { log: emit };
@@ -922,11 +590,110 @@ function parseWorkspaceOpencodeMount(pathname: string): { workspaceId: string; r
   return { workspaceId: decodeURIComponent(workspaceId), restPath };
 }
 
+function parseWorkspaceOpencodeV2Mount(pathname: string): { workspaceId: string; restPath: string } | null {
+  if (!pathname.startsWith("/workspace/")) return null;
+  const remainder = pathname.slice("/workspace/".length);
+  if (!remainder) return null;
+  const slash = remainder.indexOf("/");
+  if (slash === -1) return null;
+  const workspaceId = remainder.slice(0, slash);
+  const restPath = remainder.slice(slash) || "/";
+  if (!workspaceId.trim()) return null;
+  if (restPath !== "/opencode2" && !restPath.startsWith("/opencode2/")) return null;
+  return { workspaceId: decodeURIComponent(workspaceId), restPath };
+}
+
+/** Requests that read or select from the provider catalog. Other requests never wait on upkeep. */
+function needsV2ProviderCatalog(method: string, restPath: string): boolean {
+  let path = restPath;
+  try { path = decodeURIComponent(restPath); } catch { /* Malformed paths reach the engine unchanged. */ }
+  if (method === "GET" || method === "HEAD") return /^\/opencode2\/api\/(?:model|provider)(?:\/|$)/.test(path);
+  return method === "POST" && /^\/opencode2\/api\/session\/[^/]+\/model\/?$/.test(path);
+}
+
 function normalizeOpencodeProxyPath(proxyPath: string): string {
   const raw = (proxyPath ?? "").trim() || "/";
   const withoutPrefix = raw.startsWith("/opencode") ? raw.slice("/opencode".length) : raw;
   const normalized = (withoutPrefix || "/").replace(/\/+$/, "");
   return normalized || "/";
+}
+
+function proxiedSessionReadId(method: string, proxyPath: string): string | null {
+  if (method.toUpperCase() !== "GET" && method.toUpperCase() !== "HEAD") return null;
+  const match = normalizeOpencodeProxyPath(proxyPath).match(/^\/(?:api\/)?session\/([^/]+)(?:\/|$)/);
+  if (!match?.[1]) return null;
+  let sessionId = match[1];
+  try {
+    sessionId = decodeURIComponent(sessionId);
+  } catch {
+    // Let OpenCode answer malformed identifiers without weakening the gate for valid IDs.
+  }
+  return sessionId === "status" ? null : sessionId;
+}
+
+async function assertWorkspaceOwnsProxiedSessionRead(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  method: string,
+  proxyPath: string,
+  requireActive = false,
+  signal?: AbortSignal,
+): Promise<void> {
+  const sessionId = proxiedSessionReadId(method, proxyPath);
+  const directory = resolveOpencodeDirectory(workspace);
+  if (!sessionId || !directory) {
+    if (requireActive) throw new McpAppHostError("inactive_session", "The original conversation cannot be verified. Reopen it before using App actions.");
+    return;
+  }
+
+  signal?.throwIfAborted();
+  const result = await createWorkspaceOpencodeClient(config, workspace, { sessionId }).session.get({ sessionID: sessionId }, { signal });
+  signal?.throwIfAborted();
+  if (result.error !== undefined) {
+    if (result.response?.status === 404) {
+      throw new ApiError(404, "session_not_found", "Session not found");
+    }
+    throw new ApiError(502, "opencode_request_failed", "OpenCode request failed", {
+      ...(result.response ? { status: result.response.status } : {}),
+      body: result.error,
+      path: `/session/${encodeURIComponent(sessionId)}`,
+    });
+  }
+
+  const sessionDirectory = result.data?.directory?.trim();
+  const [expectedDirectory, actualDirectory] = workspace.workspaceType === "local" && sessionDirectory
+    ? await Promise.all([
+        realpath(directory).catch(() => directory),
+        realpath(sessionDirectory).catch(() => sessionDirectory),
+      ])
+    : [directory, sessionDirectory];
+  signal?.throwIfAborted();
+  if (!actualDirectory || actualDirectory !== expectedDirectory) {
+    throw new ApiError(404, "session_not_found", "Session not found");
+  }
+  if (requireActive && (result.data?.id !== sessionId || result.data.time.archived)) {
+    throw new McpAppHostError("inactive_session", "This conversation is archived or unavailable. Reopen an active conversation before using App actions.");
+  }
+}
+
+/**
+ * Session-scoped reads prove workspace ownership through a separate metadata
+ * read. Running that proof beside the requested read, rather than ahead of it,
+ * removes one serialized engine round trip from every conversation open. The
+ * upstream response is released only after the proof passes; a failed proof
+ * rejects immediately and discards whatever the engine eventually returns.
+ */
+async function sendWithOwnershipProof(proof: Promise<void>, send: () => Promise<Response>): Promise<Response> {
+  const sending = send();
+  // Observe rejection while ownership is pending; return the original promise below.
+  void sending.catch(() => undefined);
+  try {
+    await proof;
+  } catch (error) {
+    void sending.then((response) => response.body?.cancel().catch(() => undefined), () => undefined);
+    throw error;
+  }
+  return sending;
 }
 
 export function assertOpencodeProxyAllowed(actor: Actor, method: string, proxyPath: string) {
@@ -956,15 +723,58 @@ function isSessionCommandProxyRequest(method: string, proxyPath: string) {
   return method === "POST" && /^\/session\/[^/]+\/command$/.test(normalizeOpencodeProxyPath(proxyPath));
 }
 
-function isPromptAsyncProxyRequest(method: string, proxyPath: string) {
-  return method === "POST" && /^\/session\/[^/]+\/prompt_async$/.test(normalizeOpencodeProxyPath(proxyPath));
+function commandAdmissionFromBody(body: ArrayBuffer | undefined): { messageId: string; fingerprint: string } | null {
+  if (!body) return null;
+  const text = new TextDecoder().decode(body);
+  try {
+    const value: unknown = JSON.parse(text);
+    if (!isRecord(value) || typeof value.messageID !== "string" || !value.messageID.trim()) return null;
+    return { messageId: value.messageID.trim(), fingerprint: hashToken(text) };
+  } catch {
+    return null;
+  }
 }
 
-export async function startServer(config: ServerConfig): Promise<ServeResult> {
+function admitSessionCommand(
+  config: ServerConfig,
+  scope: string,
+  admission: { messageId: string; fingerprint: string },
+): "accepted" | "duplicate" | "conflict" {
+  const now = Date.now();
+  const admissions = commandAdmissionsByServer.get(config) ?? new Map<string, { fingerprint: string; admittedAt: number }>();
+  commandAdmissionsByServer.set(config, admissions);
+  for (const [key, value] of admissions) {
+    if (now - value.admittedAt <= COMMAND_ADMISSION_TTL_MS) break;
+    admissions.delete(key);
+  }
+
+  const key = hashToken(`${scope}\0${admission.messageId}`);
+  const existing = admissions.get(key);
+  if (existing) return existing.fingerprint === admission.fingerprint ? "duplicate" : "conflict";
+
+  if (admissions.size >= COMMAND_ADMISSION_CAPACITY) {
+    const oldest = admissions.keys().next().value;
+    if (oldest) admissions.delete(oldest);
+  }
+  admissions.set(key, { fingerprint: admission.fingerprint, admittedAt: now });
+  return "accepted";
+}
+
+export async function startServer(
+  config: ServerConfig,
+  // Callers that spawn a managed engine after binding must complete startup
+  // once its primary is registered; ordinary attached servers stay ready.
+  options: { deferManagedEngineStartup?: boolean } = {},
+): Promise<ServeResult & { completeManagedEngineStartup: () => Promise<void> }> {
+  let managedEngineReady = options.deferManagedEngineStartup !== true;
+  let stopped = false;
+  let taskRecovery: Awaited<ReturnType<typeof createTaskRecovery>> | undefined;
   const approvals = new ApprovalService(config.approval);
+  const uiControl = new UiControlMailbox();
   const reloadEvents = new ReloadEventStore();
   const tokens = new TokenService(config);
   const env = new EnvService();
+  envServicesByConfig.set(config, env);
   const logger = createServerLogger(config);
   try {
     await reconcileLocalManagedMcpRuntimeEntries(config);
@@ -982,20 +792,58 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
     watcherHandle = startReloadWatchers({ config, reloadEvents, logger });
   };
   const engineMcpServerState = beginEngineMcpServerState(config);
+  const engineInstanceReaper = new EngineInstanceReaper({
+    // Only the managed engine is swept: the pool exists exactly when this
+    // server owns the engine process. An attached engine may serve other
+    // clients, so its per-directory instances are not ours to trim.
+    engineBaseUrl: () => enginePoolForConfig(config)?.primaryUrl() ?? null,
+    activeDirectory: () => {
+      const active = config.workspaces[0];
+      return active ? resolveOpencodeDirectory(active) : null;
+    },
+    directoryBusy: (instance) => engineInstanceHasActiveSessions(config, instance),
+    dispose: (instance) => disposeIdleEngineInstance(config, engineMcpServerState, instance),
+    logger,
+  });
+  setEngineInstanceReaperForConfig(config, engineInstanceReaper);
+  const engineV2Preview = createEngineV2Preview({ config, env, deferStart: true,
+    hostReadRequest: async (path, init) => {
+      // Internal dispatch retains the host credential in this process. The
+      // native plugin receives only the context bridge's restricted token.
+      const response = await serverOptions.fetch(new Request(`http://127.0.0.1${path}`, {
+        ...init, headers: { Authorization: `Bearer ${config.token}`, "Content-Type": "application/json" },
+      }));
+      const payload: unknown = await response.json();
+      if (!response.ok) throw new Error(`OpenWork read failed (${response.status})`);
+      return payload;
+    },
+  });
   const cloudProviderSync = new CloudProviderSync({
     config,
     env,
-    reloadEngine: () => reloadOpencodeEngine(
-      config,
-      resolveEngineRuntimeWorkspace(config),
-      engineMcpServerState,
-      { forceStandby: true },
-    ),
-    engineBusy: () => managedEnginePoolForConfig(config)
-      ? Promise.resolve(false)
-      : engineHasActiveSessions(config, resolveEngineRuntimeWorkspace(config)),
+    reloadEngine: async () => {
+      if (engineV2Preview.status().chatRouting) {
+        await engineV2Preview.refreshProviders();
+        return { action: "updated_live" };
+      }
+      return reloadOpencodeEngine(config, resolveEngineRuntimeWorkspace(config), engineMcpServerState,
+        { forceStandby: true, reason: "cloud_provider_sync" });
+    },
+    engineBusy: () => {
+      if (engineV2Preview.status().chatRouting) return Promise.resolve(false);
+      const pool = enginePoolForConfig(config);
+      return pool
+        ? Promise.resolve(pool.hasDrainingGeneration())
+        : engineHasActiveSessions(config, resolveEngineRuntimeWorkspace(config));
+    },
     logger: toManagedProviderAuthLogger(logger),
   });
+  managedDesktopPolicy(config).onChange = () => {
+    // Sign-in can precede the first workspace. A managed engine is already
+    // running then and must pick up the policy; an attached server with no
+    // workspace has no engine to reload.
+    if (config.workspaces.length > 0 || enginePoolForConfig(config)) cloudProviderSync.markReloadPending();
+  };
   const routes = createRoutes(
     config,
     approvals,
@@ -1005,6 +853,8 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
     engineMcpServerState,
     logger,
     cloudProviderSync,
+    engineV2Preview,
+    () => managedEngineReady,
   );
 
   const serverOptions: {
@@ -1035,6 +885,10 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
         if (typeof cause === "string") errorCause = cause;
       };
 
+      const recordUnhandledErrorCause = (error: unknown) => {
+        errorCause = error instanceof Error ? error.message : String(error);
+      };
+
       const finalize = (response: Response) => {
         const wrapped = withCors(response, request, config);
         if (config.logRequests) {
@@ -1055,20 +909,107 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
         return wrapped;
       };
 
+      const finalizeProxyResponse = (response: Response) => {
+        // A read can be cancelled while asynchronous ownership checks finish.
+        // Do not rewrap its cancelled body in withCors, or turn it into a 500.
+        // Writes retain their existing admission/completion semantics.
+        if (request.method === "GET" || request.method === "HEAD") {
+          request.signal.throwIfAborted();
+        }
+        return finalize(response);
+      };
+
       const proxyWorkspaceOpencodeMount = async (mount: { workspaceId: string; restPath: string }) => {
         authMode = "client";
         try {
           const actor = await requireClient(request, config, tokens);
           assertOpencodeProxyAllowed(actor, request.method, mount.restPath);
-          const workspace = await resolveWorkspace(config, mount.workspaceId);
+          await validateEngineRequestBody(request);
+          await managedDesktopPolicy(config).assertRequest(request, mount.restPath, true);
+          const workspace = await resolveWorkspaceWithoutBootstrap(config, mount.workspaceId);
+          const ownership = assertWorkspaceOwnsProxiedSessionRead(config, workspace, request.method, mount.restPath, false,
+            request.method === "GET" || request.method === "HEAD" ? request.signal : undefined);
           proxyService = "opencode";
           proxyBaseUrl = workspace.baseUrl?.trim() || undefined;
-          const response = await proxyOpencodeRequest({ config, request, url, workspace, proxyPath: mount.restPath });
-          return finalize(response);
+          const send = () => proxyOpencodeRequest({ config, request, url, workspace, proxyPath: mount.restPath,
+            recoverySignal: taskRecovery?.owns(request) ? request.signal : undefined });
+          const response = await sendWithOwnershipProof(ownership,
+            () => taskRecovery ? taskRecovery.forward(workspace, "v1", mount.restPath, request, send) : send());
+          if (response.ok && workspace.workspaceType !== "remote" && engineV2Preview.status().chatRouting
+            && ["PUT", "DELETE"].includes(request.method)
+            && /^\/opencode\/auth\/[^/]+$/.test(mount.restPath)) {
+            // The ordinary local-provider form writes v1's credential store.
+            // Join v2 catalog reconciliation before reporting that save complete.
+            await engineV2Preview.refreshProviders();
+          }
+          return finalizeProxyResponse(response);
         } catch (error) {
           const requestCanceled = isExpectedRequestCancellation(error, request.signal);
           if (!(error instanceof ApiError) && !requestCanceled) {
+            recordUnhandledErrorCause(error);
             captureServerException(error, { method: request.method, route: "/workspace/:id/opencode/*", requestSignal: request.signal });
+          }
+          const apiError = error instanceof ApiError
+            ? error
+            : requestCanceled
+              ? new ApiError(499, "request_aborted", "Request was canceled")
+              : new ApiError(500, "internal_error", "Unexpected server error");
+          recordApiError(apiError);
+          return finalize(jsonResponse(formatError(apiError), apiError.status));
+        }
+      };
+
+      const proxyWorkspaceOpencodeV2Mount = async (mount: { workspaceId: string; restPath: string }) => {
+        authMode = "client";
+        try {
+          const actor = await requireClient(request, config, tokens);
+          assertOpencodeProxyAllowed(actor, request.method, mount.restPath);
+          await validateEngineRequestBody(request);
+          await managedDesktopPolicy(config).assertRequest(request, mount.restPath, true);
+          const workspace = await resolveWorkspaceWithoutBootstrap(config, mount.workspaceId);
+          const connection = engineV2Preview.connection();
+          if (!connection) {
+            return finalize(jsonResponse({ error: "engine_v2_preview_not_running" }, 503));
+          }
+          proxyService = "opencode";
+          proxyBaseUrl = connection.url;
+          // As in v1, requests go straight to the engine: OpenWork upkeep
+          // (provider mirroring, MCP registration) runs when configuration
+          // changes, and never holds reads. A folder's upkeep starts in the
+          // background the first time it is seen.
+          engineV2Preview.warmWorkspace(workspace.id, workspace.path);
+          if (needsV2ProviderCatalog(request.method, mount.restPath)) {
+            // For ~200 ms a folder the engine has not loaded omits configured
+            // providers from its catalog; v1's engine waits for its own folder
+            // setup instead. Bounded and never fails the request.
+            await engineV2Preview.ensureWorkspaceReady(workspace.path);
+          }
+          const send = () => proxyOpencodeV2Request({
+            config,
+            request,
+            url,
+            workspace,
+            proxyPath: mount.restPath,
+            connection,
+            // A turn uses the connections that are ready; MCP upkeep runs in
+            // the background and the engine adds tools as connections finish.
+            prepareExecution: async (directory) => {
+              engineV2Preview.warmWorkspace(workspace.id, directory);
+              await engineV2Preview.ensureWorkspaceReady(directory);
+            },
+            // The desktop's silent re-auth sends v1's connect route; restart
+            // that one connection through the folder's reconciler instead.
+            reconnectMcp: (directory, name) => engineV2Preview.syncWorkspaceMcp(workspace.id, directory, { reconnect: [name] }),
+            actor,
+            recoverySignal: taskRecovery?.owns(request) ? request.signal : undefined,
+          });
+          const response = taskRecovery ? await taskRecovery.forward(workspace, "v2", mount.restPath, request, send) : await send();
+          return finalizeProxyResponse(response);
+        } catch (error) {
+          const requestCanceled = isExpectedRequestCancellation(error, request.signal);
+          if (!(error instanceof ApiError) && !requestCanceled) {
+            recordUnhandledErrorCause(error);
+            captureServerException(error, { method: request.method, route: "/workspace/:id/opencode2/*", requestSignal: request.signal });
           }
           const apiError = error instanceof ApiError
             ? error
@@ -1087,6 +1028,11 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
       const canonicalOpencodeMount = parseWorkspaceOpencodeMount(url.pathname);
       if (canonicalOpencodeMount) {
         return proxyWorkspaceOpencodeMount(canonicalOpencodeMount);
+      }
+
+      const canonicalOpencodeV2Mount = parseWorkspaceOpencodeV2Mount(url.pathname);
+      if (canonicalOpencodeV2Mount) {
+        return proxyWorkspaceOpencodeV2Mount(canonicalOpencodeV2Mount);
       }
 
       const mount = parseWorkspaceMount(url.pathname);
@@ -1117,12 +1063,22 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
         try {
           const actor = await requireClient(request, config, tokens);
           assertOpencodeProxyAllowed(actor, request.method, url.pathname);
+          await validateEngineRequestBody(request);
+          await managedDesktopPolicy(config).assertRequest(request, url.pathname, true);
           proxyService = "opencode";
-          const response = await proxyOpencodeRequest({ config, request, url, workspace: config.workspaces[0] });
-          return finalize(response);
+          const workspace = config.workspaces[0];
+          const ownership = workspace
+            ? assertWorkspaceOwnsProxiedSessionRead(config, workspace, request.method, url.pathname, false,
+              request.method === "GET" || request.method === "HEAD" ? request.signal : undefined)
+            : Promise.resolve();
+          const send = () => proxyOpencodeRequest({ config, request, url, workspace });
+          const response = await sendWithOwnershipProof(ownership,
+            () => taskRecovery && workspace ? taskRecovery.forward(workspace, "v1", url.pathname, request, send) : send());
+          return finalizeProxyResponse(response);
         } catch (error) {
           const requestCanceled = isExpectedRequestCancellation(error, request.signal);
           if (!(error instanceof ApiError) && !requestCanceled) {
+            recordUnhandledErrorCause(error);
             captureServerException(error, { method: request.method, route: "/opencode/*", requestSignal: request.signal });
           }
           const apiError = error instanceof ApiError
@@ -1150,15 +1106,17 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
             ? requireHostToken(request, config)
             : route.auth === "host"
               ? await requireHost(request, config, tokens)
-              : route.auth === "client"
+              : route.auth === "client" || (route.auth === "policy" && !managedDesktopPolicy(config).authenticatesEvaluation(request))
                 ? await requireClient(request, config, tokens)
                 : undefined;
+        await managedDesktopPolicy(config).assertRequest(request, url.pathname);
         const response = await route.handler({
           request,
           url,
           params: route.params,
           config,
           approvals,
+          uiControl,
           reloadEvents,
           tokens,
           actor,
@@ -1199,13 +1157,22 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
 
   let server: ServeResult;
   try {
+    if (config.resumeInterruptedTasks && !config.readOnly) {
+      taskRecovery = await createTaskRecovery(config, async (request) => serverOptions.fetch(request),
+        () => managedDesktopPolicy(config).assert("sync"));
+      setTaskRecovery(config, taskRecovery);
+    }
     server = await serve({
       ...serverOptions,
       idleTimeout: 120,
     });
   } catch (error) {
+    await taskRecovery?.stop().catch(() => undefined);
     captureServerException(error, { method: "START", route: "startServer" });
     cloudProviderSync.stop();
+    await engineV2Preview.stop().catch(() => undefined);
+    engineInstanceReaper.close();
+    clearEngineInstanceReaperForConfig(config);
     invalidateEngineMcpServerState(config, engineMcpServerState);
     watcherHandle.close();
     reloadBaselineRefreshers.delete(config);
@@ -1222,22 +1189,64 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
       });
     }
   }
+  // Policy hooks must receive the listener that actually bound, including
+  // ephemeral ports and retries after a port collision.
+  engineV2Preview.start();
 
   // Deliver server-managed provider credentials to the engine on startup. The
   // engine process receives a fixed env allowlist, so credentials materialized
-  // into the env store only reach it through the engine's auth API. Fire and
-  // forget: a credential problem must never stop the server from serving.
+  // into the env store only reach it through the engine's auth API. A delivered
+  // credential also invalidates any SDK client the engine cached before auth
+  // arrived; the sync coordinator lands that reload without interrupting a
+  // live session.
   resetManagedProviderAuthCache();
-  void syncManagedProviderAuth({ config, env, logger: toManagedProviderAuthLogger(logger) }).catch(() => undefined);
+  if (!options.deferManagedEngineStartup) {
+    void syncManagedProviderAuth({ config, env, logger: toManagedProviderAuthLogger(logger) })
+      .then((result) => {
+        if (result.delivered.length > 0 || result.removed.length > 0) {
+          cloudProviderSync.markReloadPending();
+        }
+      })
+      .catch(() => undefined);
+  }
+
+  engineInstanceReaper.start();
 
   return {
     ...server,
+    completeManagedEngineStartup: async () => {
+      if (managedEngineReady) return;
+      const pool = enginePoolForConfig(config);
+      const primary = pool?.connections().find((connection) => connection.role === "primary");
+      if (stopped || !pool || !primary || !pool.primaryProcess()?.isAlive()) {
+        throw new Error("Managed engine startup requires a live registered primary");
+      }
+      // Seed the fresh primary before readiness, so there are no serving SDK
+      // clients to invalidate and no startup-only rollover to schedule.
+      const result = await syncManagedProviderAuth({ config, env, logger: toManagedProviderAuthLogger(logger) });
+      if (result.failed.length > 0) {
+        throw new Error("Managed provider auth delivery failed during startup");
+      }
+      if (stopped || enginePoolForConfig(config) !== pool || !pool.primaryProcess()?.isAlive()
+        || pool.connections().find((connection) => connection.role === "primary")?.generationId !== primary.generationId) {
+        throw new Error("Managed engine primary changed during startup");
+      }
+      managedEngineReady = true;
+    },
     stop: async () => {
+      stopped = true;
+      let recoveryError: unknown;
+      try { await taskRecovery?.stop(); } catch (error) { recoveryError = error; }
+      managedDesktopPolicy(config).onChange = undefined;
       cloudProviderSync.stop();
+      await engineV2Preview.stop().catch(() => undefined);
+      engineInstanceReaper.close();
+      clearEngineInstanceReaperForConfig(config);
       invalidateEngineMcpServerState(config, engineMcpServerState);
       watcherHandle.close();
       reloadBaselineRefreshers.delete(config);
       await server.stop();
+      if (recoveryError) throw recoveryError;
     },
   };
 }
@@ -1248,6 +1257,342 @@ function buildOpencodeProxyUrl(baseUrl: string, path: string, search: string) {
   target.pathname = trimmedPath.startsWith("/") ? trimmedPath : `/${trimmedPath}`;
   target.search = search;
   return target.toString();
+}
+
+export async function proxyOpencodeV2Request(input: {
+  actor: Actor;
+  config: ServerConfig;
+  request: Request;
+  url: URL;
+  workspace: WorkspaceInfo;
+  proxyPath: string;
+  connection: { url: string; username: string; password: string };
+  /** Bounded upkeep for the folder a prompt runs in; throws only when execution must not proceed. */
+  prepareExecution?: (directory: string) => Promise<void>;
+  /** Restart one connection that is not healthy (v1's `POST /mcp/:name/connect`). */
+  reconnectMcp?: (directory: string, name: string) => Promise<void>;
+  recoverySignal?: AbortSignal;
+}): Promise<Response> {
+  const method = input.request.method.toUpperCase();
+  const readRequest = method === "GET" || method === "HEAD";
+  const signal = readRequest
+    ? input.recoverySignal ? AbortSignal.any([input.request.signal, input.recoverySignal]) : input.request.signal
+    : input.recoverySignal;
+  if (readRequest) signal?.throwIfAborted();
+  if (method !== "GET" && method !== "HEAD") ensureWritable(input.config);
+
+  const withoutPrefix = input.proxyPath.slice("/opencode2".length);
+  const forwardedPath = withoutPrefix || "/";
+  // Runtime provider configuration contains server-owned credentials. The
+  // renderer uses the catalog/status APIs; it must not read or mutate this file.
+  if (/^\/api\/config(?:\/|$)/.test(decodeURIComponent(forwardedPath))) {
+    throw new ApiError(403, "engine_config_private", "Engine configuration is private");
+  }
+  if (method !== "GET" && method !== "HEAD" && /^\/api\/mcp(?:\/|$)/.test(decodeURIComponent(forwardedPath))) {
+    throw new ApiError(403, "engine_mcp_managed", "Manage connections through OpenWork");
+  }
+  const v1Connect = method === "POST" ? /^\/mcp\/([^/]+)\/connect$/.exec(forwardedPath) : null;
+  if (v1Connect?.[1] && input.reconnectMcp) {
+    // v2 has no such route (405); OpenWork owns connection restarts.
+    await input.reconnectMcp(input.workspace.path, decodeURIComponent(v1Connect[1]));
+    return Response.json(true);
+  }
+  const target = new URL(input.connection.url);
+  target.pathname = forwardedPath;
+  target.search = input.url.search;
+  if (forwardedPath.startsWith("/api/")) {
+    for (const key of [...target.searchParams.keys()]) {
+      if (key === "location" || key.startsWith("location[")) target.searchParams.delete(key);
+    }
+    target.searchParams.set("location[directory]", input.workspace.path);
+  }
+
+  const headers = new Headers(input.request.headers);
+  headers.delete("authorization");
+  headers.delete("x-openwork-host-token");
+  headers.delete("x-openwork-client-id");
+  headers.delete("host");
+  headers.delete("origin");
+  headers.set("authorization", `Basic ${Buffer.from(`opencode:${input.connection.password}`).toString("base64")}`);
+
+  const readNative = async (path: string): Promise<unknown> => {
+    const url = new URL(path, input.connection.url);
+    url.searchParams.set("location[directory]", input.workspace.path);
+    const result = await loopbackFetch(url.toString(), {
+      headers: { authorization: headers.get("authorization") ?? "" },
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
+    });
+    if (!result.ok) throw new ApiError(result.status, "session_unavailable", "Conversation could not be read");
+    return result.json();
+  };
+  const homes = createV2SessionHomes(input.config, readNative);
+  const expectedHome = await homes.canonical(input.workspace.path);
+  const sessionMatch = forwardedPath.match(/^\/api\/session\/([^/]+)(?:\/|$)/);
+  const sessionId = sessionMatch?.[1] ? decodeURIComponent(sessionMatch[1]) : null;
+  let executionDirectory = input.workspace.path;
+  // Authorization follows the persistent home, not the agent's mutable CWD.
+  // The actual native location still controls execution and tool discovery.
+  if (sessionId?.startsWith("ses_")) {
+    const session = await readNative(`/api/session/${encodeURIComponent(sessionId)}`);
+    if (await homes.resolve(session) !== expectedHome) {
+      throw new ApiError(404, "session_not_found", "Session not found");
+    }
+    executionDirectory = nativeSessionDirectory(session) ?? input.workspace.path;
+    target.searchParams.set("location[directory]", executionDirectory);
+  }
+
+  if (method !== "GET" && method !== "HEAD"
+    && decodeURIComponent(forwardedPath).endsWith(`/instructions/entries/${OPENWORK_V2_INSTRUCTION_KEY}`)) {
+    throw new ApiError(403, "engine_instructions_managed", "OpenWork instructions are managed by the server");
+  }
+
+  if (method === "POST" && sessionId && /^\/api\/session\/[^/]+\/(?:prompt|command|generate)$/.test(forwardedPath)) {
+    await input.prepareExecution?.(executionDirectory);
+    // Session ownership was verified above. Replace one native instruction
+    // entry immediately before admission; never append to conversation text.
+    const mcpUrl = new URL(target);
+    mcpUrl.pathname = "/api/mcp";
+    const internalHeaders = new Headers({ authorization: headers.get("authorization") ?? "", "content-type": "application/json" });
+    const mcpResponse = await loopbackFetch(mcpUrl.toString(), { headers: internalHeaders, signal: AbortSignal.timeout(10_000) });
+    const mcpPayload: unknown = mcpResponse.ok ? await mcpResponse.json() : null;
+    const connectReady = isRecord(mcpPayload) && Array.isArray(mcpPayload.data) && mcpPayload.data.some((entry) =>
+      isRecord(entry) && entry.name === "openwork-cloud" && isRecord(entry.status) && entry.status.status === "connected");
+    // Keep organization skill discovery on demand through Connect. The full
+    // catalog can exceed the engine's instruction-entry request limit.
+    const value = buildOpenWorkV2Instructions(connectReady);
+    const instructionUrl = new URL(target);
+    instructionUrl.pathname = `/api/session/${encodeURIComponent(sessionId)}/instructions/entries/${OPENWORK_V2_INSTRUCTION_KEY}`;
+    const synced = await loopbackFetch(instructionUrl.toString(), {
+      method: "PUT", headers: internalHeaders, body: JSON.stringify({ value }), signal: AbortSignal.timeout(15_000),
+    });
+    if (!synced.ok) throw new ApiError(502, "engine_instruction_sync_failed", "OpenWork instructions could not be updated");
+  }
+
+  const requestBody = method === "GET" || method === "HEAD"
+    ? undefined
+    : await input.request.arrayBuffer().then((buffer) => buffer.byteLength > 0 ? buffer : undefined);
+  let body: string | ArrayBuffer | undefined = requestBody;
+  if (method === "POST" && forwardedPath === "/api/session") {
+    let sessionInput: unknown = {};
+    if (requestBody) {
+      try {
+        sessionInput = JSON.parse(new TextDecoder().decode(requestBody));
+      } catch {
+        throw new ApiError(400, "invalid_body", "Expected a JSON object");
+      }
+    }
+    if (!isRecord(sessionInput)) throw new ApiError(400, "invalid_body", "Expected a JSON object");
+    // Unlike reads, v2 session creation binds its location from the body.
+    body = JSON.stringify({ ...sessionInput, location: { directory: input.workspace.path } });
+    headers.delete("content-length");
+    headers.set("content-type", "application/json");
+  }
+  const response = await loopbackFetch(target.toString(), { method, headers, body, signal });
+  if (method === "GET" && /^\/api\/skill(?:\/|$)/.test(decodeURIComponent(forwardedPath))
+    && input.actor.scope !== "owner" && response.ok) {
+    // A shared client token is not authorization to bulk-read the owner's Cloud
+    // instructions. Keep metadata for selection, just like the Connect catalog;
+    // bodies and private materialization paths stay on the owner/engine side.
+    // Internal watcher/admission reads above deliberately do not use this projection.
+    const payload: unknown = await response.json();
+    const raw = isRecord(payload) && "data" in payload ? payload.data : payload;
+    const publicSkill = (value: unknown) => {
+      if (!isRecord(value) || typeof value.id !== "string") {
+        throw new ApiError(502, "invalid_engine_response", "Invalid skill metadata");
+      }
+      if (!value.id.startsWith("openwork-cloud-")) return value;
+      return Object.fromEntries(Object.entries(value).filter(([key]) => ["id", "name", "description", "slash"].includes(key)));
+    };
+    return jsonResponse({ data: Array.isArray(raw) ? raw.map(publicSkill) : publicSkill(raw) });
+  }
+  if (method === "GET" && /^\/api\/provider(?:\/|$)/.test(decodeURIComponent(forwardedPath)) && response.ok) {
+    // Provider.Info includes request settings/headers, which may contain the
+    // mirrored server-owned key. Clients only need public catalog metadata.
+    const payload: unknown = await response.json();
+    const raw = isRecord(payload) && "data" in payload ? payload.data : payload;
+    const publicProvider = (value: unknown) => {
+      if (!isRecord(value) || typeof value.id !== "string" || typeof value.name !== "string") {
+        throw new ApiError(502, "invalid_engine_response", "Invalid provider metadata");
+      }
+      return { id: value.id, name: value.name };
+    };
+    const data = Array.isArray(raw) ? raw.map(publicProvider) : publicProvider(raw);
+    return jsonResponse({ data });
+  }
+  if (method === "GET" && /^\/api\/model(?:\/|$)/.test(decodeURIComponent(forwardedPath)) && response.ok) {
+    // Model overrides and variants can carry credentials too. Keep only the
+    // metadata needed for selection; request settings remain inside the engine.
+    const payload: unknown = await response.json();
+    const raw = isRecord(payload) && "data" in payload ? payload.data : payload;
+    const publicModel = (value: unknown) => {
+      if (value === null) return null;
+      if (!isRecord(value) || typeof value.id !== "string" || typeof value.providerID !== "string") {
+        throw new ApiError(502, "invalid_engine_response", "Invalid model metadata");
+      }
+      const metadata = Object.fromEntries(Object.entries(value).filter(([key]) => [
+        "id", "modelID", "providerID", "canonical", "family", "name", "package",
+        "capabilities", "time", "cost", "status", "enabled", "limit",
+      ].includes(key)));
+      // The picker needs opaque variant IDs, never their provider settings.
+      const variants = (Array.isArray(value.variants) ? value.variants : []).flatMap((variant) =>
+        isRecord(variant) && typeof variant.id === "string" ? [{ id: variant.id }] : []);
+      return { ...metadata, variants };
+    };
+    return jsonResponse({ data: Array.isArray(raw) ? raw.map(publicModel) : publicModel(raw) });
+  }
+  if (method === "GET" && /^\/api\/event\/*$/.test(decodeURIComponent(forwardedPath)) && response.ok && response.body) {
+    const frames = new BoundedSseFrameBuffer();
+    const encoder = new TextEncoder();
+    const scopedBody = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(": connected\n\n"));
+      },
+      async transform(chunk, controller) {
+        const parsed = frames.push(chunk);
+        if (parsed.overflow) throw new Error("OpenCode v2 event frame exceeded the size limit");
+        for (const frame of parsed.frames) {
+          let scopedFrame = frame;
+          let payload = parseSsePayload(frame);
+          if (typeof payload === "string") {
+            try { payload = JSON.parse(payload); } catch { continue; }
+          }
+          const eventData = isRecord(payload) && isRecord(payload.data) ? payload.data : null;
+          // Native form.created carries ownership inside the form, unlike
+          // form.replied/cancelled and the ordinary session events.
+          const eventOwner = isRecord(payload) && payload.type === "form.created" && isRecord(eventData?.form)
+            ? eventData.form : eventData;
+          const eventSessionId = eventOwner && typeof eventOwner.sessionID === "string" ? eventOwner.sessionID : null;
+          if (isRecord(payload) && eventSessionId?.startsWith("ses_")) {
+            let home = await homes.stored(eventSessionId);
+            if (payload.type === "session.created" && eventData && isRecord(eventData.location)
+              && typeof eventData.location.directory === "string") {
+              const parent = typeof eventData.parentID === "string"
+                ? await homes.resolve(await readNative(`/api/session/${encodeURIComponent(eventData.parentID)}`)) : null;
+              home = await homes.created(eventSessionId, parent ?? eventData.location.directory);
+            }
+            if (!home && payload.type !== "session.deleted") {
+              try { home = await homes.resolve(await readNative(`/api/session/${encodeURIComponent(eventSessionId)}`)); }
+              catch (error) {
+                // A late event for an already-deleted unknown session must not
+                // disconnect all other conversations in this workspace.
+                if (error instanceof ApiError && error.status === 404) continue;
+                throw error;
+              }
+            }
+            if (home !== expectedHome) continue;
+            // The compatibility stream is scoped to the UI home. Preserve the
+            // native directory separately; the move's data remains untouched.
+            payload = { ...payload, data: { ...eventData, openworkHomeDirectory: home },
+              openworkWorkingLocation: payload.location,
+              location: { directory: input.workspace.path } };
+            scopedFrame = `data: ${JSON.stringify(payload)}`;
+          } else {
+            const location = isRecord(payload) && isRecord(payload.location) ? payload.location : null;
+            const directory = location && typeof location.directory === "string" ? location.directory : null;
+            if (!directory || await homes.canonical(directory) !== expectedHome) continue;
+          }
+          controller.enqueue(encoder.encode(`${scopedFrame}\n\n`));
+        }
+      },
+    }));
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.delete("content-length");
+    responseHeaders.delete("content-encoding");
+    return sanitizeProxyResponse(new Response(scopedBody, { status: response.status, headers: responseHeaders }));
+  }
+  const pendingKind = forwardedPath.match(/^\/api\/(form|permission)\/request\/?$/)?.[1];
+  if (method === "GET" && pendingKind && response.ok) {
+    // Native pending lists belong to an execution location. The sidebar belongs
+    // to conversation homes, so include moved sessions through their native
+    // session-scoped lists and exclude other homes now working in this folder.
+    const payload: unknown = await response.json();
+    if (!isRecord(payload) || !Array.isArray(payload.data)) {
+      throw new ApiError(502, "invalid_engine_response", "Invalid pending request list");
+    }
+    const owned = new Set<string>();
+    const moved = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const query = new URLSearchParams({ limit: "200", ...(cursor ? { cursor } : {}) });
+      const page = await readNative(`/api/session?${query}`);
+      if (!isRecord(page) || !Array.isArray(page.data)) {
+        throw new ApiError(502, "invalid_engine_response", "Invalid session list response");
+      }
+      for (const value of page.data) {
+        const session = nativeSession(value);
+        if (typeof session?.id !== "string" || await homes.resolve(value) !== expectedHome) continue;
+        owned.add(session.id);
+        const directory = nativeSessionDirectory(value);
+        if (directory && await homes.canonical(directory) !== expectedHome) moved.add(session.id);
+      }
+      const next = isRecord(page.cursor) ? page.cursor.next : undefined;
+      if (!page.data.length || next === undefined || next === null) break;
+      if (typeof next !== "string" || cursors.has(next)) {
+        throw new ApiError(502, "invalid_engine_response", "Invalid session list cursor");
+      }
+      cursors.add(next);
+      cursor = next;
+    } while (cursor);
+    const pending = new Map<string, unknown>();
+    const include = (items: unknown[], sessionId?: string) => {
+      for (const item of items) {
+        if (!isRecord(item) || typeof item.id !== "string" || typeof item.sessionID !== "string") continue;
+        if (sessionId ? item.sessionID !== sessionId : item.sessionID !== "global" && !owned.has(item.sessionID)) continue;
+        pending.set(item.id, item);
+      }
+    };
+    include(payload.data);
+    for (const id of moved) {
+      let result: unknown;
+      try { result = await readNative(`/api/session/${encodeURIComponent(id)}/${pendingKind}`); }
+      catch (error) {
+        if (error instanceof ApiError && error.status === 404) continue; // Deleted while listing.
+        throw error;
+      }
+      if (!isRecord(result) || !Array.isArray(result.data)) {
+        throw new ApiError(502, "invalid_engine_response", "Invalid session pending requests");
+      }
+      include(result.data, id);
+    }
+    return jsonResponse({ ...payload, data: [...pending.values()] });
+  }
+  if (method === "GET" && forwardedPath === "/api/session" && response.ok) {
+    const payload: unknown = await response.json();
+    const data = isRecord(payload) && "data" in payload ? payload.data : payload;
+    const items = Array.isArray(data) ? data : isRecord(data) && Array.isArray(data.items) ? data.items : null;
+    if (!items) throw new ApiError(502, "invalid_engine_response", "Invalid session list response");
+    const scoped = (await Promise.all(items.map(async (item: unknown) =>
+      await homes.resolve(item) === expectedHome ? homes.project(item) : null,
+    ))).filter((item) => item !== null);
+    signal?.throwIfAborted();
+    const scopedData = isRecord(data) ? { ...data, items: scoped } : scoped;
+    const scopedPayload = isRecord(payload) && "data" in payload ? { ...payload, data: scopedData } : scopedData;
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.delete("content-length");
+    responseHeaders.delete("content-encoding");
+    return sanitizeProxyResponse(new Response(JSON.stringify(scopedPayload), { status: response.status, headers: responseHeaders }));
+  }
+  if (response.ok && method === "GET" && forwardedPath === "/api/session/active") {
+    const payload: unknown = await response.json();
+    const data = isRecord(payload) && isRecord(payload.data) ? payload.data : {};
+    const entries = await Promise.all(Object.entries(data).map(async ([id, status]) => {
+      const home = await homes.stored(id) ?? await homes.resolve(await readNative(`/api/session/${encodeURIComponent(id)}`));
+      return home === expectedHome ? [id, status] : null;
+    }));
+    return jsonResponse({ data: Object.fromEntries(entries.filter(entry => entry !== null)) });
+  }
+  if (response.ok && ((method === "GET" && forwardedPath === `/api/session/${sessionId}`)
+    || (method === "POST" && (forwardedPath === "/api/session" || forwardedPath.endsWith("/fork"))))) {
+    const payload: unknown = await response.json();
+    const session = nativeSession(payload);
+    if (method === "POST" && typeof session?.id === "string") await homes.created(session.id, expectedHome);
+    const data = isRecord(payload) && "data" in payload ? payload.data : payload;
+    return jsonResponse({ data: await homes.project(data) });
+  }
+  // Keep the home after deletion so a delayed session.deleted event still
+  // reaches its subscribers. Successful creation replaces a reused ID's home.
+  return sanitizeProxyResponse(response);
 }
 
 function opencodeUnreachableError(error: unknown, path: string): ApiError {
@@ -1264,6 +1609,29 @@ function agentDiagnosticsTimeoutMs(): number {
 
 function buildOpencodeDirectoryHeader(directory: string) {
   return /[^\x00-\x7F]/.test(directory) ? encodeURIComponent(directory) : directory;
+}
+
+export function scopeWorkspaceOpencodeRequest(
+  headers: Headers,
+  search: string,
+  directory: string | null,
+): { headers: Headers; search: string } {
+  const scopedHeaders = new Headers(headers);
+  scopedHeaders.delete("x-opencode-directory");
+
+  const searchParams = new URLSearchParams(search);
+  searchParams.delete("directory");
+
+  if (directory) {
+    scopedHeaders.set("x-opencode-directory", buildOpencodeDirectoryHeader(directory));
+    searchParams.set("directory", directory);
+  }
+
+  const scopedSearch = searchParams.toString();
+  return {
+    headers: scopedHeaders,
+    search: scopedSearch ? `?${scopedSearch}` : "",
+  };
 }
 
 function createOpencodeDirectoryFetch(directory: string, fetchImpl: typeof fetch = globalThis.fetch): typeof fetch {
@@ -1304,6 +1672,7 @@ export function createWorkspaceOpencodeClient(
     });
   }
   const directory = resolveOpencodeDirectory(workspace);
+  touchEngineWorkspaceInstance(config, workspace, baseUrl);
   const baseFetch = directory ? createOpencodeDirectoryFetch(directory) : globalThis.fetch;
   const clientFetch = options?.boundedDiagnosticsReads
     ? createAgentDiagnosticsEngineFetch(baseFetch)
@@ -1337,16 +1706,36 @@ export function unwrapOpencodeResult<T, E>(result: OpencodeClientResult<T, E>, p
   });
 }
 
+async function validateEngineRequestBody(request: Request): Promise<void> {
+  if (["GET", "HEAD", "OPTIONS"].includes(request.method) || !request.body) return;
+  const text = await request.clone().text();
+  if (!text.trim()) return;
+  try { JSON.parse(text); }
+  catch { throw new ApiError(400, "invalid_request", "Expected a JSON request body."); }
+}
+
 export async function proxyOpencodeRequest(input: {
   config: ServerConfig;
   request: Request;
   url: URL;
   workspace?: WorkspaceInfo;
   proxyPath?: string;
+  recoverySignal?: AbortSignal;
 }) {
   const workspace = input.workspace;
   const proxyPath = input.proxyPath ?? input.url.pathname;
   const method = input.request.method.toUpperCase();
+  const readRequest = method === "GET" || method === "HEAD";
+  const signal = readRequest
+    ? input.recoverySignal ? AbortSignal.any([input.request.signal, input.recoverySignal]) : input.request.signal
+    : input.recoverySignal;
+  if (readRequest) signal?.throwIfAborted();
+  // The wrapper routes enforced the server read-only mode via ensureWritable;
+  // native proxy writes must honor the same guard so a read-only server never
+  // forwards mutations to the engine.
+  if (method !== "GET" && method !== "HEAD") {
+    ensureWritable(input.config);
+  }
   const pool = workspace?.workspaceType === "remote" ? null : enginePoolForConfig(input.config);
   const route = pool?.routeRequest(method, proxyPath) ?? null;
   const baseUrl = route?.target.baseUrl ??
@@ -1355,7 +1744,7 @@ export async function proxyOpencodeRequest(input: {
     throw new ApiError(400, "opencode_unconfigured", "OpenCode base URL is missing for this workspace");
   }
 
-  const headers = new Headers(input.request.headers);
+  let headers = new Headers(input.request.headers);
   headers.delete("authorization");
   headers.delete("x-openwork-host-token");
   headers.delete("x-openwork-client-id");
@@ -1363,8 +1752,11 @@ export async function proxyOpencodeRequest(input: {
   headers.delete("origin");
 
   const directory = workspace ? resolveOpencodeDirectory(workspace) : null;
-  if (directory && !headers.has("x-opencode-directory")) {
-    headers.set("x-opencode-directory", buildOpencodeDirectoryHeader(directory));
+  let search = input.url.search;
+  if (workspace) {
+    const scoped = scopeWorkspaceOpencodeRequest(headers, search, directory);
+    headers = scoped.headers;
+    search = scoped.search;
   }
 
   const auth = route
@@ -1374,6 +1766,8 @@ export async function proxyOpencodeRequest(input: {
     headers.set("Authorization", auth);
   }
 
+  if (workspace) touchEngineWorkspaceInstance(input.config, workspace, baseUrl);
+
   // Buffer the request body so it can be forwarded reliably across Node.js
   // stream boundaries (Readable.toWeb streams from the HTTP adapter aren't
   // always accepted directly by Node's global fetch as a body).
@@ -1381,35 +1775,75 @@ export async function proxyOpencodeRequest(input: {
     ? undefined
     : await input.request.arrayBuffer().then((buf) => (buf.byteLength > 0 ? buf : undefined));
   if (pool && method === "GET" && isEngineEventPath(proxyPath)) {
-    return proxyEngineEventStreams({
-      pool,
-      connections: pool.connections(),
-      proxyPath,
-      search: input.url.search,
-      headers,
-      clientSignal: input.request.signal,
-    });
+    // An open engine event stream means this workspace is visible somewhere in
+    // the UI; hold its instance so the idle reaper leaves it alone until the
+    // stream's client goes away.
+    const releaseStreamHold = workspace && workspace.workspaceType !== "remote" && directory
+      ? engineInstanceReaperForConfig(input.config)?.holdStream({
+          directory,
+          workspaceId: workspace.id,
+          engineBaseUrl: baseUrl,
+        }) ?? null
+      : null;
+    if (releaseStreamHold) {
+      if (input.request.signal.aborted) releaseStreamHold();
+      else input.request.signal.addEventListener("abort", releaseStreamHold, { once: true });
+    }
+    try {
+      const response = await proxyEngineEventStreams({
+        pool,
+        connections: pool.connections(),
+        proxyPath,
+        search,
+        headers,
+        clientSignal: input.request.signal,
+      });
+      // A non-stream response completes immediately; holding it would leak
+      // across every client retry.
+      if (releaseStreamHold && (!response.ok || !response.body)) releaseStreamHold();
+      return response;
+    } catch (error) {
+      releaseStreamHold?.();
+      throw error;
+    }
   }
   if (pool && method === "GET" && engineAggregateKind(proxyPath)) {
     return proxyEngineAggregateRead({
+      pool,
       connections: pool.connections(),
       proxyPath,
-      search: input.url.search,
+      search,
       headers,
       kind: engineAggregateKind(proxyPath) ?? "pending",
     });
   }
-  const targetUrl = buildOpencodeProxyUrl(baseUrl, proxyPath, input.url.search);
+  const targetUrl = buildOpencodeProxyUrl(baseUrl, proxyPath, search);
   // Managed OpenCode proxy traffic is loopback/engine I/O; keep streaming on Node fetch.
   if (isSessionCommandProxyRequest(method, proxyPath)) {
+    const commandAdmission = commandAdmissionFromBody(body);
+    if (commandAdmission) {
+      const admissionTarget = workspace ? `workspace\0${workspace.id}` : `engine\0${baseUrl}`;
+      const admission = admitSessionCommand(
+        input.config,
+        `${admissionTarget}\0${normalizeOpencodeProxyPath(proxyPath)}`,
+        commandAdmission,
+      );
+      if (admission === "duplicate") return jsonResponse({ ok: true, accepted: true });
+      if (admission === "conflict") {
+        return jsonResponse({
+          code: "command_admission_conflict",
+          message: "This command message ID was already admitted with different input",
+        }, 409);
+      }
+    }
     void loopbackFetch(targetUrl, {
       method,
       headers,
       body,
     }).then(() => {
-      managedEnginePoolForConfig(input.config)?.reportRequestSuccess(baseUrl);
+      enginePoolForConfig(input.config)?.reportRequestSuccess(baseUrl);
     }).catch((error: unknown) => {
-      if (workspace) managedEnginePoolForConfig(input.config)?.reportRequestFailure(baseUrl, error, workspace);
+      if (workspace) enginePoolForConfig(input.config)?.reportRequestFailure(baseUrl, error, workspace);
       // Command failures are surfaced through the OpenCode event stream.
     });
     return jsonResponse({ ok: true, accepted: true });
@@ -1417,10 +1851,11 @@ export async function proxyOpencodeRequest(input: {
   const forward = async () => {
     let response: Response;
     try {
-      response = await loopbackFetch(targetUrl, { method, headers, body });
-      managedEnginePoolForConfig(input.config)?.reportRequestSuccess(baseUrl);
+      response = await loopbackFetch(targetUrl, { method, headers, body, signal });
+      enginePoolForConfig(input.config)?.reportRequestSuccess(baseUrl);
     } catch (error) {
-      if (workspace) managedEnginePoolForConfig(input.config)?.reportRequestFailure(baseUrl, error, workspace);
+      if (readRequest && isExpectedRequestCancellation(error, signal)) throw error;
+      if (workspace) enginePoolForConfig(input.config)?.reportRequestFailure(baseUrl, error, workspace);
       if (isEngineConnectionFailure(error)) throw opencodeUnreachableError(error, proxyPath);
       throw error;
     }
@@ -1430,11 +1865,12 @@ export async function proxyOpencodeRequest(input: {
       let fallbackResponse: Response;
       try {
         fallbackResponse = await loopbackFetch(
-          buildOpencodeProxyUrl(route.fallback.baseUrl, proxyPath, input.url.search),
-          { method, headers: fallbackHeaders, body },
+          buildOpencodeProxyUrl(route.fallback.baseUrl, proxyPath, search),
+          { method, headers: fallbackHeaders, body, signal },
         );
       } catch (error) {
-        if (workspace) managedEnginePoolForConfig(input.config)?.reportRequestFailure(route.fallback.baseUrl, error, workspace);
+        if (readRequest && isExpectedRequestCancellation(error, signal)) throw error;
+        if (workspace) enginePoolForConfig(input.config)?.reportRequestFailure(route.fallback.baseUrl, error, workspace);
         if (isEngineConnectionFailure(error)) throw opencodeUnreachableError(error, proxyPath);
         throw error;
       }
@@ -1444,9 +1880,6 @@ export async function proxyOpencodeRequest(input: {
     return sanitizeProxyResponse(response);
   };
 
-  if (workspace && workspace.workspaceType !== "remote" && !pool && isPromptAsyncProxyRequest(method, proxyPath)) {
-    return withEngineDirectoryFence(input.config, workspace, forward);
-  }
   return forward();
 }
 
@@ -1490,6 +1923,7 @@ function pendingItemIdentity(value: unknown): string {
 }
 
 async function proxyEngineAggregateRead(input: {
+  pool: EnginePool;
   connections: EnginePoolConnection[];
   proxyPath: string;
   search: string;
@@ -1521,6 +1955,9 @@ async function proxyEngineAggregateRead(input: {
     return jsonResponse(merged);
   }
 
+  for (const result of results) {
+    input.pool.observePendingRequests(result.connection.generationId, result.payload);
+  }
   const seen = new Set<string>();
   const items: unknown[] = [];
   let containerKey: string | null = null;
@@ -1567,44 +2004,70 @@ function mergedEventBody(input: {
     start(controller) {
       let active = readers.length;
       let closed = false;
-      const finish = () => {
-        active -= 1;
-        if (active > 0 || closed || cancelled) return;
+      const close = () => {
+        if (closed) return;
         closed = true;
         if (pingTimer) clearInterval(pingTimer);
+        input.lease.signal.removeEventListener("abort", abort);
         input.lease.release();
         controller.close();
       };
+      const abort = () => {
+        if (closed || cancelled) return;
+        cancelled = true;
+        for (const entry of readers) void entry.reader.cancel(input.lease.signal.reason).catch(() => undefined);
+        close();
+      };
+      const finish = () => {
+        active -= 1;
+        if (active > 0 || closed || cancelled) return;
+        close();
+      };
       const pump = async (entry: typeof readers[number]) => {
-        const decoder = new TextDecoder();
-        let buffered = "";
+        const frameBuffer = new BoundedSseFrameBuffer();
         try {
           while (!cancelled) {
             const chunk = await entry.reader.read();
             if (chunk.done) break;
-            buffered += decoder.decode(chunk.value, { stream: true });
-            while (true) {
-              const delimiter = buffered.match(/\r?\n\r?\n/);
-              if (!delimiter || delimiter.index === undefined) break;
-              const frame = buffered.slice(0, delimiter.index);
-              buffered = buffered.slice(delimiter.index + delimiter[0].length);
-              if (input.pool.shouldForwardEvent(entry.connection.generationId, parseSsePayload(frame))) {
-                controller.enqueue(encoder.encode(`${frame}\n\n`));
+            const parsed = frameBuffer.push(chunk.value);
+            if (parsed.frames.length > 0) {
+              // Parsing every event on the main event loop competes with the
+              // history reads it also serves; only a rollover needs the payload.
+              const mode = input.pool.eventForwardMode(entry.connection.generationId);
+              for (const frame of parsed.frames) {
+                const forward = mode === "forward"
+                  || (mode === "filter" && input.pool.shouldForwardEvent(entry.connection.generationId, parseSsePayload(frame)));
+                if (forward) controller.enqueue(encoder.encode(`${frame}\n\n`));
               }
+            }
+            if (parsed.overflow) {
+              // A frame that never terminates would buffer without bound;
+              // drop this connection and let the client reconnect.
+              await entry.reader.cancel(new Error("SSE frame exceeded the size limit")).catch(() => undefined);
+              break;
             }
           }
         } catch {
           // A generation flip intentionally aborts these readers. The client
           // reconnects and the next stream fans in every live generation.
         } finally {
+          entry.reader.releaseLock();
           finish();
         }
       };
       for (const entry of readers) void pump(entry);
+      // A data-bearing heartbeat, not an SSE comment: SSE parsers only yield
+      // frames with data lines, so a `: ping` comment can keep middleboxes
+      // happy but is invisible to the client's stream-staleness tracking. The
+      // heartbeat lets a quiet-but-healthy stream attest liveness instead of
+      // being aborted as stale, and makes a silent half-open socket
+      // detectable within one stale window.
       pingTimer = setInterval(() => {
-        if (!closed && !cancelled) controller.enqueue(encoder.encode(": ping\n\n"));
-      }, 30_000);
+        if (!closed && !cancelled) controller.enqueue(encoder.encode(`data: {"type":"server.heartbeat"}\n\n`));
+      }, engineEventStreamHeartbeatIntervalMs());
       pingTimer.unref?.();
+      input.lease.signal.addEventListener("abort", abort, { once: true });
+      if (input.lease.signal.aborted) abort();
     },
     async cancel(reason) {
       cancelled = true;
@@ -1613,6 +2076,21 @@ function mergedEventBody(input: {
       await Promise.all(readers.map((entry) => entry.reader.cancel(reason).catch(() => undefined)));
     },
   });
+}
+
+// Read lazily so tests can shrink the deadline at runtime. Matches the 5s
+// bound proxyEngineAggregateRead puts on its per-connection fan-out.
+function engineEventStreamEstablishTimeoutMs(): number {
+  const parsed = Number(process.env.OPENWORK_ENGINE_EVENT_ESTABLISH_TIMEOUT_MS ?? "5000");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 5_000;
+}
+
+// 15s keeps two heartbeats inside the renderer's 30s stale-stream window, so
+// one lost beat never churns a healthy connection. Read lazily so tests can
+// shrink the interval at runtime.
+function engineEventStreamHeartbeatIntervalMs(): number {
+  const parsed = Number(process.env.OPENWORK_ENGINE_EVENT_HEARTBEAT_MS ?? "15000");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 15_000;
 }
 
 async function proxyEngineEventStreams(input: {
@@ -1625,30 +2103,57 @@ async function proxyEngineEventStreams(input: {
 }): Promise<Response> {
   const lease = input.pool.openEventProxy(input.clientSignal);
   const settled = await Promise.allSettled(input.connections.map(async (connection) => {
-    const response = await loopbackFetch(buildOpencodeProxyUrl(connection.baseUrl, input.proxyPath, input.search), {
-      method: "GET",
-      headers: headersForEngineConnection(input.headers, connection),
-      signal: lease.signal,
-    });
-    return { connection, response };
+    // Bound establishment (headers) only: a connection that accepts the
+    // socket but never answers must not stall the whole fan-out. The timer is
+    // cleared as soon as the response resolves so the long-lived body stream
+    // itself is never put on a deadline; lease aborts tear the body down
+    // through the merged-stream reader cancellation instead.
+    const establish = new AbortController();
+    const onLeaseAbort = () => establish.abort(lease.signal.reason);
+    lease.signal.addEventListener("abort", onLeaseAbort, { once: true });
+    if (lease.signal.aborted) onLeaseAbort();
+    const timer = setTimeout(
+      () => establish.abort(new Error("OpenCode event stream establishment timed out")),
+      engineEventStreamEstablishTimeoutMs(),
+    );
+    timer.unref?.();
+    try {
+      const response = await loopbackFetch(buildOpencodeProxyUrl(connection.baseUrl, input.proxyPath, input.search), {
+        method: "GET",
+        headers: headersForEngineConnection(input.headers, connection),
+        signal: establish.signal,
+      });
+      return { connection, response };
+    } finally {
+      clearTimeout(timer);
+      lease.signal.removeEventListener("abort", onLeaseAbort);
+    }
   }));
   const successful = settled
     .filter((entry): entry is PromiseFulfilledResult<{ connection: EnginePoolConnection; response: Response }> =>
       entry.status === "fulfilled")
     .map((entry) => entry.value);
+  // Established fetches are no longer tied to any abort signal, so bodies the
+  // merged stream will not own must be cancelled here instead of leaking.
+  const discard = (entries: Array<{ response: Response }>) => {
+    for (const entry of entries) void entry.response.body?.cancel().catch(() => undefined);
+  };
   const primary = successful.find((entry) => entry.connection.role === "primary");
   if (!primary) {
     lease.release();
+    discard(successful);
     throw new ApiError(502, "opencode_unreachable", "The primary OpenCode event stream is unavailable");
   }
   if (!primary.response.ok || !primary.response.body) {
     lease.release();
+    discard(successful.filter((entry) => entry !== primary));
     return sanitizeProxyResponse(primary.response);
   }
   const streams = successful
     .flatMap((entry) => entry.response.ok && entry.response.body
       ? [{ connection: entry.connection, body: entry.response.body }]
       : []);
+  discard(successful.filter((entry) => entry !== primary && !(entry.response.ok && entry.response.body)));
   const headers = new Headers(primary.response.headers);
   headers.delete("content-length");
   headers.delete("content-encoding");
@@ -1674,7 +2179,7 @@ function sanitizeProxyResponse(response: Response): Response {
   headers.delete("content-encoding");
   headers.delete("transfer-encoding");
   headers.delete("content-length");
-  return new Response(response.body, {
+  return new Response(transferResponseBody(response), {
     status: response.status,
     statusText: response.statusText,
     headers,
@@ -1706,8 +2211,14 @@ function withCors(response: Response, request: Request, config: ServerConfig) {
     "Authorization, Content-Type, X-OpenWork-Host-Token, X-OpenWork-Client-Id, X-OpenCode-Directory, X-Opencode-Directory, x-opencode-directory",
   );
   headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  const exposed = headers.get("Access-Control-Expose-Headers");
+  headers.set("Access-Control-Expose-Headers", [exposed, "X-Next-Cursor", "Link"].filter(Boolean).join(", "));
   headers.set("Vary", "Origin");
-  return new Response(response.body, { status: response.status, headers });
+  return new Response(transferResponseBody(response), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 async function requireClient(request: Request, config: ServerConfig, tokens: TokenService): Promise<Actor> {
@@ -1773,7 +2284,7 @@ function buildCapabilities(config: ServerConfig): Capabilities {
     mcp: { read: true, write: writeEnabled },
     commands: { read: true, write: writeEnabled },
     config: { read: true, write: writeEnabled },
-    engine: { rollover: config.engineRollover === true },
+    engine: { rollover: enginePoolForConfig(config) !== null },
 
     approvals: { mode: config.approval.mode, timeoutMs: config.approval.timeoutMs },
     sandbox: { enabled: sandboxEnabled, backend: sandboxBackend },
@@ -1891,7 +2402,7 @@ type AuthorizedFoldersConfig = {
   hiddenEntries: Record<string, unknown>;
 };
 
-function normalizeAuthorizedFolderPath(input: string | null | undefined): string {
+export function normalizeAuthorizedFolderPath(input: string | null | undefined): string {
   const trimmed = (input ?? "").trim();
   if (!trimmed) return "";
   if (trimmed === "/*") return "/";
@@ -1902,7 +2413,9 @@ function normalizeAuthorizedFolderPath(input: string | null | undefined): string
       ? withoutWildcard.slice(4)
       : withoutWildcard;
   const unified = withoutVerbatim.replace(/\\/g, "/");
-  const withoutTrailing = unified.replace(/\/+$/, "");
+  let end = unified.length;
+  while (end > 0 && unified[end - 1] === "/") end -= 1;
+  const withoutTrailing = end === unified.length ? unified : unified.slice(0, end);
   return withoutTrailing || "/";
 }
 
@@ -2016,9 +2529,37 @@ function createRoutes(
   engineMcpServerState: EngineMcpServerState,
   logger: ServerLogger,
   cloudProviderSync: CloudProviderSync,
+  engineV2Preview: EngineV2Preview,
+  isReady: () => boolean,
 ): Route[] {
   const routes: Route[] = [];
+  // A rollover-capable pool can apply this immediately without disposing
+  // the generation that owns live sessions. Legacy/external engines keep
+  // the established busy deferral.
+  const applyManagedProviderReload = async (workspace: WorkspaceInfo): Promise<"reloaded" | "deferred"> => {
+    const reloadDeferred = await shouldDeferInPlaceEngineReload(config, workspace, engineHasActiveSessions);
+    if (reloadDeferred) {
+      cloudProviderSync.markReloadPending();
+      return "deferred";
+    }
+    // A key-only rotation through this route never shows in the pool's
+    // config fingerprint, so an unforced request would be skipped and the
+    // engine would keep serving the previous credential while the route
+    // answered "reloaded". Force the standby path, mirroring cloud sync, and
+    // only report "reloaded" once the engine actually read the change.
+    const outcome = await reloadOpencodeEngine(config, workspace, engineMcpServerState, {
+      reason: "managed_provider_reload",
+      forceStandby: true,
+    });
+    if (rolloverOutcomeApplied(outcome)) return "reloaded";
+    // Parked or skipped inside the pool: keep it owed so the sync retry
+    // path lands it instead of the caller believing it is done.
+    cloudProviderSync.markReloadPending();
+    return "deferred";
+  };
+  const nativeEngineForWorkspace = createNativeCloudMcpResolver(engineV2Preview);
   registerCoreRoutes({
+    nativeEngineForWorkspace,
     routes,
     config,
     tokens,
@@ -2026,6 +2567,7 @@ function createRoutes(
     managedProviderAuthLogger: toManagedProviderAuthLogger(logger),
     serverVersion: SERVER_VERSION,
     opencodeVersion: OPENCODE_VERSION,
+    isReady,
     jsonResponse,
     readJsonBody,
     readOptionalJsonBody,
@@ -2039,7 +2581,9 @@ function createRoutes(
     refreshRegistrationFromLiveStatus: refreshEngineMcpRegistrationFromLiveStatus,
     serializeWorkspace,
     resolveDevLogPath,
-    createOpenAiRealtimeVoiceSession,
+    onManagedProviderAuthChanged: async () => {
+      await applyManagedProviderReload(resolveEngineRuntimeWorkspace(config));
+    },
   });
 
   registerWorkspaceRoutes({
@@ -2053,33 +2597,28 @@ function createRoutes(
     ensureWritable,
     resolveWorkspace,
     serializeWorkspace,
-    reloadOpencodeEngine: async (routeConfig, workspace, options) => {
-      await withEngineDirectoryFence(routeConfig, workspace, async () => {
-        if (await shouldDeferInPlaceEngineReload(routeConfig, workspace, engineHasActiveSessions)) {
-          return;
-        }
-        await reloadOpencodeEngine(routeConfig, workspace, engineMcpServerState, options);
-      });
-    },
+    syncWorkspaceRuntimeMcp: (routeConfig, workspace) =>
+      enqueueWorkspaceMcpRefreshSync({
+        config: routeConfig,
+        workspace,
+        serverState: activeEngineMcpServerState(routeConfig),
+        trigger: "workspace_activate",
+      }),
   });
 
-  registerSessionRoutes({
+  registerSessionGroupRoutes({
     routes,
     config,
     jsonResponse,
-    parseOptionalBoolean,
-    parseOptionalPositiveInteger,
-    parseOptionalNonNegativeInteger,
     readJsonBody,
     ensureWritable,
     requireClientScope,
     resolveWorkspace,
     resolveWorkspaceWithoutBootstrap,
-    createWorkspaceOpencodeClient,
-    unwrapOpencodeResult,
   });
 
   registerCloudMcpRoutes({
+    nativeEngineForWorkspace,
     routes,
     config,
     jsonResponse,
@@ -2090,14 +2629,14 @@ function createRoutes(
     resolveOpencodeDirectory,
     createWorkspaceOpencodeClient,
     refreshRegistrationFromLiveStatus: refreshEngineMcpRegistrationFromLiveStatus,
-    registerRuntimeMcp: (routeConfig, workspace, onlyNames, options) =>
+    registerRuntimeMcp: createRoutedCloudMcpRegistrar(engineV2Preview, (routeConfig, workspace, onlyNames, options) =>
       syncRuntimeMcpToOpencodeEngine(
         routeConfig,
         workspace,
         onlyNames,
         options,
         engineMcpServerState,
-      ),
+      )),
     serverMetadata: { serverVersion: SERVER_VERSION, expectedOpencodeVersion: OPENCODE_VERSION },
   });
 
@@ -2167,9 +2706,12 @@ function createRoutes(
   addRoute(routes, "GET", "/workspace/:id/config", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const openwork = await readOpenworkConfigForWorkspace(config, workspace);
+    // Effective runtime view (ENGINE_GLOBAL ⊕ workspace row): providers,
+    // plugins, and authorized folders live in the global row now, and the UI
+    // must keep seeing them after migration.
     const opencode = mergeOpencodeConfigs(
       await readOpencodeConfig(workspace.path),
-      await readRuntimeOpencodeConfig(config, workspace.id),
+      await readEffectiveRuntimeOpencodeConfig(config, workspace.id),
     );
     const lastAudit = await readLastAudit(workspace.path, workspace.id);
     return jsonResponse({ opencode, openwork, updatedAt: lastAudit?.timestamp ?? null });
@@ -2279,6 +2821,9 @@ function createRoutes(
         action: "added",
       });
     }
+    if (imported.files.some((file) => file.objectType === "skill") && workspace.workspaceType !== "remote") {
+      await engineV2Preview.settleWorkspaceSkills(workspace.path);
+    }
 
     // Hot-register any bundled MCP servers with the running engine.
     await syncRuntimeMcpToOpencodeEngine(
@@ -2344,6 +2889,9 @@ function createRoutes(
         action: "added",
       });
     }
+    if (imported.files.some((file) => file.objectType === "skill") && workspace.workspaceType !== "remote") {
+      await engineV2Preview.settleWorkspaceSkills(workspace.path);
+    }
 
     // Hot-register any bundled MCP servers with the running engine.
     await syncRuntimeMcpToOpencodeEngine(
@@ -2394,15 +2942,147 @@ function createRoutes(
         action: "removed",
       });
     }
+    if (removed.files.some((file) => file.objectType === "skill") && workspace.workspaceType !== "remote") {
+      await engineV2Preview.settleWorkspaceSkills(workspace.path);
+    }
 
     return jsonResponse({ item: removed, warnings: [] });
+  });
+
+  const pendingRunModeRefresh = new Set<string>();
+  const runModeState = async (workspace: WorkspaceInfo): Promise<WorkspaceRunModeState & { path: string }> => {
+    const state = await readWorkspaceRunMode(workspace.path);
+    if (engineV2Preview.status().chatRouting) {
+      return { ...state, supported: false, reason: "Workspace run modes are unavailable while OpenCode v2 chat routing is enabled." };
+    }
+    if (workspace.workspaceType === "remote" || resolve(resolveOpencodeDirectory(workspace) ?? workspace.path) !== resolve(workspace.path)) {
+      return { ...state, supported: false, reason: "Workspace run modes require an engine using this local workspace directory." };
+    }
+    return state;
+  };
+
+  addRoute(routes, "GET", "/workspace/:id/permissions/mode", "client", async (ctx) => {
+    const state = await runModeState(await resolveWorkspace(config, ctx.params.id));
+    return jsonResponse({ ...state, refreshPending: pendingRunModeRefresh.has(state.path) });
+  });
+
+  addRoute(routes, "PUT", "/workspace/:id/permissions/mode", "client", async (ctx) => {
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const mode = body.mode;
+    if (mode !== "default" && mode !== "approve" && mode !== "run-everything") {
+      throw new ApiError(400, "invalid_payload", 'mode must be "default", "approve", or "run-everything"');
+    }
+    const initial = await runModeState(workspace);
+    if (!initial.supported) throw new ApiError(409, "workspace_run_mode_unsupported", initial.reason);
+    await requireWorkspaceRunModeIdle(config, workspace);
+    await requireApproval(ctx, {
+      workspaceId: workspace.id,
+      action: "config.write",
+      summary: mode === "run-everything"
+        ? "Allow tools by default in this workspace, keeping narrower permission rules"
+        : mode === "approve"
+          ? "Ask before tools by default in this workspace, keeping narrower permission rules"
+          : "Remove this workspace's permission catch-all, keeping narrower rules and inherited permissions",
+      paths: [initial.path],
+    });
+    return withEngineDirectoryFence(config, workspace, async () => {
+      // Approval can wait while another session starts or the runtime changes.
+      const current = await runModeState(workspace);
+      if (!current.supported) throw new ApiError(409, "workspace_run_mode_unsupported", current.reason);
+      await requireWorkspaceRunModeIdle(config, workspace);
+      const changed = await setWorkspaceRunMode(workspace.path, mode);
+      if (changed) {
+        pendingRunModeRefresh.add(current.path);
+        emitReloadEvent(ctx.reloadEvents, workspace, "config", buildConfigTrigger(current.path));
+      }
+      await recordAudit(workspace.path, {
+        id: shortId(),
+        workspaceId: workspace.id,
+        actor: ctx.actor ?? { type: "remote" },
+        action: "config.write",
+        target: current.path,
+        summary: `Set workspace run mode to ${mode}`,
+        timestamp: Date.now(),
+      });
+      let refresh: "reloaded" | "deferred" | "skipped" = "skipped";
+      if (pendingRunModeRefresh.has(current.path)) {
+        refresh = "deferred";
+        try {
+          if (engineV2Preview.status().chatRouting) throw new Error("OpenCode v2 chat routing is enabled");
+          await requireWorkspaceRunModeIdle(config, workspace);
+          // Directory-scoped disposal leaves other workspaces alone. The
+          // detached MCP sync uses the same fence, so do not await it here.
+          await reloadOpencodeEngineInPlace(config, workspace, engineMcpServerState, { awaitPostRefreshSync: false });
+          const opencode = createWorkspaceOpencodeClient(config, workspace, { boundedDiagnosticsReads: true });
+          const [configResult, agentResult] = await Promise.all([opencode.config.get({}), opencode.app.agents({})]);
+          const snapshot = validateEffectiveEngineSnapshot({
+            config: unwrapOpencodeResult(configResult, "/config"),
+            agents: unwrapOpencodeResult(agentResult, "/agent"),
+          });
+          if (engineV2Preview.status().chatRouting || !snapshot || !selectGoverningAgent(snapshot.agents, snapshot.defaultAgent)) throw new Error("Engine reload could not be confirmed");
+          pendingRunModeRefresh.delete(current.path);
+          refresh = "reloaded";
+        } catch {
+          // The file is saved, not necessarily applied. Keep the event and
+          // retry on a subsequent PUT even when the requested mode is unchanged.
+        }
+      }
+      return jsonResponse({
+        ...await runModeState(workspace),
+        changed,
+        refresh,
+        refreshPending: refresh === "deferred",
+        ...(refresh === "deferred" ? { reason: "Saved to the workspace config; engine refresh is pending. Wait for idle sessions and retry, or reload the workspace." } : {}),
+      });
+    });
+  });
+
+  addRoute(routes, "GET", "/workspace/:id/permissions/effective", "client", async (ctx) => {
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    // The engine's own evaluated ruleset decides; OpenWork only names the
+    // layer each winning rule came from.
+    const opencode = createWorkspaceOpencodeClient(config, workspace, { boundedDiagnosticsReads: true });
+    const [configResult, agentResult] = await Promise.all([opencode.config.get({}), opencode.app.agents({})]);
+    const snapshot = validateEffectiveEngineSnapshot({
+      config: unwrapOpencodeResult(configResult, "/config"),
+      agents: unwrapOpencodeResult(agentResult, "/agent"),
+    });
+    if (!snapshot) {
+      throw new ApiError(502, "opencode_invalid_response", "OpenCode returned an unreadable agent list", { workspaceId: workspace.id });
+    }
+    const agent = selectGoverningAgent(snapshot.agents, snapshot.defaultAgent);
+    if (!agent) {
+      throw new ApiError(502, "opencode_agent_missing", "OpenCode reported no agent for this workspace", { workspaceId: workspace.id });
+    }
+    const globalPath = resolveOpencodeConfigFilePath("global", workspace.path);
+    const emptyConfig: Record<string, unknown> = {};
+    const [workspaceConfig, globalConfig, injected] = await Promise.all([
+      readOpencodeConfig(workspace.path),
+      readJsoncFile(globalPath, emptyConfig, { allowInvalid: true }).then((result) => result.data),
+      buildOpenworkRuntimeConfigObject(config),
+    ]);
+    return jsonResponse({
+      agent: agent.name,
+      rows: summarizeEffectivePermissions(agent.permission, {
+        global: globalConfig.permission,
+        openwork: injected.permission,
+        workspace: workspaceConfig.permission,
+      }),
+      files: { workspace: opencodeConfigPath(workspace.path), global: globalPath },
+    });
   });
 
   addRoute(routes, "GET", "/workspace/:id/authorized-folders", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const opencode = mergeOpencodeConfigs(
       await readOpencodeConfig(workspace.path),
-      await readRuntimeOpencodeConfig(config, workspace.id),
+      // Global-first: authorized folders live in the ENGINE_GLOBAL row; the
+      // effective read also surfaces legacy per-workspace entries until the
+      // startup migration folds them in.
+      await readEffectiveRuntimeOpencodeConfig(config, workspace.id),
     );
     const foldersConfig = readAuthorizedFoldersFromOpencodeConfig(opencode, workspace.path);
     return jsonResponse(buildAuthorizedFoldersResponse(workspace, foldersConfig));
@@ -2424,7 +3104,7 @@ function createRoutes(
     });
 
     const persistedOpencode = await readOpencodeConfig(workspace.path);
-    const runtimeOpencode = await readRuntimeOpencodeConfig(config, workspace.id);
+    const runtimeOpencode = await readEffectiveRuntimeOpencodeConfig(config, workspace.id);
     const existingOpencode = mergeOpencodeConfigs(persistedOpencode, runtimeOpencode);
     const existingFoldersConfig = readAuthorizedFoldersFromOpencodeConfig(existingOpencode, workspace.path);
     const nextExternalDirectory = mergeAuthorizedFoldersIntoExternalDirectory(
@@ -2432,13 +3112,26 @@ function createRoutes(
       existingFoldersConfig.hiddenEntries,
     );
 
-    await writeRuntimeOpencodeConfig(config, workspace.id, (current) => ({
+    // Authorized folders are engine-global: the injected engine config file is
+    // rendered from the ENGINE_GLOBAL row only. Any legacy per-workspace
+    // entries were folded into the effective read above, so clear them from
+    // the workspace row or removals could never take effect.
+    await writeGlobalRuntimeOpencodeConfig(config, (current) => ({
       ...current,
       permission: {
         ...(ensurePlainObject(current.permission)),
         external_directory: nextExternalDirectory ?? {},
       },
     }));
+    await writeRuntimeOpencodeConfig(config, workspace.id, (current) => {
+      const { permission, ...rest } = current;
+      // Strip only the migrated external_directory; other permission keys stay.
+      const { external_directory: _legacyExternalDirectory, ...permissionRest } = ensurePlainObject(permission);
+      return {
+        ...rest,
+        ...(Object.keys(permissionRest).length ? { permission: permissionRest } : {}),
+      };
+    });
 
     const updatedAt = Date.now();
     await recordAudit(workspace.path, {
@@ -2465,61 +3158,12 @@ function createRoutes(
     return jsonResponse(response);
   });
 
-  addRoute(routes, "POST", "/workspace/:id/runtime-config/migrate", "client", async (ctx) => {
-    ensureWritable(config);
-    requireClientScope(ctx, "collaborator");
-    const workspace = await resolveWorkspace(config, ctx.params.id);
-    const configPath = openworkConfigPath(workspace.path);
-
-    await requireApproval(ctx, {
-      workspaceId: workspace.id,
-      action: "config.runtime_migrate",
-      summary: "Migrate legacy runtime OpenCode config",
-      paths: [configPath],
-    });
-
-    // Resolve the effective openwork config (DB, migrating any legacy file
-    // contents in on read) so legacy runtime keys are detected wherever they
-    // currently live.
-    let openworkError: string | null = null;
-    let openworkData: Record<string, unknown> = {};
-    try {
-      openworkData = await readOpenworkConfigForWorkspace(config, workspace);
-    } catch (error) {
-      if (error instanceof ApiError && error.code === "invalid_json") {
-        openworkError = error.message;
-      } else {
-        throw error;
-      }
-    }
-    const legacy = legacyRuntimeConfigFromOpenworkConfig(openworkData);
-    const user = userRuntimeConfigFromOpencodeConfig(await readOpencodeConfig(workspace.path));
-    if (!legacy.keys.length && !user.keys.length) {
-      return jsonResponse({ migrated: false, keys: [], legacyKeys: [], userOpencodeKeys: [], updatedAt: null, legacyError: openworkError });
-    }
-
-    await writeRuntimeOpencodeConfig(config, workspace.id, (current) => (
-      mergeLegacyRuntimeConfig(mergeLegacyRuntimeConfig(current, legacy.config), user.config)
-    ));
-    if (legacy.keys.length && !openworkError) {
-      await writeOpenworkConfigForWorkspace(config, workspace, removeLegacyRuntimeConfig(openworkData), false);
-    }
-    await removeUserRuntimeConfigFromOpencode(workspace.path, user.keys);
-
-    const updatedAt = Date.now();
-    const keys = [...legacy.keys, ...user.keys];
-    await recordAudit(workspace.path, {
-      id: shortId(),
-      workspaceId: workspace.id,
-      actor: ctx.actor ?? { type: "remote" },
-      action: "config.runtime_migrate",
-      target: configPath,
-      summary: `Migrated runtime OpenCode config: ${keys.join(", ")}`,
-      timestamp: updatedAt,
-    });
-    emitReloadEvent(ctx.reloadEvents, workspace, "config", buildConfigTrigger(configPath));
-
-    return jsonResponse({ migrated: true, keys, legacyKeys: legacy.keys, userOpencodeKeys: user.keys, updatedAt, legacyError: openworkError });
+  // OpenCode v2 keeps its engine config private, so clients read the shared
+  // disabled list here (ids only) to offer "Enable" for hidden providers.
+  addRoute(routes, "GET", "/workspace/:id/runtime-config/disabled-providers", "client", async (ctx) => {
+    await resolveWorkspace(config, ctx.params.id);
+    const runtime = await readGlobalRuntimeOpencodeConfig(config);
+    return jsonResponse({ ok: true, disabledProviders: runtimeDisabledProviderList(runtime) });
   });
 
   addRoute(routes, "POST", "/workspace/:id/runtime-config/disabled-providers", "client", async (ctx) => {
@@ -2528,7 +3172,9 @@ function createRoutes(
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const body = await readJsonBody(ctx.request);
     const providers = parseDisabledProvidersPayload(body.providers);
-    const result = await writeRuntimeOpencodeConfig(config, workspace.id, (current) => ({
+    // Disabled providers are engine-global: the injected engine config file is
+    // rendered from the ENGINE_GLOBAL row only.
+    const result = await writeGlobalRuntimeOpencodeConfig(config, (current) => ({
       ...current,
       disabled_providers: providers,
     }));
@@ -2548,16 +3194,39 @@ function createRoutes(
     return jsonResponse({ provider: runtimeProviderMap(runtime) });
   });
 
+  // The host that owns this instance's lifecycle asks before stopping or
+  // restarting it. Counts only; no session content leaves the instance.
+  addRoute(routes, "GET", "/runtime/activity", "host-token", async () => {
+    const response = jsonResponse(await describeRuntimeActivity(config));
+    response.headers.set("Cache-Control", "no-store");
+    return response;
+  });
+
+  addRoute(routes, "PUT", "/den-session/identity", "host-token", async (ctx) => {
+    ensureWritable(config);
+    const session = parseCloudProviderDenSession(await readJsonBody(ctx.request));
+    if (!session) throw new ApiError(400, "invalid_payload", "baseUrl, token, and orgId are required");
+    const suspended = cloudProviderSync.suspend();
+    try {
+      await managedDesktopPolicy(config).setSession(session);
+    } finally {
+      await suspended;
+    }
+    return new Response(null, { status: 204 });
+  });
+
   addRoute(routes, "PUT", "/den-session", "host-token", async (ctx) => {
     ensureWritable(config);
     const session = parseCloudProviderDenSession(await readJsonBody(ctx.request));
     if (!session) throw new ApiError(400, "invalid_payload", "baseUrl, token, and orgId are required");
-    cloudProviderSync.setSession(session);
+    await managedDesktopPolicy(config).setSession(session);
+    await cloudProviderSync.setSession(session);
     return new Response(null, { status: 204 });
   });
 
   addRoute(routes, "DELETE", "/den-session", "host-token", async () => {
     ensureWritable(config);
+    await managedDesktopPolicy(config).clearSession();
     await cloudProviderSync.clearSession();
     return new Response(null, { status: 204 });
   });
@@ -2571,8 +3240,66 @@ function createRoutes(
     return jsonResponse(await cloudProviderSync.run(typeof body.reason === "string" ? body.reason : undefined));
   });
 
+  addRoute(routes, "POST", "/cloud-provider-sync/providers/:id/oauth/start", "host-token", async (ctx) => {
+    ensureWritable(config);
+    const origin = ctx.request.headers.get("origin");
+    if (origin && origin !== new URL(ctx.request.url).origin && !config.corsOrigins.includes("*") && !config.corsOrigins.includes(origin)) {
+      throw new ApiError(403, "invalid_origin", "This origin cannot start provider authorization");
+    }
+    if (ctx.request.headers.get("content-type")?.split(";")[0]?.trim() !== "application/json") {
+      throw new ApiError(415, "invalid_content_type", "A JSON request is required");
+    }
+    const body = await readJsonBody(ctx.request);
+    if (typeof body.orgId !== "string" || (body.credentialSetId !== undefined && typeof body.credentialSetId !== "string") || Object.keys(body).some((key) => key !== "orgId" && key !== "credentialSetId")) {
+      throw new ApiError(400, "invalid_payload", "Only the active orgId and optional credentialSetId are accepted");
+    }
+    return jsonResponse(await cloudProviderSync.startProviderOAuth(ctx.params.id, body.orgId, body.credentialSetId));
+  });
+
+  addRoute(routes, "GET", "/managed-policy", "client", async () =>
+    jsonResponse({ policy: await managedDesktopPolicy(config).current() }));
+  addRoute(routes, "POST", "/managed-policy/evaluate", "policy", async (ctx) => {
+    const body = await readJsonBody(ctx.request);
+    const action = managedPolicyActionSchema.safeParse(body.action);
+    if (!action.success || !isRecord(body.input)) throw new ApiError(400, "invalid_payload", "A supported policy action and input are required");
+    await managedDesktopPolicy(config).assert(action.data, body.input);
+    return jsonResponse({ allowed: true });
+  });
+
   addRoute(routes, "GET", "/cloud-provider-sync/status", "client", async () => {
     return jsonResponse(cloudProviderSync.status());
+  });
+
+  addRoute(routes, "GET", "/experimental/engine-v2-preview/status", "client", async () => {
+    return jsonResponse(engineV2Preview.status());
+  });
+
+  addRoute(routes, "POST", "/experimental/engine-v2-preview/migrate", "host-token", async (ctx) => {
+    ensureWritable(config);
+    const body = await readJsonBody(ctx.request);
+    if (!isRecord(body) || body.confirm !== true) throw new ApiError(400, "invalid_payload", "Confirm history migration first");
+    return jsonResponse(engineV2Preview.migrateHistory());
+  });
+
+  addRoute(routes, "PUT", "/experimental/engine-v2-preview", "client", async (ctx) => {
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const body = await readJsonBody(ctx.request);
+    if (!isRecord(body) || (body.enabled === undefined && body.chatRouting === undefined)) {
+      throw new ApiError(400, "invalid_payload", "enabled or chatRouting must be provided");
+    }
+    if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+      throw new ApiError(400, "invalid_payload", "enabled must be a boolean");
+    }
+    if (body.chatRouting !== undefined && typeof body.chatRouting !== "boolean") {
+      throw new ApiError(400, "invalid_payload", "chatRouting must be a boolean");
+    }
+    let status = engineV2Preview.status();
+    // Stop routing before stopping the v2 process; enable the process before routing to it.
+    if (body.chatRouting === false) status = await engineV2Preview.setChatRouting(false);
+    if (typeof body.enabled === "boolean") status = await engineV2Preview.setEnabled(body.enabled);
+    if (body.chatRouting === true) status = await engineV2Preview.setChatRouting(true);
+    return jsonResponse(status);
   });
 
   addRoute(routes, "PATCH", "/runtime-config/providers", "host-token", async (ctx) => {
@@ -2585,27 +3312,21 @@ function createRoutes(
       provider: mergeRuntimeProviderUpdate(current.provider, providerPatch),
     }));
 
-    const fileResult = await writeOpenworkRuntimeConfigFile(config, workspace.id);
-    const shouldReload = result.changed || fileResult.changed;
-    // A rollover-capable pool can apply this immediately without disposing
-    // the generation that owns live sessions. Legacy/external engines keep
-    // the established busy deferral.
-    const reloadDeferred = shouldReload
-      && (await shouldDeferInPlaceEngineReload(config, workspace, engineHasActiveSessions));
-    if (shouldReload && !reloadDeferred) {
-      await reloadOpencodeEngine(config, workspace, engineMcpServerState);
-    }
-    if (reloadDeferred) {
-      cloudProviderSync.markReloadPending();
-    }
-    // The provider entry only names its credential env vars; the engine needs
-    // the value itself via its auth API.
-    await syncManagedProviderAuth({
+    const fileResult = await writeOpenworkRuntimeConfigFile(config);
+    // Auth must land before the reload so the replacement provider instance is
+    // constructed with its credential. This also refreshes SDK clients after
+    // a key rotation even when provider config itself did not change.
+    const authResult = await syncManagedProviderAuth({
       config,
       env,
       logger: toManagedProviderAuthLogger(logger),
-    }).catch(() => undefined);
-
+    });
+    const shouldReload = result.changed
+      || fileResult.changed
+      || authResult.delivered.length > 0
+      || authResult.removed.length > 0;
+    const reloadDeferred = shouldReload
+      && (await applyManagedProviderReload(workspace)) === "deferred";
     return jsonResponse({
       ok: true,
       changed: result.changed,
@@ -2618,29 +3339,22 @@ function createRoutes(
   addRoute(routes, "GET", "/workspace/:id/runtime-config", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const runtime = await readRuntimeOpencodeConfig(config, workspace.id);
-    // Report legacy runtime keys from the effective (DB-backed) openwork config
-    // so the status reflects post-migration state, while still surfacing parse
-    // errors from a malformed legacy file.
-    const fileStatus = await readOpenworkConfigForStatus(workspace.path);
-    const effectiveOpenwork = fileStatus.error ? {} : await readOpenworkConfigForWorkspace(config, workspace);
-    const legacy = legacyRuntimeConfigFromOpenworkConfig(effectiveOpenwork);
     const rawOpencode = await readRawOpencodeConfig(opencodeConfigPath(workspace.path));
     const persistedOpencode = await readOpencodeConfig(workspace.path);
     const globalOpencodePath = resolveOpencodeConfigFilePath("global", workspace.path);
     const rawGlobalOpencode = await readRawOpencodeConfig(globalOpencodePath);
     const emptyGlobalOpencode: Record<string, unknown> = {};
     const globalOpencode = (await readJsoncFile(globalOpencodePath, emptyGlobalOpencode, { allowInvalid: true })).data;
-    const effectiveRuntime = await buildOpenworkRuntimeConfigObject(config, workspace.id);
-    const user = userRuntimeConfigFromOpencodeConfig(persistedOpencode);
+    // The injected file is rendered from the ENGINE_GLOBAL row only; the
+    // workspace runtime row reaches the engine via the dynamic MCP push.
+    const effectiveRuntime = await buildOpenworkRuntimeConfigObject(config);
     const managedFile = await readManagedRuntimeConfigDebug(config);
-    const sweep = await readLegacyConfigSweepState(config);
 
     return jsonResponse({
       runtime,
       runtimeKeys: runtimeConfigKeys(runtime),
       effectiveRuntime,
       ...managedFile,
-      sweep,
       sources: {
         projectOpencode: {
           path: opencodeConfigPath(workspace.path),
@@ -2663,16 +3377,10 @@ function createRoutes(
           config: effectiveRuntime,
         },
       },
-      legacyOpenwork: {
-        path: openworkConfigPath(workspace.path),
-        keys: legacy.keys,
-        error: fileStatus.error,
-      },
       userOpencode: {
         path: opencodeConfigPath(workspace.path),
         exists: rawOpencode.exists,
         keys: userOpencodeConfigKeys(persistedOpencode),
-        migratableKeys: user.keys,
       },
     });
   });
@@ -2772,39 +3480,54 @@ function createRoutes(
       // Per-provider merge: record values upsert, explicit `null` deletes
       // (mergeRuntimeProviderUpdate) — so clients can remove runtime-managed
       // providers (e.g. cloud imports) without read-modify-write races.
+      // Providers are engine-global: the injected engine config file is
+      // rendered from the ENGINE_GLOBAL row only, so a workspace-row write
+      // would never reach the engine.
       const providerUpdate = isRecord(provider) ? provider : {};
+      // Removing a provider is always allowed; adding or changing one must fit the organization's model access.
+      if (Object.keys(providerUpdate).length) await managedDesktopPolicy(config).assert("provider", {
+        providerIDs: Object.entries(providerUpdate).filter(([, value]) => value !== null).map(([id]) => id),
+      });
       if (Object.keys(providerUpdate).length) {
-        const currentRuntime = await readRuntimeOpencodeConfig(config, workspace.id);
-        logicalUpdates.provider = mergeRuntimeProviderUpdate(currentRuntime.provider, providerUpdate);
+        const providerResult = await writeGlobalRuntimeOpencodeConfig(config, (current) => ({
+          ...current,
+          provider: mergeRuntimeProviderUpdate(current.provider, providerUpdate),
+        }));
+        runtimeChanged = providerResult.changed || runtimeChanged;
       }
 
       const permissionUpdate = ensurePlainObject(permission);
       if (Object.prototype.hasOwnProperty.call(permissionUpdate, "external_directory")) {
-        const existingRuntime = await readRuntimeOpencodeConfig(config, workspace.id);
-        const existingPermission = ensurePlainObject(existingRuntime.permission);
+        // Authorized folders are engine-global for the same reason as providers.
         const nextExternalDirectory = permissionUpdate.external_directory;
-        const existingPermissionKeys = Object.keys(existingPermission);
-        const removePermissionParent =
-          typeof nextExternalDirectory === "undefined" &&
-            (existingPermissionKeys.length === 0 ||
-            (existingPermissionKeys.length === 1 && Object.prototype.hasOwnProperty.call(existingPermission, "external_directory")));
-
-        if (removePermissionParent) {
-          logicalUpdates.permission = undefined;
-        } else {
-          logicalUpdates.permission = {
-            ...existingPermission,
-            external_directory: nextExternalDirectory,
+        const permissionResult = await writeGlobalRuntimeOpencodeConfig(config, (current) => {
+          const existingPermission = ensurePlainObject(current.permission);
+          const existingPermissionKeys = Object.keys(existingPermission);
+          const removePermissionParent =
+            typeof nextExternalDirectory === "undefined" &&
+              (existingPermissionKeys.length === 0 ||
+              (existingPermissionKeys.length === 1 && Object.prototype.hasOwnProperty.call(existingPermission, "external_directory")));
+          if (removePermissionParent) {
+            const { permission: _removed, ...rest } = current;
+            return rest;
+          }
+          return {
+            ...current,
+            permission: {
+              ...existingPermission,
+              external_directory: ensurePlainObject(nextExternalDirectory),
+            },
           };
-        }
+        });
+        runtimeChanged = permissionResult.changed || runtimeChanged;
       }
 
-      if (Object.keys(logicalUpdates).length || Object.prototype.hasOwnProperty.call(logicalUpdates, "permission")) {
+      if (Object.keys(logicalUpdates).length) {
         const result = await writeRuntimeOpencodeConfig(config, workspace.id, (current) => ({
           ...current,
           ...logicalUpdates,
         }));
-        runtimeChanged = result.changed;
+        runtimeChanged = result.changed || runtimeChanged;
       }
     }
     if (openwork) {
@@ -2840,9 +3563,14 @@ function createRoutes(
     readJsonBody,
     requireClientScope,
     resolveWorkspace,
-    reloadOpencodeEngine: (routeConfig, workspace) =>
-      reloadOpencodeEngine(routeConfig, workspace, engineMcpServerState),
+    reloadOpencodeEngine: async (routeConfig, workspace) => {
+      // Explicit reloads also follow provider credential writes, which are not
+      // part of the runtime-config fingerprint used by background syncs.
+      await reloadOpencodeEngine(routeConfig, workspace, engineMcpServerState, { reason: "operation_route", manual: true });
+    },
   });
+
+  registerUiControlRoutes({ routes, jsonResponse, readJsonBody, requireClientScope });
 
   registerFileRoutes({
     routes,
@@ -2879,7 +3607,7 @@ function createRoutes(
       summary: `Add plugin ${spec}`,
       paths: [openworkConfigPath(workspace.path)],
     });
-    const changed = await addPlugin(config, workspace.id, spec);
+    const changed = await addPlugin(config, spec);
     await recordAudit(workspace.path, {
       id: shortId(),
       workspaceId: workspace.id,
@@ -2912,7 +3640,7 @@ function createRoutes(
       summary: `Remove plugin ${name}`,
       paths: [openworkConfigPath(workspace.path)],
     });
-    const removed = await removePlugin(config, workspace.id, name);
+    const removed = await removePlugin(config, name);
     await recordAudit(workspace.path, {
       id: shortId(),
       workspaceId: workspace.id,
@@ -2987,6 +3715,9 @@ function createRoutes(
       action: result.action,
       path: result.path,
     });
+    // The next v2 turn should see a skill OpenWork just wrote; the engine's
+    // own watcher normally catches up within ~200 ms.
+    if (workspace.workspaceType !== "remote") await engineV2Preview.settleWorkspaceSkills(workspace.path);
     return jsonResponse({ name, path: result.path, description: description ?? "", scope: "project" });
   });
 
@@ -3020,6 +3751,7 @@ function createRoutes(
       action: "removed",
       path: result.path,
     });
+    if (workspace.workspaceType !== "remote") await engineV2Preview.settleWorkspaceSkills(workspace.path);
     return jsonResponse({ ok: true, name, path: result.path });
   });
 
@@ -3051,10 +3783,36 @@ function createRoutes(
     headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
   }));
 
+  addRoute(routes, "GET", "/workspace/:id/mcp-apps/list", "client", async (ctx) => {
+    requireClientScope(ctx, "viewer");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    try {
+      const servers = await listMcpAppCatalog({
+        serverConfig: config,
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.path,
+      });
+      return jsonResponse({ servers });
+    } catch (error) {
+      rethrowMcpAppHostError(error);
+    }
+  });
+
   addRoute(routes, "POST", "/workspace/:id/mcp-apps/resolve", "client", async (ctx) => {
     requireClientScope(ctx, "viewer");
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const body = await readJsonBody(ctx.request);
+    let context: McpAppLaunchContext | undefined;
+    if (body.context !== undefined) {
+      const parsed = body.context;
+      if (!parsed || typeof parsed !== "object" || !("sessionId" in parsed) || !("readOnly" in parsed)
+        || (parsed.sessionId !== null && (typeof parsed.sessionId !== "string" || !parsed.sessionId.trim()))
+        || ("engine" in parsed && parsed.engine !== "v1" && parsed.engine !== "v2")
+        || typeof parsed.readOnly !== "boolean") {
+        throw new ApiError(400, "invalid_launch_context", "App context requires a sessionId (null for dashboard views) and readOnly flag.");
+      }
+      context = { sessionId: parsed.sessionId, readOnly: parsed.readOnly, engine: "engine" in parsed && parsed.engine === "v2" ? "v2" : "v1" };
+    }
     const projectedToolName = typeof body.projectedToolName === "string" ? body.projectedToolName.trim() : "";
     const launch = body.launch && typeof body.launch === "object" && !Array.isArray(body.launch)
       ? body.launch as Record<string, unknown>
@@ -3063,6 +3821,7 @@ function createRoutes(
       const app = launch && typeof launch.connectionId === "string"
         ? await resolveConnectMcpAppResource({
             serverConfig: config,
+            context,
             workspaceId: workspace.id,
             workspaceRoot: workspace.path,
             launch: {
@@ -3074,16 +3833,19 @@ function createRoutes(
         : launch
           ? await resolveSameServerMcpAppResource({
               serverConfig: config,
+              context,
               workspaceId: workspace.id,
               workspaceRoot: workspace.path,
               projectedToolName,
               launch: {
                 toolName: typeof launch.toolName === "string" ? launch.toolName : "",
                 resourceUri: typeof launch.resourceUri === "string" ? launch.resourceUri : "",
+                arguments: isRecord(launch.arguments) ? launch.arguments : undefined,
               },
             })
         : await resolveMcpAppResource({
             serverConfig: config,
+            context,
             workspaceId: workspace.id,
             workspaceRoot: workspace.path,
             projectedToolName,
@@ -3101,26 +3863,72 @@ function createRoutes(
     const serverName = typeof body.serverName === "string" ? body.serverName.trim() : "";
     const name = typeof body.name === "string" ? body.name.trim() : "";
     const resourceUri = typeof body.resourceUri === "string" ? body.resourceUri.trim() : "";
+    const expectedResourceDigest = body.expectedResourceDigest;
+    if (expectedResourceDigest !== undefined && typeof expectedResourceDigest !== "string") {
+      throw new ApiError(400, "invalid_resource_digest", "expectedResourceDigest must be a SHA-256 hex digest.");
+    }
     const args = body.arguments && typeof body.arguments === "object" && !Array.isArray(body.arguments)
       ? body.arguments as Record<string, unknown>
       : {};
     const approved = body.approved === true;
+    const launchId = typeof body.launchId === "string" ? body.launchId : undefined;
+    const sessionId = typeof body.sessionId === "string" || body.sessionId === null ? body.sessionId : undefined;
+    if (body.engine !== undefined && body.engine !== "v1" && body.engine !== "v2") throw new ApiError(400, "invalid_launch_context", "Unknown App session engine.");
+    const engine = body.engine === "v2" ? "v2" : "v1";
     if (!serverName || !name) throw new ApiError(400, "invalid_payload", "serverName and name are required");
     if (approved) requireClientScope(ctx, "collaborator");
     try {
       return jsonResponse(await callMcpAppTool({
         serverConfig: config,
+        launchId,
+        sessionId,
+        engine,
         workspaceId: workspace.id,
         workspaceRoot: workspace.path,
         serverName,
         name,
         resourceUri,
+        expectedResourceDigest,
         arguments: args,
         approved,
+        assertSessionActive: async () => {
+          if (!sessionId) return;
+          if (engine === "v2") {
+            const connection = engineV2Preview.connection();
+            if (!connection) throw new McpAppHostError("inactive_session", "The original conversation engine is unavailable. Reopen it before using App actions.");
+            const url = new URL(`/api/session/${encodeURIComponent(sessionId)}`, connection.url);
+            url.searchParams.set("location[directory]", workspace.path);
+            const response = await loopbackFetch(url.toString(), {
+              headers: { authorization: `Basic ${Buffer.from(`opencode:${connection.password}`).toString("base64")}` },
+              signal: AbortSignal.timeout(10_000),
+            });
+            const payload: unknown = response.ok ? await response.json() : null;
+            const data = isRecord(payload) && isRecord(payload.data) ? payload.data : payload;
+            const session = isRecord(data) && isRecord(data.info) ? data.info : data;
+            const location = isRecord(session) && isRecord(session.location) ? session.location : null;
+            const directory = location && typeof location.directory === "string" ? location.directory : null;
+            const [expected, actual] = await Promise.all([
+              realpath(workspace.path).catch(() => workspace.path),
+              directory ? realpath(directory).catch(() => directory) : null,
+            ]);
+            if (!isRecord(session) || (session.id ?? session.sessionID) !== sessionId || !actual || actual !== expected || (isRecord(session.time) && session.time.archived)) {
+              throw new McpAppHostError("inactive_session", "The original conversation is archived or unavailable. Reopen it before using App actions.");
+            }
+            return;
+          }
+          await assertWorkspaceOwnsProxiedSessionRead(config, workspace, "GET", `/session/${encodeURIComponent(sessionId)}`, true);
+        },
       }));
     } catch (error) {
       rethrowMcpAppHostError(error);
     }
+  });
+
+  addRoute(routes, "POST", "/workspace/:id/mcp-apps/release", "client", async (ctx) => {
+    requireClientScope(ctx, "viewer");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    return jsonResponse({ released: typeof body.launchId === "string" && releaseMcpAppLaunch(config, workspace.id, body.launchId) });
   });
 
   addRoute(routes, "POST", "/workspace/:id/mcp/managed", "client", async (ctx) => {
@@ -3213,7 +4021,7 @@ function createRoutes(
     const state = ctx.url.searchParams.get("state") ?? "";
     const code = ctx.url.searchParams.get("code") ?? "";
     if (!state || !code) throw new ApiError(400, "managed_mcp_oauth_callback_invalid", "OAuth callback is missing code or state");
-    const { connection, workspaceId } = await completeLocalManagedMcpAuthorization(config, state, code);
+    const { connection, workspaceId } = await completeLocalManagedMcpAuthorization(config, state, code, ctx.url.searchParams.get("iss") ?? undefined);
     const workspace = config.workspaces.find((item) => item.id === workspaceId);
     if (workspace) {
       await syncRuntimeMcpToOpencodeEngine(config, workspace, [connection.name], undefined, engineMcpServerState).catch(() => undefined);
@@ -3233,32 +4041,6 @@ function createRoutes(
   addRoute(routes, "POST", "/mcp/managed/:workspaceId/:name", "none", managedGatewayHandler);
   addRoute(routes, "GET", "/mcp/managed/:workspaceId/:name", "none", managedGatewayHandler);
   addRoute(routes, "DELETE", "/mcp/managed/:workspaceId/:name", "none", managedGatewayHandler);
-
-  // Portable export of installed skills and MCP servers (including
-  // OpenWork-managed runtime MCPs that only live in the runtime DB), so
-  // agents can package them into marketplace plugins. Read-only; MCP
-  // secrets (headers/environment) are always redacted.
-  addRoute(routes, "POST", "/workspace/:id/extensions/export", "client", async (ctx) => {
-    const workspace = await resolveWorkspace(config, ctx.params.id);
-    const body = await readJsonBody(ctx.request);
-    const skills = Array.isArray(body.skills)
-      ? body.skills.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-      : [];
-    const mcps = Array.isArray(body.mcps)
-      ? body.mcps.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-      : [];
-    if (skills.length === 0 && mcps.length === 0) {
-      throw new ApiError(400, "invalid_payload", "At least one skill or mcp name is required");
-    }
-    const result = await exportExtensions({
-      serverConfig: config,
-      workspaceId: workspace.id,
-      workspaceRoot: workspace.path,
-      skills,
-      mcps,
-    });
-    return jsonResponse(result);
-  });
 
   addRoute(routes, "POST", "/workspace/:id/mcp", "client", async (ctx) => {
     ensureWritable(config);
@@ -3316,8 +4098,15 @@ function createRoutes(
       summary: `Remove MCP ${name}`,
       paths: [openworkConfigPath(workspace.path)],
     });
-    const managedRemoved = await deleteLocalManagedMcp(config, workspace.id, name);
-    const removed = managedRemoved || await removeMcp(config, workspace.id, name);
+    const managedRemoved = name === OPENWORK_CLOUD_MCP_NAME
+      ? false
+      : await deleteLocalManagedMcp(config, workspace.id, name);
+    const cloudRemoval = name === OPENWORK_CLOUD_MCP_NAME
+      ? await removeOpenworkCloudMcpDesiredConfig(config)
+      : null;
+    const removed = cloudRemoval
+      ? cloudRemoval.changed
+      : managedRemoved || await removeMcp(config, workspace.id, name);
     await recordAudit(workspace.path, {
       id: shortId(),
       workspaceId: workspace.id,
@@ -3328,8 +4117,14 @@ function createRoutes(
       timestamp: Date.now(),
     });
     if (removed) {
-      deleteEngineMcpRegistration(config, engineMcpServerState, workspace, name);
-      await disconnectMcpFromOpencodeEngine(config, workspace, name).catch(() => undefined);
+      const affectedWorkspaces = cloudRemoval ? config.workspaces : [workspace];
+      const removedNames = cloudRemoval ? cloudRemoval.removedNames : [name];
+      await Promise.all(affectedWorkspaces.map(async (affectedWorkspace) => {
+        for (const removedName of removedNames) {
+          deleteEngineMcpRegistration(config, engineMcpServerState, affectedWorkspace, removedName);
+          await disconnectMcpFromOpencodeEngine(config, affectedWorkspace, removedName).catch(() => undefined);
+        }
+      }));
       emitReloadEvent(ctx.reloadEvents, workspace, "mcp", {
         type: "mcp",
         name,
@@ -3550,101 +4345,6 @@ function createRoutes(
     return jsonResponse(exportPayload);
   });
 
-  addRoute(routes, "POST", "/workspace/:id/import/preview", "client", async (ctx) => {
-    requireClientScope(ctx, "viewer");
-    const workspace = await resolveWorkspace(config, ctx.params.id);
-    const body = await readJsonBody(ctx.request);
-    const preview = await buildWorkspaceImportPreview(workspace.path, body);
-    return jsonResponse(publicWorkspaceImportPreview(preview));
-  });
-
-  addRoute(routes, "POST", "/workspace/:id/import", "client", async (ctx) => {
-    ensureWritable(config);
-    requireClientScope(ctx, "collaborator");
-    const workspace = await resolveWorkspace(config, ctx.params.id);
-    const body = await readJsonBody(ctx.request);
-    const expectedFingerprint = parseWorkspaceImportPreviewFingerprint(body);
-    const preview = await buildWorkspaceImportPreview(workspace.path, body);
-    if (expectedFingerprint && expectedFingerprint !== preview.fingerprint) {
-      return jsonResponse(
-        {
-          ok: false,
-          code: "workspace_import_preview_stale",
-          message: "Workspace changed after this import was previewed. Review the latest preview before importing.",
-          preview: publicWorkspaceImportPreview(preview),
-        },
-        409,
-      );
-    }
-    const approvalPaths = workspaceImportPreviewApprovalPaths(preview);
-    if (approvalPaths.length === 0) {
-      return jsonResponse({ ok: true, preview: publicWorkspaceImportPreview(preview) });
-    }
-    if (!expectedFingerprint) {
-      return jsonResponse(
-        {
-          ok: false,
-          code: "workspace_import_preview_required",
-          message: "Review this import preview before applying workspace changes.",
-          preview: publicWorkspaceImportPreview(preview),
-        },
-        409,
-      );
-    }
-    await requireApproval(ctx, {
-      workspaceId: workspace.id,
-      action: "config.import",
-      summary: summarizeWorkspaceImportPreview(preview),
-      paths: approvalPaths,
-    });
-    const latestPreview = await buildWorkspaceImportPreview(workspace.path, body);
-    if (latestPreview.fingerprint !== expectedFingerprint) {
-      return jsonResponse(
-        {
-          ok: false,
-          code: "workspace_import_preview_stale",
-          message: "Workspace changed after this import was previewed. Review the latest preview before importing.",
-          preview: publicWorkspaceImportPreview(latestPreview),
-        },
-        409,
-      );
-    }
-    const configFingerprintBefore = await computeReloadFingerprint(workspace.path, "config");
-    await importWorkspace(config, workspace, body, latestPreview);
-    await recordAudit(workspace.path, {
-      id: shortId(),
-      workspaceId: workspace.id,
-      actor: ctx.actor ?? { type: "remote" },
-      action: "config.import",
-      target: "workspace",
-      summary: summarizeWorkspaceImportApplied(latestPreview),
-      timestamp: Date.now(),
-    });
-    if (configFingerprintBefore !== await computeReloadFingerprint(workspace.path, "config")) {
-      emitReloadEvent(ctx.reloadEvents, workspace, "config", buildConfigTrigger(opencodeConfigPath(workspace.path)));
-    }
-    return jsonResponse({ ok: true, preview: publicWorkspaceImportPreview(latestPreview) });
-  });
-
-  addRoute(routes, "POST", "/workspace/:id/blueprint/sessions/materialize", "client", async (ctx) => {
-    ensureWritable(config);
-    requireClientScope(ctx, "collaborator");
-    const workspace = await resolveWorkspace(config, ctx.params.id);
-    const result = await materializeBlueprintSessions(config, workspace);
-    await recordAudit(workspace.path, {
-      id: shortId(),
-      workspaceId: workspace.id,
-      actor: ctx.actor ?? { type: "remote" },
-      action: "blueprint.sessions.materialize",
-      target: "workspace",
-      summary: result.created.length
-        ? `Materialized ${result.created.length} template starter session${result.created.length === 1 ? "" : "s"}`
-        : "Checked template starter sessions",
-      timestamp: Date.now(),
-    });
-    return jsonResponse(result);
-  });
-
   return routes;
 }
 
@@ -3706,7 +4406,7 @@ async function resolveWorkspace(config: ServerConfig, id: string): Promise<Works
 function reloadOpencodeEngineAfterInternalBootstrap(config: ServerConfig, workspace: WorkspaceInfo): void {
   const connection = resolveWorkspaceOpencodeConnection(config, workspace);
   if (!connection.baseUrl?.trim()) return;
-  void reloadOpencodeEngine(config, workspace).catch((error) => {
+  void reloadOpencodeEngine(config, workspace, undefined, { reason: "workspace_bootstrap" }).catch((error) => {
     createServerLogger(config).log("error", `Bootstrap engine reload failed for workspace ${workspace.id}.`, {
       "workspace.id": workspace.id,
       "engine.reload.failure": error instanceof Error ? error.message : String(error),
@@ -4022,12 +4722,15 @@ function resolveOpencodeDirectory(workspace: WorkspaceInfo): string | null {
   return null;
 }
 
-function normalizeOpencodeDirectory(directory: string): string {
+export function normalizeOpencodeDirectory(
+  directory: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
   // OpenCode stores/list-filters Windows sessions by regular drive paths
   // (`C:\Users\...`). Electron can persist local workspaces as extended-length
   // paths (`\\?\C:\Users\...`); passing those through as the directory query
   // makes OpenCode return an empty session list even though the sessions exist.
-  if (process.platform === "win32") {
+  if (platform === "win32") {
     return directory.replace(/^\\\\\?\\/, "").replace(/^\/\/\?\//, "");
   }
   return directory;
@@ -4067,6 +4770,112 @@ function opencodeDisposeTimeoutMs(): number {
 }
 
 /**
+ * One workspace's live engine activity: non-idle sessions plus unanswered
+ * permission and question requests across every engine connection, including
+ * draining generations. `unknown` means a probe failed or was unreadable, so a
+ * caller that wants to interrupt the workspace must treat it as not idle.
+ */
+export type WorkspaceActivityProbe = {
+  verdict: "idle" | "busy" | "unknown";
+  busySessions: number;
+  waitingRequests: number;
+  unknownReason: "unreachable" | "unreadable" | null;
+};
+
+async function probeWorkspaceActivity(config: ServerConfig, workspace: WorkspaceInfo): Promise<WorkspaceActivityProbe> {
+  const connection = resolveWorkspaceOpencodeConnection(config, workspace);
+  const connections = new Map<string, string | undefined>();
+  if (connection.baseUrl) connections.set(connection.baseUrl, connection.authHeader);
+  // Include draining generations: a waiting permission can belong to an older
+  // engine even when the primary reports no active sessions.
+  for (const entry of enginePoolForConfig(config)?.connections() ?? []) {
+    connections.set(entry.baseUrl, buildEngineAuthProbeHeader(entry.username, entry.password));
+  }
+  type ProbeResult =
+    | { kind: "unknown"; reason: "unreachable" | "unreadable" }
+    | { kind: "sessions"; busy: number }
+    | { kind: "requests"; waiting: number };
+  const results = await Promise.all([...connections].map(async ([baseUrl, authorization]) =>
+    Promise.all(["/session/status", "/permission", "/question"].map(async (path): Promise<ProbeResult> => {
+      let payload: unknown;
+      try {
+        const url = new URL(path, baseUrl);
+        const directory = resolveOpencodeDirectory(workspace);
+        if (directory) url.searchParams.set("directory", directory);
+        const response = await loopbackFetch(url.toString(), {
+          headers: authorization ? { Authorization: authorization } : {},
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (!response.ok) throw new Error("Activity probe failed");
+        payload = await response.json();
+      } catch {
+        return { kind: "unknown", reason: "unreachable" };
+      }
+      if (path === "/session/status") {
+        if (!isRecord(payload) || Object.values(payload).some((status) => !isRecord(status) || typeof status.type !== "string")) {
+          return { kind: "unknown", reason: "unreadable" };
+        }
+        return { kind: "sessions", busy: Object.values(payload).filter((status) => isRecord(status) && status.type !== "idle").length };
+      }
+      if (!Array.isArray(payload)) return { kind: "unknown", reason: "unreadable" };
+      return { kind: "requests", waiting: payload.length };
+    }))));
+  const probe: WorkspaceActivityProbe = { verdict: "idle", busySessions: 0, waitingRequests: 0, unknownReason: null };
+  for (const result of results.flat()) {
+    if (result.kind === "sessions") probe.busySessions += result.busy;
+    else if (result.kind === "requests") probe.waitingRequests += result.waiting;
+    else probe.unknownReason ??= result.reason;
+  }
+  // A definite busy answer is authoritative even when another probe failed.
+  if (probe.busySessions > 0 || probe.waitingRequests > 0) probe.verdict = "busy";
+  else if (probe.unknownReason) probe.verdict = "unknown";
+  return probe;
+}
+
+async function requireWorkspaceRunModeIdle(config: ServerConfig, workspace: WorkspaceInfo): Promise<void> {
+  const activity = await probeWorkspaceActivity(config, workspace);
+  if (activity.verdict === "busy") {
+    throw new ApiError(409, "workspace_run_mode_busy", "Wait for all workspace sessions, including permission and question requests, to finish before changing run mode.");
+  }
+  if (activity.verdict === "unknown") {
+    throw new ApiError(409, "workspace_run_mode_activity_unknown", activity.unknownReason === "unreadable"
+      ? "OpenCode returned unreadable workspace activity; no permission change was made."
+      : "Cannot verify that all workspace sessions are idle; no permission change was made.");
+  }
+}
+
+/**
+ * The whole instance's activity, for a host (Den) deciding whether it may stop
+ * or restart this sandbox. Busy wins over unknown, unknown wins over idle, so
+ * a caller that fails closed never reads a half-answered probe as idle.
+ */
+export async function describeRuntimeActivity(config: ServerConfig): Promise<{
+  ok: true;
+  verdict: "idle" | "busy" | "unknown";
+  busySessions: number;
+  waitingRequests: number;
+  connectedClients: number;
+  workspaces: number;
+  checkedAt: string;
+}> {
+  const probes = await Promise.all(config.workspaces.map((workspace) => probeWorkspaceActivity(config, workspace)));
+  const busySessions = probes.reduce((total, probe) => total + probe.busySessions, 0);
+  const waitingRequests = probes.reduce((total, probe) => total + probe.waitingRequests, 0);
+  const verdict = busySessions > 0 || waitingRequests > 0
+    ? "busy"
+    : probes.some((probe) => probe.verdict === "unknown") ? "unknown" : "idle";
+  return {
+    ok: true,
+    verdict,
+    busySessions,
+    waitingRequests,
+    connectedClients: enginePoolForConfig(config)?.eventProxyCount() ?? 0,
+    workspaces: probes.length,
+    checkedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * True when the managed engine reports any non-idle session (subagent child
  * sessions carry their own ids and statuses, so they count too). Unknown
  * activity reports false: a reload against a dead engine fails loudly on its
@@ -4075,40 +4884,118 @@ function opencodeDisposeTimeoutMs(): number {
 async function engineHasActiveSessions(config: ServerConfig, workspace: WorkspaceInfo): Promise<boolean> {
   try {
     const opencode = createWorkspaceOpencodeClient(config, workspace);
-    const statuses = unwrapOpencodeResult(await opencode.session.status(), "/session/status");
-    return Object.values(statuses).some((status) => status.type !== "idle");
+    const statuses: unknown = unwrapOpencodeResult(await opencode.session.status(), "/session/status");
+    if (!isRecord(statuses)) return true;
+    return Object.values(statuses).some((status) => !isRecord(status) || status.type !== "idle");
   } catch {
-    return false;
+    return true;
   }
+}
+
+function primaryManagedEngineConnection(config: ServerConfig): EnginePoolConnection | null {
+  return enginePoolForConfig(config)?.connections().find((entry) => entry.role === "primary") ?? null;
+}
+
+/**
+ * Whether a tracked engine instance still reports a non-idle session. Probed
+ * directly against the managed engine (never through the workspace client) so
+ * the reaper's own probe cannot refresh the instance's last-used time.
+ * Throws on an unreadable status: unknown activity must never evict.
+ */
+async function engineInstanceHasActiveSessions(
+  config: ServerConfig,
+  instance: TrackedEngineInstance,
+): Promise<boolean> {
+  const primary = primaryManagedEngineConnection(config);
+  if (!primary || primary.baseUrl !== instance.engineBaseUrl) return false;
+  const url = new URL("/session/status", primary.baseUrl);
+  url.searchParams.set("directory", instance.directory);
+  const response = await loopbackFetch(url.toString(), {
+    headers: { Authorization: buildEngineAuthProbeHeader(primary.username, primary.password) },
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error(`OpenCode session status probe failed with status ${response.status}`);
+  const payload: unknown = await response.json();
+  if (!isRecord(payload)) return false;
+  return Object.values(payload).some((status) => isRecord(status) && status.type !== "idle");
+}
+
+/**
+ * Dispose one idle per-directory engine instance without the reload path's
+ * post-refresh sync: re-materializing the instance here would defeat the
+ * eviction. The workspace's MCP registration evidence is invalidated first so
+ * nothing claims the fresh instance already holds the runtime-DB MCPs; the
+ * reaper marks the workspace and the next traffic re-attaches that state.
+ */
+async function disposeIdleEngineInstance(
+  config: ServerConfig,
+  serverState: EngineMcpServerState,
+  instance: TrackedEngineInstance,
+): Promise<void> {
+  const primary = primaryManagedEngineConnection(config);
+  if (!primary || primary.baseUrl !== instance.engineBaseUrl) {
+    throw new Error("The managed engine connection is unavailable for the instance dispose");
+  }
+  const activeState = activeEngineMcpServerState(config, serverState);
+  if (activeState) invalidateEngineMcpWorkspace(activeState, instance.workspaceId);
+  const response = await loopbackFetch(buildOpencodeReloadUrl(primary.baseUrl, instance.directory), {
+    method: "POST",
+    headers: { Authorization: buildEngineAuthProbeHeader(primary.username, primary.password) },
+    signal: AbortSignal.timeout(opencodeDisposeTimeoutMs()),
+  });
+  if (!response.ok) throw new Error(`OpenCode instance dispose failed with status ${response.status}`);
+}
+
+/**
+ * Record engine traffic for a local workspace's directory instance. When this
+ * is the first traffic after that instance was evicted, re-attach the state a
+ * fresh instance cannot recover from disk (the runtime-DB MCP push), detached
+ * from the request that triggered it.
+ */
+function touchEngineWorkspaceInstance(config: ServerConfig, workspace: WorkspaceInfo, engineBaseUrl: string): void {
+  if (workspace.workspaceType === "remote") return;
+  const reaper = engineInstanceReaperForConfig(config);
+  if (!reaper) return;
+  const directory = resolveOpencodeDirectory(workspace);
+  if (!directory) return;
+  const evicted = reaper.noteUsed({ directory, workspaceId: workspace.id, engineBaseUrl });
+  if (!evicted) return;
+  void postEngineRefreshSync(config, workspace, activeEngineMcpServerState(config)).catch((error) => {
+    createServerLogger(config).log("error", "Post-eviction engine MCP re-sync failed.", {
+      "workspace.id": workspace.id,
+      "error.message": error instanceof Error ? error.message : String(error),
+    });
+  });
 }
 
 /**
  * Bring the engine onto current config.
  *
- * With engine rollover enabled the pool decides: an idle engine still reloads
- * in place, a busy one rolls over to a standby so live runs are not aborted.
- * Disabled (the default), this is the in-place dispose and callers keep their
- * own defer-while-busy handling.
+ * Managed engines always reload through the rollover pool: an idle engine
+ * still reloads in place, a busy one rolls over to a standby so live runs are
+ * not aborted. Attached engines have no pool, so this falls back to the
+ * in-place dispose and callers keep their own defer-while-busy handling.
  */
 async function reloadOpencodeEngine(
   config: ServerConfig,
   workspace: WorkspaceInfo,
   serverState?: EngineMcpServerState,
-  options?: { awaitPostRefreshSync?: boolean; forceStandby?: boolean },
-): Promise<void> {
-  const pool = options?.forceStandby
-    ? managedEnginePoolForConfig(config)
-    : enginePoolForConfig(config);
+  options?: { awaitPostRefreshSync?: boolean; forceStandby?: boolean; reason?: RolloverReason; manual?: boolean },
+): Promise<RolloverOutcome> {
+  const pool = enginePoolForConfig(config);
   if (pool) {
-    await pool.requestRollover({
-      reason: "engine_reload",
+    // The outcome is the caller's proof: only an applied action means the
+    // engine now reads the requested config and credentials.
+    return pool.requestRollover({
+      reason: options?.reason ?? "engine_reload",
       workspace,
+      manual: options?.manual,
       awaitPostRefreshSync: options?.awaitPostRefreshSync,
       forceStandby: options?.forceStandby,
     });
-    return;
   }
   await reloadOpencodeEngineInPlace(config, workspace, serverState, options);
+  return { action: "reloaded_in_place" };
 }
 
 async function reloadOpencodeEngineInPlace(
@@ -4168,6 +5055,13 @@ async function reloadOpencodeEngineInPlace(
     });
   }
 
+  // The reload rebuilt this directory's instance and the post-refresh sync
+  // below re-attaches its runtime state, so any pending post-eviction mark is
+  // satisfied here rather than by the next request.
+  if (directory && workspace.workspaceType !== "remote") {
+    engineInstanceReaperForConfig(config)?.noteUsed({ directory, workspaceId: workspace.id, engineBaseUrl: baseUrl });
+  }
+
   const postRefreshSync = postEngineRefreshSync(config, workspace, activeState);
   if (options?.awaitPostRefreshSync === false) {
     void postRefreshSync.catch((error) => {
@@ -4200,7 +5094,7 @@ async function postEngineRefreshSync(
   });
 }
 
-type WorkspaceMcpRefreshTrigger = "startup" | "engine_reload";
+type WorkspaceMcpRefreshTrigger = "startup" | "engine_reload" | "workspace_activate";
 
 type WorkspaceMcpRefreshRequest = {
   config: ServerConfig;
@@ -4255,14 +5149,13 @@ async function runWorkspaceMcpRefreshSync(input: WorkspaceMcpRefreshRequest): Pr
   } catch (error) {
     logPersistedCloudMcpReconcileError({ config, workspace, trigger, error });
   }
-  // The MCP re-registration above writes the runtime DB; refresh the
+  // The reconcile above may write the ENGINE_GLOBAL runtime row; refresh the
   // engine-visible file synchronously so the next provider-sync pass compares
   // against post-reload state instead of racing the async fresh-keeper and
   // reporting a phantom "changed" (which would schedule yet another reload).
   try {
-    const engineWorkspace = resolveEngineRuntimeWorkspace(config);
-    if (trigger === "engine_reload" && engineWorkspace.id === workspace.id) {
-      await writeOpenworkRuntimeConfigFile(config, workspace.id);
+    if (trigger === "engine_reload") {
+      await writeOpenworkRuntimeConfigFile(config);
     }
   } catch {
     // Best-effort: the fresh-keeper listener still converges eventually.
@@ -4317,7 +5210,7 @@ async function runRuntimeMcpSyncToOpencodeEngine(
     return { status: "skipped", syncedNames: [], failures: [] };
   }
 
-  const runtimeConfig = await readRuntimeOpencodeConfig(config, workspace.id);
+  const runtimeConfig = await readEffectiveRuntimeOpencodeConfig(config, workspace.id);
   const entries = Object.entries(runtimeMcpMap(runtimeConfig)).filter(
     ([name]) => !name.startsWith(CONNECT_MCP_SERVER_NAME_PREFIX)
       && (!onlyNames || onlyNames.includes(name)),
@@ -4354,7 +5247,9 @@ async function runRuntimeMcpSyncToOpencodeEngine(
   const failures: EngineMcpSyncFailure[] = [];
   const registrations: EngineMcpRegistrationResult[] = [];
   for (const [name, mcpConfig] of entries) {
-    const registration = await postMcpEntryWithRetry(config, workspace, url, headers, name, mcpConfig);
+    const registration = await withEngineDirectoryFence(config, workspace, () =>
+      registerRuntimeMcpEntry(config, workspace, url, headers, name, mcpConfig)
+    );
     registrations.push(registration);
     if (registration.failure) failures.push(registration.failure);
   }
@@ -4376,7 +5271,7 @@ async function runRuntimeMcpSyncToOpencodeEngine(
   );
 
   if (failures.length > 0) {
-    if (activeState && !options?.deferred && hasRetryableMcpSyncFailure(failures)) {
+    if (activeState && (!options?.deferred || failures.some((failure) => failure.deferredForActivity)) && hasRetryableMcpSyncFailure(failures)) {
       scheduleDeferredEngineMcpSync({
         config,
         state: activeState,
@@ -4427,9 +5322,59 @@ async function withEngineMcpRegistrationLock<Result>(
   }
 }
 
-// POST one MCP entry to the engine, retrying once on 5xx/network errors
-// (the engine is often mid-rebuild right after a dispose). 4xx responses
-// are not retried — they won't change.
+// Reuse verified clients and defer replacements while tasks are observed busy.
+// A health observation alone is not proof of config delivery.
+async function registerRuntimeMcpEntry(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  url: URL,
+  headers: Record<string, string>,
+  name: string,
+  mcpConfig: Record<string, unknown>,
+): Promise<EngineMcpRegistrationResult> {
+  // Explicit disabling still takes effect immediately.
+  if (mcpConfig.enabled === false) return postMcpEntryWithRetry(config, workspace, url, headers, name, mcpConfig);
+  try {
+    const response = await loopbackFetch(url, { headers, signal: AbortSignal.timeout(5_000) });
+    if (!response.ok) throw new Error("MCP status probe failed");
+    const statuses: unknown = JSON.parse(await readBoundedEngineMcpRegistrationResponse(response));
+    if (!isRecord(statuses)) throw new Error("Invalid MCP status response");
+    const live = statuses[name];
+    if (isRecord(live) && live.status === "connected") {
+      const recorded = inspectEngineMcpRegistrationDetails(config, workspace, name, mcpConfig);
+      const receipt = activeEngineMcpServerState(config)?.registrationByWorkspace.get(workspace.id)?.get(name);
+      if (recorded.status === "connected" && receipt?.configDelivered) {
+        // OpenCode's add endpoint replaces and closes even an unchanged client.
+        // Keep the client already captured by a model turn or in-flight tool.
+        return { name, status: "connected", source: "engine_status", errorSummary: null, failure: null };
+      }
+      const activityUrl = new URL(url);
+      activityUrl.pathname = "/session/status";
+      const activity = await loopbackFetch(activityUrl, { headers, signal: AbortSignal.timeout(5_000) });
+      if (!activity.ok) throw new Error("Session activity probe failed");
+      const sessions: unknown = JSON.parse(await readBoundedEngineMcpRegistrationResponse(activity));
+      if (!isRecord(sessions)) throw new Error("Invalid session activity response");
+      if (Object.values(sessions).some((session) => !isRecord(session) || session.type !== "idle")) {
+        // Prompt admission does not take the maintenance fence: this activity
+        // check is not atomic with replacement, and a new task can start after it.
+        return {
+          name, status: "failed", source: "transport_failure", errorSummary: null,
+          failure: { name, status: 503, deferredForActivity: true, message: "MCP replacement deferred until active tasks finish" },
+        };
+      }
+    }
+  } catch {
+    // Unknown liveness must not turn a background refresh into a destructive
+    // replacement. Let the existing deferred-sync path retry the probe.
+    return {
+      name, status: "failed", source: "transport_failure", errorSummary: null,
+      failure: { name, status: 503, message: "Could not verify MCP connection activity before registration" },
+    };
+  }
+  return postMcpEntryWithRetry(config, workspace, url, headers, name, mcpConfig);
+}
+
+// POST one MCP entry to the engine, retrying once on 5xx/network errors.
 async function postMcpEntryWithRetry(
   config: ServerConfig,
   workspace: WorkspaceInfo,
@@ -4449,7 +5394,7 @@ async function postMcpEntryWithRetry(
         body: JSON.stringify({ name, config: mcpConfig }),
         signal: AbortSignal.timeout(15_000),
       });
-      managedEnginePoolForConfig(config)?.reportRequestSuccess(url.origin);
+      enginePoolForConfig(config)?.reportRequestSuccess(url.origin);
       if (response.ok) {
         // OpenCode's dynamic registration endpoint historically treats every
         // 2xx response as accepted delivery and Cloud readiness verifies the
@@ -4474,7 +5419,7 @@ async function postMcpEntryWithRetry(
       };
       if (response.status < 500) return { name, status: "failed", source: "transport_failure", errorSummary: null, failure };
     } catch (error) {
-      managedEnginePoolForConfig(config)?.reportRequestFailure(url.origin, error, workspace);
+      enginePoolForConfig(config)?.reportRequestFailure(url.origin, error, workspace);
       failure = {
         name,
         registrationStatus: "failed",
@@ -4691,6 +5636,7 @@ function scheduleDeferredEngineMcpSync(input: {
 export type EngineMcpSyncFailure = {
   name: string;
   status?: number;
+  deferredForActivity?: boolean;
   registrationStatus?: EngineMcpRegistrationStatus;
   message?: string;
 };
@@ -4703,6 +5649,7 @@ export type EngineMcpSyncState = { status: "ok" | "failed"; at: number; failures
 
 type EngineMcpRegistrationRecord = {
   fingerprint: string;
+  configDelivered: boolean;
   status: EngineMcpRegistrationStatus;
   source: EngineMcpRegistrationSource;
   errorSummary: string | null;
@@ -4807,10 +5754,15 @@ export function createEnginePoolForConfig(input: {
   trustedIdentity: string | null;
 }): EnginePool {
   const { config } = input;
+  const logger = createServerLogger(config);
+  // Thread approvals live in OpenWork because the engine forgets an "always"
+  // reply whenever this pool rebuilds an instance or rolls over.
+  let threadApprovals: ThreadApprovalReplayer | null = null;
   const pool = new EnginePool({
     config,
     template: input.template,
     hooks: {
+      onDisposed: () => threadApprovals?.stop(),
       reloadInPlace: (poolConfig, workspace, options) =>
         reloadOpencodeEngineInPlace(poolConfig, workspace, undefined, options),
       engineBusy: (poolConfig, workspace) => engineHasActiveSessions(poolConfig, workspace),
@@ -4818,10 +5770,33 @@ export function createEnginePoolForConfig(input: {
         await postEngineRefreshSync(poolConfig, workspace, activeEngineMcpServerState(poolConfig));
         await syncAllWorkspacesRuntimeMcpToEngine(poolConfig);
       },
-      writeRuntimeConfigFile: (poolConfig, workspaceId) => writeOpenworkRuntimeConfigFile(poolConfig, workspaceId),
+      prepareStandby: async (poolConfig, standby) => {
+        const env = envServiceForConfig(poolConfig);
+        if (!env) return;
+        const result = await syncManagedProviderAuth({
+          config: poolConfig,
+          env,
+          logger: toManagedProviderAuthLogger(logger),
+          target: standby,
+        });
+        logger.log("info", "Engine standby seeded with managed provider credentials.", {
+          "engine.rollover.generation": standby.generationId,
+          "provider.auth.delivered": result.delivered.length,
+          "provider.auth.skipped": result.skipped.length,
+          "provider.auth.failed": result.failed.length,
+        });
+        // A generation missing even one managed credential must not be
+        // promoted: the pool keeps the live engine and the caller retries.
+        if (result.failed.length > 0) {
+          throw new Error(
+            `Managed provider credential seed failed for ${result.failed.map((entry) => entry.providerId).join(", ")}`,
+          );
+        }
+      },
+      writeRuntimeConfigFile: (poolConfig) => writeOpenworkRuntimeConfigFile(poolConfig),
       registerTrusted: (poolConfig, generation) => registerTrustedOpencodeProcess(poolConfig, generation),
       clearTrusted: (poolConfig, identity) => clearTrustedOpencodeProcess(poolConfig, identity),
-      logger: createServerLogger(config),
+      logger,
     },
   });
   pool.adoptPrimary({
@@ -4831,6 +5806,22 @@ export function createEnginePoolForConfig(input: {
     trustedIdentity: input.trustedIdentity,
   });
   setEnginePoolForConfig(config, pool);
+  threadApprovals = startThreadApprovalReplayer({
+    config,
+    primary: () => pool.connections().find((entry) => entry.role === "primary") ?? null,
+    // The engine reports an instance by its canonical path (macOS resolves
+    // /tmp and /var through /private), so compare canonical forms.
+    workspaceIdForDirectory: async (directory) => {
+      const reported = await realpath(normalizeOpencodeDirectory(directory)).catch(() => normalizeOpencodeDirectory(directory));
+      for (const workspace of config.workspaces) {
+        const owned = resolveOpencodeDirectory(workspace);
+        if (!owned) continue;
+        if (owned === reported || (await realpath(owned).catch(() => owned)) === reported) return workspace.id;
+      }
+      return null;
+    },
+    logger,
+  });
   return pool;
 }
 
@@ -5089,6 +6080,7 @@ function recordEngineMcpSyncResult(
     }
     registrations.set(name, {
       fingerprint,
+      configDelivered: registration.failure === null,
       status: registration.status,
       source: registration.source,
       errorSummary: registration.errorSummary,
@@ -5205,8 +6197,15 @@ export function refreshEngineMcpRegistrationFromLiveStatus(
     return false;
   }
   const registrations = new Map(state.registrationByWorkspace.get(workspace.id) ?? []);
+  const previous = registrations.get(name);
   registrations.set(name, {
     fingerprint,
+    // A health probe observes status, not the engine's effective credentials.
+    // It must not manufacture a delivery receipt for a changed desired config.
+    configDelivered: previous?.configDelivered === true
+      && previous.fingerprint === fingerprint
+      && previous.registrationIdentity === registrationIdentity
+      && previous.generation === state.generation,
     status,
     source: "engine_status",
     errorSummary: sanitizeEngineMcpRegistrationErrorSummary(liveError, status),
@@ -5233,7 +6232,7 @@ function deleteEngineMcpRegistration(
 function logPersistedCloudMcpReconcileResult(input: {
   config: ServerConfig;
   workspace: WorkspaceInfo;
-  trigger: "startup" | "engine_reload";
+  trigger: WorkspaceMcpRefreshTrigger;
   health: CloudMcpHealth;
 }): void {
   if (!input.health.desired.present || input.health.usable) return;
@@ -5256,7 +6255,7 @@ function logPersistedCloudMcpReconcileResult(input: {
 function logRuntimeMcpSyncError(input: {
   config: ServerConfig;
   workspace: WorkspaceInfo;
-  trigger: "startup" | "engine_reload";
+  trigger: WorkspaceMcpRefreshTrigger;
   error: unknown;
 }): void {
   createServerLogger(input.config).log(
@@ -5291,7 +6290,7 @@ function logDetachedPostEngineRefreshSyncError(input: {
 function logPersistedCloudMcpReconcileError(input: {
   config: ServerConfig;
   workspace: WorkspaceInfo;
-  trigger: "startup" | "engine_reload";
+  trigger: WorkspaceMcpRefreshTrigger;
   error: unknown;
 }): void {
   createServerLogger(input.config).log(
@@ -5312,6 +6311,8 @@ function logPersistedCloudMcpReconcileError(input: {
 // only, so other workspaces' runtime MCPs are invisible to the engine until
 // something re-syncs them. Best-effort.
 export async function syncAllWorkspacesRuntimeMcpToEngine(config: ServerConfig): Promise<void> {
+  await migrateOpenworkCloudMcpRuntimeConfig(config);
+  await migrateWorkspaceRuntimeConfigToEngineGlobal(config);
   const serverState = activeEngineMcpServerState(config);
   for (const workspace of config.workspaces) {
     await enqueueWorkspaceMcpRefreshSync({ config, workspace, serverState, trigger: "startup" });
@@ -5422,153 +6423,4 @@ function parseWorkspaceExportSensitiveMode(input: string | null): WorkspaceExpor
     return trimmed;
   }
   throw new ApiError(400, "invalid_workspace_export_sensitive_mode", `Invalid workspace export sensitive mode: ${trimmed}`);
-}
-
-function parseWorkspaceImportPreviewFingerprint(payload: Record<string, unknown>): string | null {
-  const value = payload.previewFingerprint;
-  if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string") {
-    throw new ApiError(
-      400,
-      "invalid_workspace_import_preview_fingerprint",
-      "Workspace import preview fingerprint must be a string",
-    );
-  }
-  return value;
-}
-
-function workspaceImportRelativePath(workspace: WorkspaceInfo, path: string): string {
-  return relative(workspace.path, path).replaceAll("\\", "/");
-}
-
-async function importWorkspace(config: ServerConfig, workspace: WorkspaceInfo, payload: Record<string, unknown>, preview: WorkspaceImportPlan): Promise<void> {
-  const input = normalizeWorkspaceImportPayload(workspace.path, payload);
-  const changed = new Set(
-    preview.changes
-      .filter((change) => change.action !== "unchanged")
-      .map((change) => `${change.kind}:${change.path}`),
-  );
-  const changedPath = (kind: string, path: string) => changed.has(`${kind}:${path}`);
-
-  if (
-    input.opencode !== undefined &&
-    changedPath("opencode", workspaceImportRelativePath(workspace, opencodeConfigPath(workspace.path)))
-  ) {
-    if (input.modes.opencode === "replace") {
-      await writeJsoncFile(opencodeConfigPath(workspace.path), input.opencode);
-    } else {
-      await updateJsoncTopLevel(opencodeConfigPath(workspace.path), input.opencode);
-    }
-  }
-
-  if (
-    input.openwork !== undefined &&
-    changedPath("openwork", workspaceImportRelativePath(workspace, openworkConfigPath(workspace.path)))
-  ) {
-    if (input.modes.openwork === "replace") {
-      await writeOpenworkConfigForWorkspace(config, workspace, input.openwork, false);
-    } else {
-      await writeOpenworkConfigForWorkspace(config, workspace, input.openwork, true);
-    }
-  }
-
-  if (input.sections.skills) {
-    for (const skill of input.skills) {
-      const path = workspaceImportRelativePath(workspace, join(projectSkillsDir(workspace.path), skill.name, "SKILL.md"));
-      if (!changedPath("skill", path)) continue;
-      await upsertSkill(workspace.path, skill);
-    }
-    if (input.modes.skills === "replace") {
-      for (const change of preview.changes) {
-        if (change.kind === "skill" && change.action === "delete") {
-          await rm(change.absolutePath, { recursive: true, force: true });
-        }
-      }
-    }
-  }
-
-  if (input.sections.commands) {
-    for (const command of input.commands) {
-      const path = workspaceImportRelativePath(workspace, join(projectCommandsDir(workspace.path), `${command.name}.md`));
-      if (!changedPath("command", path)) continue;
-      await upsertCommand(workspace.path, command);
-    }
-    if (input.modes.commands === "replace") {
-      for (const change of preview.changes) {
-        if (change.kind === "command" && change.action === "delete") {
-          await rm(change.absolutePath, { force: true });
-        }
-      }
-    }
-  }
-
-  if (input.sections.files) {
-    for (const file of input.files) {
-      if (!changedPath("file", file.path)) continue;
-      const path = join(workspace.path, file.path);
-      await ensureDir(dirname(path));
-      await writeFile(path, file.content, "utf8");
-    }
-    if (input.modes.files === "replace") {
-      for (const change of preview.changes) {
-        if (change.kind === "file" && change.action === "delete") {
-          await rm(change.absolutePath, { force: true });
-        }
-      }
-    }
-  }
-}
-
-async function materializeBlueprintSessions(config: ServerConfig, workspace: WorkspaceInfo): Promise<{
-  ok: boolean;
-  created: Array<{ templateId: string; sessionId: string; title: string }>;
-  existing: Array<{ templateId: string; sessionId: string }>;
-  openSessionId: string | null;
-}> {
-  const openwork = await readOpenworkConfigForWorkspace(config, workspace);
-  const templates = normalizeBlueprintSessionTemplates(openwork);
-  if (!templates.length) {
-    return { ok: true, created: [], existing: [], openSessionId: null };
-  }
-
-  const existing = readMaterializedBlueprintSessions(openwork);
-  if (existing.length > 0) {
-    const preferredTemplate = templates.find((template) => template.openOnFirstLoad) ?? templates[0] ?? null;
-    const openSessionId = preferredTemplate
-      ? existing.find((item) => item.templateId === preferredTemplate.id)?.sessionId ?? existing[0]?.sessionId ?? null
-      : existing[0]?.sessionId ?? null;
-    return { ok: true, created: [], existing, openSessionId };
-  }
-
-  const created: Array<{ templateId: string; sessionId: string; title: string }> = [];
-  const opencode = createWorkspaceOpencodeClient(config, workspace);
-  for (const template of templates) {
-    const result = unwrapOpencodeResult(await opencode.session.create({ title: template.title }), "/session");
-    const sessionId =
-      result && typeof result === "object" && "id" in result && typeof result.id === "string" ? result.id.trim() : "";
-    if (!sessionId) {
-      throw new ApiError(502, "opencode_failed", "OpenCode session did not return an id");
-    }
-    seedOpencodeSessionMessages({
-      sessionId,
-      workspaceRoot: resolveOpencodeDirectory(workspace) ?? workspace.path,
-      messages: template.messages,
-    });
-    created.push({ templateId: template.id, sessionId, title: template.title });
-  }
-
-  const now = Date.now();
-  const nextOpenwork = applyMaterializedBlueprintSessions(
-    openwork,
-    created.map(({ templateId, sessionId }) => ({ templateId, sessionId })),
-    now,
-  );
-  await writeOpenworkConfigForWorkspace(config, workspace, nextOpenwork, false);
-
-  const preferredTemplate = templates.find((template) => template.openOnFirstLoad) ?? templates[0] ?? null;
-  const openSessionId = preferredTemplate
-    ? created.find((item) => item.templateId === preferredTemplate.id)?.sessionId ?? created[0]?.sessionId ?? null
-    : created[0]?.sessionId ?? null;
-
-  return { ok: true, created, existing: [], openSessionId };
 }

@@ -5,6 +5,17 @@ import { useLocal } from "../../../kernel/local-provider";
 export function useFeatureFlagsPreferences() {
   const { prefs, setPrefs } = useLocal();
 
+  const workspaceRunModeEnabled = prefs.featureFlags?.workspaceRunMode === true;
+  const toggleWorkspaceRunMode = useCallback(() => {
+    setPrefs((previous) => ({
+      ...previous,
+      featureFlags: {
+        ...previous.featureFlags,
+        workspaceRunMode: !previous.featureFlags?.workspaceRunMode,
+      },
+    }));
+  }, [setPrefs]);
+
   const microsandboxCreateSandboxEnabled =
     prefs.featureFlags?.microsandboxCreateSandbox === true;
 
@@ -18,36 +29,10 @@ export function useFeatureFlagsPreferences() {
     }));
   }, [setPrefs]);
 
-  const memoryEnabled = prefs.featureFlags?.memory === true;
-
-  const continuousEngineEnabled = prefs.featureFlags?.continuousEngine === true;
-
-  const setContinuousEngine = useCallback((enabled: boolean) => {
-    setPrefs((previous) => ({
-      ...previous,
-      featureFlags: {
-        ...previous.featureFlags,
-        continuousEngine: enabled,
-      },
-    }));
-  }, [setPrefs]);
-
-  const toggleMemory = useCallback(() => {
-    setPrefs((previous) => ({
-      ...previous,
-      featureFlags: {
-        ...previous.featureFlags,
-        memory: !previous.featureFlags?.memory,
-      },
-    }));
-  }, [setPrefs]);
-
   return {
+    workspaceRunModeEnabled,
+    toggleWorkspaceRunMode,
     microsandboxCreateSandboxEnabled,
     toggleMicrosandboxCreateSandbox,
-    continuousEngineEnabled,
-    setContinuousEngine,
-    memoryEnabled,
-    toggleMemory,
   };
 }

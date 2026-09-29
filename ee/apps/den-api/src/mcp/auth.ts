@@ -7,6 +7,7 @@ import {
   auth,
   DEN_MCP_FIRST_PARTY_CLIENT_ID,
   DEN_MCP_FIRST_PARTY_RESOURCES,
+  DEN_MCP_GRANT_ID_CLAIM,
   DEN_MCP_OPAQUE_ACCESS_TOKEN_PREFIX,
   DEN_MCP_ORG_ID_CLAIM,
   DEN_MCP_OAUTH_RESOURCE,
@@ -21,6 +22,7 @@ import { publicRequestUrl } from "../request-url.js"
 import { DEN_JWT_SIGNING_ALGORITHM, getDenAuthIssuer } from "./jwt-policy.js"
 import { mcpProtectedResourceMetadataUrl, mcpRouteResource, resolveMcpResourceFromRequest, type McpResourceRoute } from "./resource.js"
 import { DEN_MCP_REQUESTED_SCOPE } from "./scopes.js"
+import { getMcpGrantLiveness } from "./grant-liveness.js"
 import { getMcpSessionLiveness } from "./session-liveness.js"
 export { hasActiveMcpSession } from "./session-liveness.js"
 
@@ -266,12 +268,15 @@ export async function hasActiveMcpMembership(input: { userId: string; organizati
   return await cache.org.membership(principal) !== null
 }
 
+class McpSigningKeysUnavailable extends Error {}
+
 async function getJwks() {
-  const response = await auth.handler(new Request(`${env.betterAuthUrl}/api/auth/jwks`))
-  if (!response.ok) {
-    throw new Error("Unable to load auth JWKS")
+  try {
+    // Internal verification must not consume the public auth HTTP rate limit.
+    return await auth.api.getJwks()
+  } catch (cause) {
+    throw new McpSigningKeysUnavailable("Unable to load auth JWKS", { cause })
   }
-  return response.json()
 }
 
 async function verifyJwtMcpToken(token: string) {
@@ -300,6 +305,8 @@ async function verifyOpaqueMcpToken(token: string) {
 
   const storedScopes = readStoredScopes(accessToken.scopes)
   const resource = accessToken.clientId === DEN_MCP_FIRST_PARTY_CLIENT_ID ? DEN_MCP_RESOURCE : DEN_MCP_OAUTH_RESOURCE
+  // Only first-party opaque tokens are accepted below. Those skip OAuth consent,
+  // so they intentionally remain session-coupled through the compatibility path.
   return {
     sub: accessToken.userId,
     scope: storedScopes.join(" "),
@@ -327,8 +334,19 @@ export async function verifyMcpRequest(headers: Headers, optionsInput?: string |
 
   let verifiedToken: VerifiedMcpToken | null
   if (token.includes(".")) {
-    const payload = await verifyJwtMcpToken(token).catch(() => null)
-    verifiedToken = payload ? { payload, source: "jwt" } : null
+    try {
+      const payload = await verifyJwtMcpToken(token)
+      verifiedToken = payload ? { payload, source: "jwt" } : null
+    } catch (error) {
+      if (error instanceof McpSigningKeysUnavailable) {
+        return mcpJsonResponse(503, {
+          error: "mcp_signing_keys_unavailable",
+          message: "OpenWork could not verify the token signing key. Retry shortly.",
+          referenceId,
+        }, undefined, { "retry-after": "10" })
+      }
+      verifiedToken = null
+    }
   } else {
     const payload = await verifyOpaqueMcpToken(token)
     verifiedToken = payload ? { payload, source: "opaque" } : null
@@ -388,34 +406,56 @@ export async function verifyMcpRequest(headers: Headers, optionsInput?: string |
     }, bearerChallenge({ metadataUrl: options.metadataUrl, error: "invalid_token", message }))
   }
 
-  const sessionId = readStringClaim(payload, "sid")
-  if (!sessionId) {
-    const message = "The MCP bearer token is not tied to an active session."
-    return mcpJsonResponse(401, {
-      error: "mcp_session_required",
-      oauthError: "invalid_token",
-      message,
-      referenceId,
-    }, bearerChallenge({ metadataUrl: options.metadataUrl, error: "invalid_token", message }))
-  }
+  const grantId = readStringClaim(payload, DEN_MCP_GRANT_ID_CLAIM)
+  if (grantId) {
+    const grantLiveness = await getMcpGrantLiveness(grantId)
+    if (grantLiveness === "check_failed") {
+      return mcpJsonResponse(503, {
+        error: "mcp_grant_check_unavailable",
+        message: "OpenWork could not verify the token grant. Retry shortly.",
+        referenceId,
+      }, undefined, { "retry-after": "10" })
+    }
 
-  const sessionLiveness = await getMcpSessionLiveness(sessionId)
-  if (sessionLiveness === "check_failed") {
-    return mcpJsonResponse(503, {
-      error: "mcp_session_check_unavailable",
-      message: "OpenWork could not verify the token session. Retry shortly.",
-      referenceId,
-    }, undefined, { "retry-after": "10" })
-  }
+    if (grantLiveness === "missing") {
+      const message = "The MCP bearer token grant is missing or revoked."
+      return mcpJsonResponse(401, {
+        error: "mcp_grant_revoked",
+        oauthError: "invalid_token",
+        message,
+        referenceId,
+      }, bearerChallenge({ metadataUrl: options.metadataUrl, error: "invalid_token", message }))
+    }
+  } else {
+    const sessionId = readStringClaim(payload, "sid")
+    if (!sessionId) {
+      const message = "The MCP bearer token is not tied to an active session."
+      return mcpJsonResponse(401, {
+        error: "mcp_session_required",
+        oauthError: "invalid_token",
+        message,
+        referenceId,
+      }, bearerChallenge({ metadataUrl: options.metadataUrl, error: "invalid_token", message }))
+    }
 
-  if (sessionLiveness === "missing") {
-    const message = "The MCP bearer token session is missing, expired, or revoked."
-    return mcpJsonResponse(401, {
-      error: "mcp_session_revoked",
-      oauthError: "invalid_token",
-      message,
-      referenceId,
-    }, bearerChallenge({ metadataUrl: options.metadataUrl, error: "invalid_token", message }))
+    const sessionLiveness = await getMcpSessionLiveness(sessionId)
+    if (sessionLiveness === "check_failed") {
+      return mcpJsonResponse(503, {
+        error: "mcp_session_check_unavailable",
+        message: "OpenWork could not verify the token session. Retry shortly.",
+        referenceId,
+      }, undefined, { "retry-after": "10" })
+    }
+
+    if (sessionLiveness === "missing") {
+      const message = "The MCP bearer token session is missing, expired, or revoked."
+      return mcpJsonResponse(401, {
+        error: "mcp_session_revoked",
+        oauthError: "invalid_token",
+        message,
+        referenceId,
+      }, bearerChallenge({ metadataUrl: options.metadataUrl, error: "invalid_token", message }))
+    }
   }
 
   if (!(await hasActiveMcpMembership({ userId, organizationId }))) {

@@ -1,12 +1,12 @@
 "use client";
 
 import { ArrowRight, Check, Loader2, Plus } from "lucide-react";
+import { GOOGLE_WORKSPACE_QUICK_ADD_ID, MICROSOFT_365_QUICK_ADD_ID } from "./connector-catalog";
 import { EFFORT_LABELS, type ConnectorEffort, presetEffort } from "./connector-effort";
 import type { ExternalMcpConnection, ExternalMcpPreset } from "./mcp-connections-data";
 import { IntegrationIcon } from "./integration-icon";
 
-export const GOOGLE_WORKSPACE_QUICK_ADD_ID = "google-workspace";
-export const MICROSOFT_365_QUICK_ADD_ID = "microsoft-365";
+export { GOOGLE_WORKSPACE_QUICK_ADD_ID, MICROSOFT_365_QUICK_ADD_ID };
 
 const SUITE_CONNECTORS = [
   {
@@ -111,7 +111,7 @@ export function ConnectorQuickAddGrid({
                   type="button"
                   data-testid={suite.id === MICROSOFT_365_QUICK_ADD_ID ? "quick-add-microsoft-365" : undefined}
                   onClick={() => onSelect(suite.id)}
-                  className="rounded-2xl border border-gray-100 bg-white p-3.5 text-left transition hover:border-gray-300 hover:shadow-sm"
+                  className="rounded-2xl border border-gray-100 bg-white p-3.5 text-left transition hover:border-gray-300 hover:shadow-xs"
                 >
                   <div className="flex items-start gap-2.5">
                     <IntegrationIcon
@@ -158,7 +158,7 @@ export function ConnectorQuickAddGrid({
                     else if (effort === "instant") onInstantAdd(preset);
                     else onSelect(preset.presetId);
                   }}
-                  className={`rounded-2xl border bg-white p-3.5 text-left transition hover:border-gray-300 hover:shadow-sm ${
+                  className={`rounded-2xl border bg-white p-3.5 text-left transition hover:border-gray-300 hover:shadow-xs ${
                     connection ? "border-emerald-200" : "border-gray-100"
                   }`}
                 >

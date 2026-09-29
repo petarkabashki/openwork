@@ -55,6 +55,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
+export function stripUndefinedEntries(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return Array.from(value, (entry) => entry === undefined ? null : stripUndefinedEntries(entry))
+  }
+  if (!isRecord(value)) return value
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return value
+  const stripped: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== undefined) stripped[key] = stripUndefinedEntries(entry)
+  }
+  return stripped
+}
+
 function isCodemodeJsonSchema(value: unknown): value is Tool.JsonSchema {
   return isRecord(value)
 }
@@ -95,6 +109,31 @@ export function restrictCodemodeToolTree(input: {
   }
 }
 
+export function restrictReadOnlyCodemodeToolTree(input: {
+  built: BuiltCodemodeTools
+  requiredCapabilities: readonly CodemodeManifestEntry[]
+}): { tools: CodemodeToolTree; missing: CodemodeManifestEntry[]; unsafe: CodemodeManifestEntry[] } {
+  const restricted = restrictCodemodeToolTree(input)
+  const missing = new Set(restricted.missing)
+  const unsafe: CodemodeManifestEntry[] = []
+  const permitted: CodemodeManifestEntry[] = []
+  for (const required of input.requiredCapabilities) {
+    if (missing.has(required)) continue
+    const entries = input.built.manifest.filter((entry) =>
+      entry.scriptPath === required.scriptPath && entry.capabilityName === required.capabilityName)
+    if (entries.length === 0 || entries.some((entry) => entry.authority !== "den" || entry.readOnly !== true)) {
+      unsafe.push(required)
+      continue
+    }
+    permitted.push(required)
+  }
+  return {
+    tools: restrictCodemodeToolTree({ built: input.built, requiredCapabilities: permitted }).tools,
+    missing: restricted.missing,
+    unsafe,
+  }
+}
+
 /**
  * Unattended Cloud runs may be retried after a lost lease, so Phase 1 admits
  * only read-only capabilities implemented by Den itself. External MCP tools
@@ -121,6 +160,9 @@ function textParts(value: unknown): string[] {
 }
 
 function toolResultValue(value: unknown): unknown {
+  // Den routes attach their untruncated payload for scripts; the model-visible
+  // `content` is capped per string and would silently cut long files.
+  if (isRecord(value) && "payload" in value) return value.payload
   if (isRecord(value) && value.structuredContent !== undefined) return value.structuredContent
   const text = textParts(value)
   if (text.length === 0) return null
@@ -155,11 +197,13 @@ export function buildDenCatalogToolTree(input: {
   const definitions = operations.map((operation) => [operation.name, Tool.make({
     description: operation.operation.summary ?? operation.operation.description ?? operation.name,
     input: denInputJsonSchema(operation),
+    output: operation.outputSchema,
     run: (toolInput) => Effect.promise(() => invokeMcpOperation({
       app: input.app,
       env: input.env,
       operation,
       principal: input.principal,
+      includePayload: true,
       toolInput: {
         path: normalizeToolRecord(isRecord(toolInput) ? toolInput.path : undefined),
         query: normalizeToolRecord(isRecord(toolInput) ? toolInput.query : undefined),
@@ -225,6 +269,7 @@ export async function buildNativeProviderToolTree(input: {
     const definitions = nativeOperations(input.catalog, connection.nativeProviderKey).map((operation) => [operation.name, Tool.make({
       description: operation.operation.summary ?? operation.operation.description ?? operation.name,
       input: denInputJsonSchema(operation),
+      output: operation.outputSchema,
       run: (toolInput) => Effect.promise(() => executeNativeCapability({
         app: input.app,
         env: input.env,
@@ -233,6 +278,7 @@ export async function buildNativeProviderToolTree(input: {
         member: memberIdentity,
         catalog: input.catalog,
         principal: input.principal,
+        includePayload: true,
         path: normalizeToolRecord(isRecord(toolInput) ? toolInput.path : undefined),
         query: normalizeToolRecord(isRecord(toolInput) ? toolInput.query : undefined),
         body: normalizeToolBody(isRecord(toolInput) ? toolInput.body : undefined),
@@ -285,6 +331,7 @@ function isListedExternalConnection(value: ListedExternalConnection | undefined)
 export async function buildExternalMcpToolTree(input: {
   organizationId: string
   member: McpMemberIdentity | null
+  scopes: ReadonlySet<string>
   redirectUriBase: string
   namespaceContext?: CodemodeConnectionNamespaceContext
 }): Promise<BuiltCodemodeTools> {
@@ -324,9 +371,10 @@ export async function buildExternalMcpToolTree(input: {
       run: (args) => Effect.promise(() => executeExternalCapability({
         organizationId: input.organizationId,
         member: memberIdentity,
+        scopes: input.scopes,
         connectionId: connection.id,
         toolName: tool.name,
-        args,
+        args: stripUndefinedEntries(args),
         redirectUriBase: input.redirectUriBase,
       })).pipe(Effect.flatMap((result) => result.ok
         ? Effect.succeed(toolResultValue(result.result))
@@ -344,7 +392,8 @@ export async function buildExternalMcpToolTree(input: {
         .map((tool) => ({
           scriptPath: codemodeScriptPath(namespace, tool.name),
           capabilityName: buildExternalCapabilityName(connection.id, tool.name),
-          readOnly: tool.annotations?.readOnlyHint === true,
+          // Descriptive only: external dispatch always requires the caller's write scope.
+          readOnly: tool.annotations?.readOnlyHint === true && tool.annotations?.destructiveHint !== true,
           authority: "external" as const,
         }))
     }),

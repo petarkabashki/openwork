@@ -36,6 +36,11 @@
       "development": "./src/schema/org.ts",
       "default": "./dist/schema/org.js"
     },
+    "./schema/remote-session-commands": {
+      "types": "./src/schema/remote-session-commands.ts",
+      "development": "./src/schema/remote-session-commands.ts",
+      "default": "./dist/schema/remote-session-commands.js"
+    },
     "./schema/teams": {
       "types": "./src/schema/teams.ts",
       "development": "./src/schema/teams.ts",
@@ -61,6 +66,21 @@
       "development": "./src/schema/telemetry.ts",
       "default": "./dist/schema/telemetry.js"
     },
+    "./audit-accounting": {
+      "types": "./src/audit-accounting.ts",
+      "development": "./src/audit-accounting.ts",
+      "default": "./dist/audit-accounting.js"
+    },
+    "./audit-log": {
+      "types": "./src/audit-log.ts",
+      "development": "./src/audit-log.ts",
+      "default": "./dist/audit-log.js"
+    },
+    "./gateway-usage-limits": {
+      "types": "./src/gateway-usage-limits.ts",
+      "development": "./src/gateway-usage-limits.ts",
+      "default": "./dist/gateway-usage-limits.js"
+    },
     "./drizzle": {
       "types": "./src/drizzle.ts",
       "development": "./src/drizzle.ts",
@@ -71,11 +91,18 @@
     "build": "pnpm run build:utils && tsup && tsup --config tsup.scripts.config.ts && node scripts/build-assets.mjs",
     "build:utils": "pnpm --dir ../utils run build",
     "db:baseline": "node --import tsx scripts/baseline-migrations.ts",
+    "db:migrate:local": "node --import tsx scripts/dev-migrate.ts",
     "db:bootstrap": "pnpm run build && node dist/scripts/bootstrap.js",
-    "db:generate": "pnpm run build && node --import tsx ./node_modules/drizzle-kit/bin.cjs generate --config drizzle.config.ts",
-    "db:migrate": "pnpm run build && node --import tsx ./node_modules/drizzle-kit/bin.cjs migrate --config drizzle.config.ts && node --import tsx scripts/ensure-fulltext-indexes.ts && node --import tsx scripts/ensure-schema-repairs.ts",
-    "db:push": "pnpm run build && node --import tsx ./node_modules/drizzle-kit/bin.cjs push --config drizzle.config.ts && node --import tsx scripts/ensure-fulltext-indexes.ts && node --import tsx scripts/ensure-schema-repairs.ts",
+    "db:generate": "node --conditions=development --import tsx ./node_modules/drizzle-kit/bin.cjs generate --config drizzle.config.ts",
+    "db:migrate": "node --conditions=development --import tsx ./node_modules/drizzle-kit/bin.cjs migrate --config drizzle.config.ts && node --conditions=development --import tsx scripts/ensure-schema-repairs.ts",
+    "db:push": "node --conditions=development --import tsx ./node_modules/drizzle-kit/bin.cjs push --config drizzle.config.ts && node --conditions=development --import tsx scripts/ensure-schema-repairs.ts",
     "test": "NODE_OPTIONS=--conditions=development tsx --test test/*.test.ts",
+    "test:audit": "NODE_OPTIONS=--conditions=development tsx --test --test-concurrency=1 test/audit-log.test.ts test/audit-migration.test.ts test/audit-accounting.test.ts",
+    "test:audit:db": "DEN_AUDIT_TEST_DATABASE_URL=${DEN_AUDIT_TEST_DATABASE_URL:?Set an isolated loopback audit_logs_test database URL} NODE_OPTIONS=--conditions=development tsx --test --test-concurrency=1 test/audit-log-db.test.ts",
+    "typecheck:audit": "tsc -p tsconfig.audit-test.json --pretty false",
+    "test:usage-limits": "NODE_OPTIONS=--conditions=development tsx --test --test-concurrency=1 test/gateway-usage-limits.test.ts test/gateway-usage-migration.test.ts",
+    "test:usage-limits:db": "DEN_USAGE_TEST_DATABASE_URL=${DEN_USAGE_TEST_DATABASE_URL:?Set an isolated loopback usage_limits_test database URL} NODE_OPTIONS=--conditions=development tsx --test --test-concurrency=1 test/gateway-usage-limits-db.test.ts",
+    "typecheck:usage-limits": "tsc -p tsconfig.usage-limits-test.json --pretty false",
     "db:verify-memory": "pnpm run build && node --import tsx scripts/verify-memory-schema.ts",
     "benchmark:admin-scale:mysql": "node --import tsx scripts/admin-scale-benchmark.ts"
   },
@@ -84,7 +111,7 @@
     "@openwork-ee/utils": "workspace:*",
     "@planetscale/database": "^1.19.0",
     "drizzle-orm": "^0.45.2",
-    "mysql2": "^3.11.3"
+    "mysql2": "^3.23.1"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",

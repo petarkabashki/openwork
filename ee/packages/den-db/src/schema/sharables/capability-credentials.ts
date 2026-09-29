@@ -4,6 +4,7 @@ import {
   index,
   mysqlEnum,
   mysqlTable,
+  text,
   timestamp,
   uniqueIndex,
   varchar,
@@ -170,6 +171,7 @@ export const ExternalMcpConnectionTable = mysqlTable(
       "organization_id",
     ).notNull(),
     name: varchar("name", { length: 255 }).notNull(),
+    externalKey: varchar("external_key", { length: 128 }),
     url: varchar("url", { length: 2048 }).notNull(),
     authType: mysqlEnum("auth_type", externalMcpAuthTypeValues).notNull(),
     /**
@@ -194,6 +196,15 @@ export const ExternalMcpConnectionTable = mysqlTable(
      */
     oauthConfiguration: compatJsonColumn<ExternalMcpOAuthConfiguration>("oauth_configuration"),
     toolPolicy: compatJsonColumn<ExternalMcpToolPolicy>("tool_policy"),
+    /**
+     * When true, granted members may reach this connection as a standard MCP
+     * server through Den's per-connection endpoint: the provider's own tool
+     * catalog is listed and callable directly instead of only through the
+     * bounded search_capabilities/execute_capability pair. Access grants and
+     * the tool policy still apply on every request. Defaults to false so
+     * existing connections keep the bounded surface.
+     */
+    exposeDirectly: boolean("expose_directly").notNull().default(false),
     /**
      * How the connection's credential relates to people:
      * - "shared": one org-level credential (this row's token columns, or
@@ -220,7 +231,7 @@ export const ExternalMcpConnectionTable = mysqlTable(
     accessToken: encryptedTextColumn("access_token"),
     refreshToken: encryptedTextColumn("refresh_token"),
     tokenType: varchar("token_type", { length: 64 }),
-    scope: varchar("scope", { length: 1024 }),
+    scope: text("scope"),
     expiresAt: timestamp("expires_at", { fsp: 3 }),
     /**
      * Transient PKCE code verifier, present only between connect/start and
@@ -246,6 +257,10 @@ export const ExternalMcpConnectionTable = mysqlTable(
   },
   (table) => [
     index("external_mcp_connection_organization_id").on(table.organizationId),
+    uniqueIndex("external_mcp_connection_org_external_key").on(
+      table.organizationId,
+      table.externalKey,
+    ),
   ],
 )
 

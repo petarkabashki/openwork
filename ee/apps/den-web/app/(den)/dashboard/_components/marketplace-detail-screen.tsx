@@ -59,7 +59,7 @@ const COMPONENT_TYPE_LABELS: Record<string, { singular: string; plural: string }
   mcp_server: { singular: "MCP server", plural: "MCP servers" },
   lsp_server: { singular: "LSP server", plural: "LSP servers" },
   monitor: { singular: "monitor", plural: "monitors" },
-  script: { singular: "Program", plural: "Programs" },
+  workflow: { singular: "Workflow", plural: "Workflows" },
   settings: { singular: "setting", plural: "settings" },
 };
 
@@ -843,7 +843,7 @@ function AccessAddPicker({
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder={`Search ${label.toLowerCase()}...`}
-              className="w-full bg-transparent text-[12.5px] text-gray-900 placeholder:text-gray-400 focus:outline-none"
+              className="w-full bg-transparent text-[12.5px] text-gray-900 placeholder:text-gray-400 focus:outline-hidden"
               autoFocus
             />
           </div>

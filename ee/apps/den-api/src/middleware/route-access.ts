@@ -1,4 +1,5 @@
 import type { MiddlewareHandler } from "hono"
+import { INSUFFICIENT_SCOPE_CHALLENGE, requiresAdminError } from "../agent-error-envelope.js"
 import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { getMcpResourceContext, verifyMcpRequest } from "../mcp/auth.js"
 import { DEN_MCP_WRITE_SCOPE } from "../mcp/scopes.js"
@@ -6,7 +7,7 @@ import { getOrganizationContextForUser } from "../orgs.js"
 import { organizationRoleValueSatisfies } from "../organization-role-hierarchy.js"
 import type { AuthContextVariables } from "../session.js"
 import { requireAdminMiddleware } from "./admin.js"
-import { requireUserMiddleware } from "./current-user.js"
+import { requireUserMiddleware, requireUserSessionMiddleware } from "./current-user.js"
 import { resolveOrganizationContextMiddleware, type OrganizationContextVariables } from "./organization-context.js"
 import { resolveUserOrganizationsMiddleware, type UserOrganizationsContext } from "./user-organizations.js"
 
@@ -47,6 +48,7 @@ const cloudTransportRouteHandler: MiddlewareHandler<{ Variables: OrganizationCon
 const explicitAuthGuardHandlers = new WeakSet<object>([
   requireAdminMiddleware,
   requireUserMiddleware,
+  requireUserSessionMiddleware,
   resolveOrganizationContextMiddleware,
   resolveUserOrganizationsMiddleware,
   cloudTransportRouteHandler,
@@ -96,6 +98,10 @@ export function authenticatedRoute(): MiddlewareHandler<{ Variables: AuthContext
   return requireUserMiddleware
 }
 
+export function userSessionRoute(): MiddlewareHandler<{ Variables: AuthContextVariables }> {
+  return requireUserSessionMiddleware
+}
+
 export function adminRoute(): MiddlewareHandler<{ Variables: AuthContextVariables }> {
   return requireAdminMiddleware
 }
@@ -126,7 +132,13 @@ export function orgRoleRoute(roles: readonly string[]): MiddlewareHandler<{ Vari
 
       const allowed = verifyOrgRole({ roles, userContext: payload.currentMember })
       if (!allowed) {
-        roleResponse = c.json({ error: "forbidden" }, 403)
+        c.header("WWW-Authenticate", INSUFFICIENT_SCOPE_CHALLENGE)
+        roleResponse = c.json({
+          error: "forbidden",
+          ...requiresAdminError(roles.includes("admin")
+            ? "Only workspace owners and admins can do this. Ask one of them, or have them change your role."
+            : "Only the workspace owner can do this."),
+        }, 403)
         return
       }
 

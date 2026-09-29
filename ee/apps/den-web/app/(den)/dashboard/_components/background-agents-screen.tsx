@@ -69,13 +69,13 @@ function CredentialField({
         <input
           readOnly
           value={value}
-          className="flex-1 rounded-lg border border-gray-200 bg-white px-3 py-2 text-[12px] font-mono text-gray-600 outline-none shadow-sm transition-colors focus:border-gray-300"
+          className="flex-1 rounded-lg border border-gray-200 bg-white px-3 py-2 text-[12px] font-mono text-gray-600 outline-hidden shadow-xs transition-colors focus:border-gray-300"
           onClick={(event) => event.currentTarget.select()}
         />
         <button
           type="button"
           onClick={() => onCopy(id, value)}
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 shadow-sm transition-colors hover:border-gray-300 hover:text-gray-700"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-400 shadow-xs transition-colors hover:border-gray-300 hover:text-gray-700"
           aria-label={`Copy ${label}`}
         >
           {copied ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
@@ -192,7 +192,7 @@ function SandboxCard({
                 }
               }}
               disabled={!openDesktopUrl}
-              className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-gray-900 py-2.5 text-[13px] font-medium text-white shadow-sm transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
+              className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-gray-900 py-2.5 text-[13px] font-medium text-white shadow-xs transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
             >
               <Monitor size={15} /> Open in desktop
             </button>
@@ -202,7 +202,7 @@ function SandboxCard({
                 href={openWebUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-gray-200 bg-white py-2.5 text-[13px] font-medium text-gray-700 shadow-sm transition-colors hover:bg-gray-50"
+                className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-gray-200 bg-white py-2.5 text-[13px] font-medium text-gray-700 shadow-xs transition-colors hover:bg-gray-50"
               >
                 <ExternalLink size={15} /> Open in web
               </a>
@@ -210,7 +210,7 @@ function SandboxCard({
               <button
                 type="button"
                 disabled
-                className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-gray-200 bg-white py-2.5 text-[13px] font-medium text-gray-700 shadow-sm opacity-60"
+                className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-gray-200 bg-white py-2.5 text-[13px] font-medium text-gray-700 shadow-xs opacity-60"
               >
                 <ExternalLink size={15} /> Open in web
               </button>
@@ -312,7 +312,7 @@ export function BackgroundAgentsScreen() {
         `/v1/workers/${encodeURIComponent(workerId)}/tokens`,
         {
           method: "POST",
-          body: JSON.stringify({}),
+          body: JSON.stringify({ includeExpiringOpenworkUrl: true }),
         },
         12000,
       );
@@ -334,7 +334,7 @@ export function BackgroundAgentsScreen() {
         clientToken: tokens.clientToken,
         openworkAppConnectUrl: buildOpenworkAppConnectUrl(
           runtimeConfig.openworkAppConnectUrl,
-          tokens.openworkUrl,
+          tokens.previewOpenworkUrl,
           tokens.clientToken,
           workerId,
           workerName,
@@ -342,7 +342,7 @@ export function BackgroundAgentsScreen() {
         ),
         openworkDeepLink: buildOpenworkDeepLink(
           tokens.openworkUrl,
-          tokens.clientToken,
+          tokens.hostToken ?? tokens.ownerToken,
           workerId,
           workerName,
         ),
@@ -385,7 +385,7 @@ export function BackgroundAgentsScreen() {
       description="Run selected workflows in the background without asking each teammate to run them locally. Coming soon."
       colors={["#E9FFE0", "#3E9A1D", "#B3F750", "#51F0A3"]}
     >
-      <div className="mb-10 rounded-2xl border border-amber-100 bg-amber-50 px-4 py-3 text-[13px] leading-6 text-amber-800">
+      <div className="mb-10 rounded-2xl border border-[var(--dls-border)] bg-[var(--dls-hover)] px-4 py-3 text-[13px] leading-6 text-[var(--dls-text-primary)]">
         New cloud workspaces are no longer available from this page. Existing workspaces remain available below.
       </div>
 

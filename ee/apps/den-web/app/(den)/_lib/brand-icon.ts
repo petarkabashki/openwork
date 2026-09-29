@@ -20,20 +20,55 @@ export function apexDomain(serviceUrl?: string | null): string | undefined {
 const BUNDLED_ICONS_BY_APEX: Record<string, string> = {
   "notion.com": "/integrations/notion.svg",
   "linear.app": "/integrations/linear.svg",
+  "slack.com": "/integrations/slack.svg",
   "stripe.com": "/integrations/stripe.svg",
   "sentry.dev": "/integrations/sentry.svg",
   "sentry.io": "/integrations/sentry.svg",
   "context7.com": "/integrations/context7.png",
   "google.com": "/integrations/google.svg",
+  "openai.com": "/integrations/openai.svg",
+  "openworklabs.com": "/openwork-mark.svg",
+};
+
+const BUNDLED_ICONS_BY_SLUG: Record<string, string> = {
+  openai: "/integrations/openai.svg",
+  openwork: "/openwork-mark.svg",
+  slack: "/integrations/slack.svg",
 };
 
 const SIMPLE_ICON_SLUG_BY_APEX: Record<string, string> = {
+  "githubcopilot.com": "github",
+  "github.com": "github",
   "slack.com": "slack",
   "granola.ai": "granola",
   "polar.sh": "polar",
   "exa.ai": "exa",
   "render.com": "render",
 };
+
+export function safeBrandImageUrl(value?: string): string | undefined {
+  if (!value) return undefined;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 31 || (code >= 127 && code <= 159) || code === 92) return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) return trimmed;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "https:" || url.username || url.password) return undefined;
+    return trimmed;
+  } catch {
+    return undefined;
+  }
+}
+
+function simpleIconUrl(slug?: string): string | undefined {
+  const trimmed = slug?.trim();
+  if (!trimmed || !/^[a-z0-9]+$/i.test(trimmed)) return undefined;
+  return `https://cdn.simpleicons.org/${encodeURIComponent(trimmed)}`;
+}
 
 /**
  * Ordered icon candidates: explicit URL first, then a bundled brand icon
@@ -47,12 +82,16 @@ export function brandIconCandidates(input: {
   serviceUrl?: string | null;
 }): string[] {
   const candidates: string[] = [];
-  if (input.iconUrl) candidates.push(input.iconUrl);
+  const iconUrl = safeBrandImageUrl(input.iconUrl);
+  if (iconUrl) candidates.push(iconUrl);
   const apex = apexDomain(input.serviceUrl);
-  const bundled = apex ? BUNDLED_ICONS_BY_APEX[apex] : undefined;
   const simpleIconSlug = input.simpleIconSlug ?? (apex ? SIMPLE_ICON_SLUG_BY_APEX[apex] : undefined);
+  const bundledBySlug = simpleIconSlug ? BUNDLED_ICONS_BY_SLUG[simpleIconSlug.toLowerCase()] : undefined;
+  const bundled = bundledBySlug ?? (apex ? BUNDLED_ICONS_BY_APEX[apex] : undefined);
   if (bundled) candidates.push(bundled);
-  if (simpleIconSlug) candidates.push(`https://cdn.simpleicons.org/${simpleIconSlug}`);
+  // These brands aren't available on Simple Icons; don't request known 404s.
+  const simpleIcon = bundledBySlug ? undefined : simpleIconUrl(simpleIconSlug);
+  if (simpleIcon) candidates.push(simpleIcon);
   if (apex) candidates.push(`https://www.google.com/s2/favicons?sz=64&domain=${encodeURIComponent(apex)}`);
   return candidates;
 }

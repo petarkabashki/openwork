@@ -1,346 +1,221 @@
-import { expect, onTestFinished } from "vitest";
-import { createOrgConnection, deleteConnection, denFetch, evalIn, go } from "@openwork/behaviors";
-import type { DenSession } from "@openwork/behaviors";
-import { screenshot, validate } from "@openwork/test-evidence";
-import type { Surface } from "@openwork/cdp";
+import { browserScript } from "@openwork/testkit";
+import { expect } from "vitest";
+import { readAvailableModels, selectModel } from "@openwork/behaviors";
+import { observeTranscript, spec } from "@openwork/testkit";
 import {
-  app,
-  eventually,
-  localMysqlIsRunning,
-  mcpMock,
-  needs,
-  readConnectState,
-  server,
-  test,
-} from "@openwork/testkit";
+  cloudHealthExpression,
+  isRecord,
+  mcpCallBody,
+  preseededConnect,
+  records,
+  rpcResult,
+  toolJson,
+} from "../worlds/library.ts";
 
-const e2eTestsEnabled = process.env.OPENWORK_EVAL_E2E_TESTS === "1";
-const remotePlacement = process.env.OPENWORK_EVAL_DAYTONA === "1" || Boolean(process.env.OPENWORK_EVAL_DEN_API_URL?.trim());
-const mysqlOpen = remotePlacement || await localMysqlIsRunning();
-const title = !e2eTestsEnabled
-  ? "preseeded Connect readiness skipped — needs: set OPENWORK_EVAL_E2E_TESTS=1"
-  : !mysqlOpen
-    ? "preseeded Connect readiness skipped — needs: MySQL on 127.0.0.1:3306 for local placement"
-    : "bundled engine connects to preseeded organization skills and connections";
-let requestId = 0;
+const test = spec.world(preseededConnect, { timeout: 600_000 });
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+test("bundled engine recovers from a startup outage and uses preseeded organization skills and connections", async ({ world, user, agent, seed, probe, step, evidence }) => {
+  await user.see("composer", { editable: true });
+  const taskRoute = await probe.hash();
+  expect(taskRoute).toBe(`#/workspace/${world.workspaceId}/session`);
+  const signedOut = await probe.connectState(world.app);
+  expect(signedOut).toMatchObject({ status: "missing", connectEnabled: false });
+  expect(signedOut).not.toMatchObject({ status: "available" });
+  await user.screenshot();
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!isRecord(value)) throw new Error(`${label} was not an object: ${JSON.stringify(value).slice(0, 500)}`);
-  return value;
-}
+  const tokenRequests = async () => (await world.proxy.requestLog())
+    .filter((request) => request.method === "POST" && request.path === world.tokenPath);
+  const firstFailure = await step("desktop startup maintenance encounters a sustained token-mint outage", async () => {
+    await seed.signIn(world.app, world.member, "admin");
+    const first = await probe.eventually(async () => (await tokenRequests())
+      .find((request) => request.faulted && request.status === 503), {
+      within: 60_000,
+      label: "the desktop reaches the startup token-mint fault",
+    });
+    if (!first) throw new Error("Desktop startup did not encounter the token-mint fault.");
 
-function toolText(result: unknown): string {
-  const record = requireRecord(result, "MCP tool result");
-  const first = Array.isArray(record.content) ? record.content[0] : null;
-  if (!isRecord(first) || typeof first.text !== "string") {
-    throw new Error(`MCP tool result had no text content: ${JSON.stringify(result).slice(0, 500)}`);
-  }
-  return first.text;
-}
-
-function toolJson(result: unknown): unknown {
-  return JSON.parse(toolText(result));
-}
-
-function searchMatches(result: unknown): Record<string, unknown>[] {
-  const payload = requireRecord(toolJson(result), "search_capabilities payload");
-  return Array.isArray(payload.matches) ? payload.matches.filter(isRecord) : [];
-}
-
-async function organizationId(session: DenSession): Promise<string> {
-  const result = await denFetch(session, "/v1/me/orgs", {
-    headers: { authorization: `Bearer ${session.token}` },
+    // Measure from an observed desktop failure, not world boot: slow startup
+    // must not consume the outage before maintenance ever reaches it.
+    const observedAt = Date.now();
+    const outage = await probe.eventually(async () => ({
+      requests: await tokenRequests(),
+      heldForMs: Date.now() - observedAt,
+    }), {
+      within: 60_000,
+      label: "startup remains unavailable beyond the initial 1s/3s retry burst",
+      until: (value) => value.heldForMs >= 10_000 && value.requests.length >= 3,
+    });
+    expect(outage.requests.every((request) => request.faulted && request.status === 503)).toBe(true);
+    expect(await probe.desktopApi(`/workspace/${world.workspaceId}/mcp/openwork-cloud/health`))
+      .toMatchObject({ status: 200, body: { usable: false } });
+    expect(await probe.hash()).toBe(taskRoute);
+    return first;
   });
-  const orgs = isRecord(result.body) && Array.isArray(result.body.orgs) ? result.body.orgs.filter(isRecord) : [];
-  const id = orgs[0] && typeof orgs[0].id === "string" ? orgs[0].id : "";
-  if (!result.response.ok || !id) {
-    throw new Error(`Finding the provisioned organization failed: HTTP ${result.response.status} ${result.text.slice(0, 500)}`);
-  }
-  return id;
-}
 
-async function mintMcpToken(session: DenSession, orgId: string): Promise<string> {
-  const result = await denFetch(session, "/v1/mcp/token", {
-    method: "POST",
-    headers: { authorization: `Bearer ${session.token}`, "x-openwork-org-id": orgId },
-    body: JSON.stringify({}),
-  });
-  const mcpToken = isRecord(result.body) && typeof result.body.token === "string" ? result.body.token : "";
-  if (!result.response.ok || !mcpToken.startsWith("ow_mcp_at_")) {
-    throw new Error(`Minting the member Connect token failed: HTTP ${result.response.status} ${result.text.slice(0, 500)}`);
-  }
-  return mcpToken;
-}
-
-async function callTool(
-  apiUrl: string,
-  mcpToken: string,
-  name: "search_capabilities" | "execute_capability",
-  args: Record<string, unknown>,
-): Promise<unknown> {
-  const response = await fetch(`${apiUrl}/mcp/agent`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${mcpToken}`,
-      "content-type": "application/json",
-      accept: "application/json, text/event-stream",
+  const signedIn = await probe.eventually(
+    () => probe.connectState(world.app),
+    {
+      within: 90_000,
+      label: "signed-in available Connect state",
+      until: (value) => isRecord(value) && value.status === "available" && value.connectEnabled === true,
     },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: ++requestId,
-      method: "tools/call",
-      params: { name, arguments: args },
-    }),
+  );
+  expect(signedIn).toMatchObject({ status: "available", connectEnabled: true });
+
+  await step("restore connectivity without navigation, reload, focus, online, or manual retry", async () => {
+    await world.proxy.faults.clear();
+    await world.proxy.faults.status("/api/runtime-config", 200, { times: 1000, body: world.runtimeConfig });
   });
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`MCP tools/call failed: HTTP ${response.status} ${raw.slice(0, 500)}`);
-  const dataLine = raw.split("\n").find((line) => line.startsWith("data:"));
-  if (!dataLine) throw new Error(`MCP tools/call returned no SSE data frame: ${raw.slice(0, 500)}`);
-  const payload: unknown = JSON.parse(dataLine.slice(5));
-  const record = requireRecord(payload, "MCP JSON-RPC payload");
-  if (record.error) throw new Error(`MCP tools/call returned JSON-RPC error: ${JSON.stringify(record.error)}`);
-  return record.result;
-}
 
-async function readCloudMcpHealth(surface: Surface, workspaceId: string): Promise<Record<string, unknown>> {
-  const raw = await evalIn(surface, `(async () => {
-    const port = localStorage.getItem("openwork.server.port");
-    const token = localStorage.getItem("openwork.server.token");
-    if (!port || !token) return JSON.stringify({ error: "missing local server credentials" });
-    const response = await fetch(
-      "http://127.0.0.1:" + port + "/workspace/" + encodeURIComponent(${JSON.stringify(workspaceId)}) + "/mcp/openwork-cloud/health?probe=1",
-      { headers: { Authorization: "Bearer " + token } },
-    );
-    const text = await response.text();
-    if (!response.ok) return JSON.stringify({ error: "HTTP " + response.status, body: text.slice(0, 500) });
-    return text;
-  })()`, { awaitPromise: true, timeoutMs: 30_000 });
-  if (typeof raw !== "string") throw new Error(`Cloud MCP health response was not text: ${JSON.stringify(raw)}`);
-  return requireRecord(JSON.parse(raw), "Cloud MCP health response");
-}
+  // Observe UI convergence before asking the server to probe health: the test
+  // must not supply the recovery trigger it is asserting happens automatically.
+  await probe.eventually(() => probe.dom('[data-testid="account-status-menu"][data-connect-state="ready"]'), {
+    within: 120_000,
+    label: "the task screen reports Connect ready after background recovery",
+    until: (value) => value.elements.length === 1,
+  });
 
-function healthIsReady(health: Record<string, unknown>): boolean {
-  const engine = isRecord(health.engine) ? health.engine : null;
-  const tools = isRecord(health.tools) ? health.tools : null;
-  const direct = tools && isRecord(tools.direct) ? tools.direct : null;
-  return health.phase === "ready"
-    && health.usable === true
-    && engine?.status === "connected"
-    && Array.isArray(tools?.present)
-    && tools.present.includes("openwork-cloud_search_capabilities")
-    && tools.present.includes("openwork-cloud_execute_capability")
-    && Array.isArray(direct?.present)
-    && direct.present.includes("search_capabilities")
-    && direct.present.includes("execute_capability");
-}
-
-test.skipIf(!e2eTestsEnabled || !mysqlOpen)(title, async ({ evidence, place }) => {
-  needs({ optIn: ["OPENWORK_EVAL_E2E_TESTS"] });
-  const run = Date.now();
-  const skillName = `pr3806-connect-proof-${run}`;
-  const connectionName = `PR3806 conn ${String(run).slice(-6)}`;
-  const nonsenseName = `no-such-capability-${run}`;
-  const rawSourceText = `---\nname: ${skillName}\ndescription: Proves preseeded Connect skill discovery on OpenCode 1.18.18.\n---\n\nReturn the PR 3806 Connect proof phrase.`;
-
-  await using den = await server({
-    place,
-    org: {
-      name: `PR 3806 Connect Readiness ${run}`,
-      admin: {
-        email: `pr3806-connect-admin-${run}@openwork.test`,
-        name: "PR 3806 Connect Admin",
-        password: "OpenWorkEval123!",
+  const health = await probe.eventually(
+    // TODO(primitive): probe.cloudMcpHealth
+    () => probe.eval(browserScript(cloudHealthExpression, [world.workspaceId])),
+    {
+      within: 180_000,
+      label: "openwork-cloud engine and agent-tool readiness",
+      until: (value) => {
+        if (!isRecord(value) || !isRecord(value.engine) || !isRecord(value.tools)) return false;
+        return value.phase === "ready"
+          && value.usable === true
+          && value.engine.status === "connected"
+          && Array.isArray(value.tools.present)
+          && value.tools.present.includes("openwork-cloud_search_capabilities")
+          && value.tools.present.includes("openwork-cloud_execute_capability")
+          && isRecord(value.tools.direct)
+          && Array.isArray(value.tools.direct.present)
+          && value.tools.direct.present.includes("search_capabilities")
+          && value.tools.direct.present.includes("execute_capability");
       },
     },
-    mocks: { connector: mcpMock() },
-  });
-
-  const orgId = await organizationId(den.admin);
-  const createdSkill = await denFetch(den.admin, "/v1/plugins", {
-    method: "POST",
-    headers: { authorization: `Bearer ${den.admin.token}`, "x-openwork-org-id": orgId },
-    body: JSON.stringify({
-      name: skillName,
-      orgWide: true,
-      components: [{ type: "skill", input: { rawSourceText } }],
-    }),
-  });
-  const skillItem = isRecord(createdSkill.body) && isRecord(createdSkill.body.item) ? createdSkill.body.item : null;
-  const pluginId = skillItem && typeof skillItem.id === "string" ? skillItem.id : "";
-  if (!createdSkill.response.ok || !pluginId) {
-    throw new Error(`Creating the org-wide proof skill failed: HTTP ${createdSkill.response.status} ${createdSkill.text.slice(0, 500)}`);
-  }
-  onTestFinished(async () => {
-    await denFetch(den.admin, `/v1/plugins/${encodeURIComponent(pluginId)}/archive`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${den.admin.token}`, "x-openwork-org-id": orgId },
-    }).catch(() => undefined);
-  });
-
-  const connectionInput = {
-    name: connectionName,
-    url: den.mocks.connector.mcpUrl,
-    authType: "oauth",
-    credentialMode: "per_member",
-    access: { orgWide: true },
-  };
-  const connection = await createOrgConnection(den.admin, connectionInput);
-  onTestFinished(async () => deleteConnection(den.admin, connection.id).catch(() => undefined));
-  evidence.recordAssertionEvidence(
-    "The organization was seeded before desktop boot",
-    `Skill plugin ${pluginId} used components=[{type:"skill",input:{rawSourceText}}] with orgWide=true; connection input: ${JSON.stringify(connectionInput)}.`,
-    createdSkill.response.status === 201 && connection.name === connectionName,
   );
-
-  await using desktopApp = await app({
-    den,
-    as: "admin",
-    place,
-    beforeSignIn: async (surface) => {
-      const signedOutState = await eventually(() => readConnectState(surface), {
-        within: 15_000,
-        label: "signed-out fresh-profile Connect state",
-        until: (state) => state.ok && state.status === "missing",
-      });
-      const signedOutNotAvailable = signedOutState.status !== "available";
-      expect(signedOutState.status).toBe("missing");
-      expect(signedOutState.connectEnabled).toBe(false);
-      expect(signedOutNotAvailable).toBe(true);
-      evidence.recordAssertionEvidence(
-        "A signed-out fresh profile has no Connect capability access",
-        `Observed Connect state before sign-in: ${JSON.stringify(signedOutState)}.`,
-        signedOutState.status === "missing" && signedOutState.connectEnabled === false && signedOutNotAvailable,
-      );
-      const shot = await screenshot(surface);
-      const seen = await validate(shot, [
-        "The OpenWork desktop is visible before organization sign-in",
-        "No crash or error dialog is visible",
-      ]);
-      expect(seen.ok, seen.why).toBe(true);
-    },
-  });
-
-  const signedInState = await eventually(() => readConnectState(desktopApp), {
-    within: 90_000,
-    label: "signed-in available Connect state",
-    until: (state) => state.ok && state.status === "available" && state.connectEnabled === true,
-  });
-  const signedInNotMissing = signedInState.status !== "missing";
-  expect(signedInState.status).toBe("available");
-  expect(signedInState.connectEnabled).toBe(true);
-  expect(signedInNotMissing).toBe(true);
-  evidence.recordAssertionEvidence(
-    "Organization sign-in enables Connect",
-    `Observed Connect state after sign-in: ${JSON.stringify(signedInState)}.`,
-    signedInState.status === "available" && signedInState.connectEnabled === true && signedInNotMissing,
-  );
-
-  const health = await eventually(() => readCloudMcpHealth(desktopApp, desktopApp.workspaceId), {
-    within: 180_000,
-    label: "OpenCode 1.18.18 openwork-cloud engine and agent-tool readiness",
-    until: healthIsReady,
-  });
-  const engine = requireRecord(health.engine, "Cloud MCP engine health");
-  const tools = requireRecord(health.tools, "Cloud MCP tools health");
-  expect(health.phase).toBe("ready");
-  expect(health.usable).toBe(true);
-  expect(engine.status).toBe("connected");
-  expect(engine.status).not.toBe("needs_auth");
-  expect(engine.status).not.toBe("failed");
-  expect(engine.status).not.toBe("needs_client_registration");
-  expect(tools.present).toEqual(expect.arrayContaining([
+  expect(health).toMatchObject({ phase: "ready", usable: true, engine: { status: "connected" } });
+  if (!isRecord(health) || !isRecord(health.engine) || !isRecord(health.tools)) throw new Error("Connect health was malformed.");
+  expect(health.engine.status).not.toBe("needs_auth");
+  expect(health.engine.status).not.toBe("failed");
+  expect(health.engine.status).not.toBe("needs_client_registration");
+  expect(health.tools.present).toEqual(expect.arrayContaining([
     "openwork-cloud_search_capabilities",
     "openwork-cloud_execute_capability",
   ]));
-  evidence.recordAssertionEvidence(
-    "OpenCode 1.18.18 connects openwork-cloud with both agent tools",
-    `Health payload: ${JSON.stringify({ phase: health.phase, usable: health.usable, engine, tools: tools.present })}.`,
-    healthIsReady(health)
-      && engine.status !== "needs_auth"
-      && engine.status !== "failed"
-      && engine.status !== "needs_client_registration",
-  );
+  const recoveredMint = (await tokenRequests()).find((request) => !request.faulted && request.status === 200);
+  if (!recoveredMint) throw new Error("Connect became ready without a successful desktop token mint through the restored connection.");
+  // Exclude the five-minute maintenance interval as the recovery mechanism.
+  expect(recoveredMint.at - firstFailure.at).toBeLessThan(120_000);
+  expect(await probe.hash()).toBe(taskRoute);
+  await user.see("composer", { editable: true });
+  evidence.recordAssertionEvidence("Connect recovers from a startup outage without a UI recovery action",
+    "The desktop encountered at least three HTTP 503 token-mint failures over a fault held for at least ten seconds after an observed failure. A later background mint succeeded within two minutes of the first failure; the unchanged task route reported Ready with both engine and direct Cloud tools present before any navigation or agent send.", true);
 
-  const mcpToken = await mintMcpToken(den.admin, orgId);
-  const skillSearch = await callTool(den.ref.apiUrl, mcpToken, "search_capabilities", {
-    query: skillName,
-    limit: 20,
-    type: "skills",
-  });
-  const skillMatch = searchMatches(skillSearch).find((match) => (
-    match.kind === "skill" && typeof match.name === "string" && match.name.startsWith(`plugin:${pluginId}:`)
-  ));
-  if (!skillMatch || typeof skillMatch.name !== "string") throw new Error(`Connect did not discover the exact skill ${skillName}.`);
-  const capabilityName = skillMatch.name;
-  expect(skillMatch.kind).toBe("skill");
-  expect(capabilityName.startsWith(`plugin:${pluginId}:`)).toBe(true);
-  const execution = await callTool(den.ref.apiUrl, mcpToken, "execute_capability", { name: capabilityName });
-  expect(isRecord(execution) && execution.isError === true).toBe(false);
-  expect(toolJson(execution)).toMatchObject({ kind: "skill", content: rawSourceText });
-  evidence.recordAssertionEvidence(
-    "The member's Connect token discovers and executes the preseeded skill",
-    `Search query ${skillName} returned ${JSON.stringify(skillMatch)}; execution returned the exact ${rawSourceText.length}-character source.`,
-    skillMatch.kind === "skill" && capabilityName.startsWith(`plugin:${pluginId}:`) && JSON.stringify(toolJson(execution)).includes(rawSourceText),
-  );
+  await step("the preseeded skill is discovered and executed", async () => {
+    const search = await seed.api(world.mcpSession, "/mcp/agent", {
+      method: "POST",
+      headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+      body: mcpCallBody(1, "search_capabilities", { query: world.skillName, limit: 20, type: "skills" }),
+    });
+    const payload = toolJson(search);
+    const matches = isRecord(payload) ? records(payload.matches) : [];
+    const match = matches.find((entry) => entry.kind === "skill" && typeof entry.name === "string" && entry.name.startsWith(`plugin:${world.pluginId}:`));
+    if (!match || typeof match.name !== "string") throw new Error("The exact preseeded skill was not discovered.");
+    const execution = await seed.api(world.mcpSession, "/mcp/agent", {
+      method: "POST",
+      headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+      body: mcpCallBody(2, "execute_capability", { name: match.name }),
+    });
+    const executed = toolJson(execution);
+    expect(rpcResult(execution).isError).not.toBe(true);
+    expect(executed).toMatchObject({ kind: "skill", content: world.rawSourceText });
 
-  const nonsenseSearch = await callTool(den.ref.apiUrl, mcpToken, "search_capabilities", {
-    query: nonsenseName,
-    limit: 20,
-    type: "skills",
+    // The direct tools reach the same skill without keywords or a search hop.
+    const listed = await seed.api(world.mcpSession, "/mcp/agent", {
+      method: "POST",
+      headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+      body: mcpCallBody(5, "list_skills", {}),
+    });
+    const catalog = isRecord(rpcResult(listed).structuredContent) ? rpcResult(listed).structuredContent : null;
+    const skills = isRecord(catalog) ? records(catalog.skills) : [];
+    expect(skills.find((entry) => entry.capability === match.name)).toMatchObject({ capability: match.name, pluginName: world.skillName });
+    const read = await seed.api(world.mcpSession, "/mcp/agent", {
+      method: "POST",
+      headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+      body: mcpCallBody(6, "get_skill", { name: match.name }),
+    });
+    expect(rpcResult(read).isError).not.toBe(true);
+    expect(rpcResult(read).structuredContent).toMatchObject({ capability: match.name, content: expect.stringContaining(world.proofPhrase) });
   });
-  const nonsenseSkillMatches = searchMatches(nonsenseSearch).filter((match) => (
-    match.kind === "skill" && JSON.stringify(match).includes(nonsenseName)
-  ));
-  expect(nonsenseSkillMatches).toEqual([]);
-  evidence.recordAssertionEvidence(
-    "Connect does not invent a nonexistent skill",
-    `Search query ${nonsenseName} returned no skill match naming that capability.`,
-    nonsenseSkillMatches.length === 0,
-  );
 
-  const connectionSearch = await callTool(den.ref.apiUrl, mcpToken, "search_capabilities", {
-    query: connectionName,
-    limit: 20,
-    type: "mcp",
+  const nonsense = await seed.api(world.mcpSession, "/mcp/agent", {
+    method: "POST",
+    headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+    body: mcpCallBody(3, "search_capabilities", { query: world.nonsenseName, limit: 20, type: "skills" }),
   });
-  const connectionMatch = searchMatches(connectionSearch).find((match) => {
+  const nonsensePayload = toolJson(nonsense);
+  const nonsenseMatches = isRecord(nonsensePayload) ? records(nonsensePayload.matches) : [];
+  expect(nonsenseMatches.filter((entry) => entry.kind === "skill" && JSON.stringify(entry).includes(world.nonsenseName))).toEqual([]);
+
+  const connectionSearch = await seed.api(world.mcpSession, "/mcp/agent", {
+    method: "POST",
+    headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+    body: mcpCallBody(4, "search_capabilities", { query: world.connectionName, limit: 20, type: "mcp" }),
+  });
+  const connectionPayload = toolJson(connectionSearch);
+  const connectionMatches = isRecord(connectionPayload) ? records(connectionPayload.matches) : [];
+  const connectionMatch = connectionMatches.find((match) => {
     const status = isRecord(match.connectionStatus) ? match.connectionStatus : null;
-    return status?.connectionName === connectionName || JSON.stringify(match).includes(connectionName);
+    return status?.connectionName === world.connectionName || JSON.stringify(match).includes(world.connectionName);
   });
-  if (!connectionMatch) throw new Error(`Connect did not discover the preseeded connection ${connectionName}.`);
+  if (!connectionMatch) throw new Error(`Connect did not discover ${world.connectionName}.`);
   const connectionStatus = isRecord(connectionMatch.connectionStatus) ? connectionMatch.connectionStatus : null;
-  const readiness = connectionStatus?.state === "needs_connection" && connectionStatus.actor === "member"
-    ? "needs_signin"
-    : connectionStatus?.actor === "organization_admin"
-      ? "needs_admin_setup"
-      : "ready";
-  expect(["ready", "needs_signin", "needs_admin_setup"]).toContain(readiness);
-  evidence.recordAssertionEvidence(
-    "The preseeded organization connection is discoverable with truthful readiness",
-    `Connection match: ${JSON.stringify(connectionMatch)}; normalized readiness=${readiness}.`,
-    Boolean(connectionMatch) && ["ready", "needs_signin", "needs_admin_setup"].includes(readiness),
-  );
+  expect(connectionStatus).toMatchObject({
+    state: "needs_connection", actor: "member", credentialMode: "per_member",
+    connectionId: world.connection.id, connectionName: world.connectionName,
+    action: { type: "connect", surface: "openwork_your_connections" },
+  });
+  evidence.recordAssertionEvidence("An unconnected member-owned connection requires member sign-in",
+    JSON.stringify(connectionStatus), true);
 
-  const connectionsDeadline = Date.now() + 30_000;
-  while (Date.now() < connectionsDeadline) {
-    const settled = await evalIn(
-      desktopApp,
-      `document.body.innerText.includes(${JSON.stringify(connectionName)})`,
-      { timeoutMs: 5_000 },
-    ).catch(() => false);
-    if (settled === true) break;
-    await go(desktopApp, "/workspace/" + desktopApp.workspaceId + "/settings/extensions/connections").catch(() => undefined);
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-  }
-  expect(await evalIn(desktopApp, `document.body.innerText.includes(${JSON.stringify(connectionName)})`)).toBe(true);
-  const signedInShot = await screenshot(desktopApp);
-  const signedInSeen = await validate(signedInShot, [
-    `A Library view of skills, connections, and tools lists an organization connection card named '${connectionName}'`,
-    "No crash or error dialog is visible",
-  ]);
-  expect(signedInSeen.ok, signedInSeen.why).toBe(true);
+  await user.click("Library");
+  await user.see({ text: world.connectionName }, { timeoutMs: 60_000 });
+  const signInChip = await probe.eventually(
+    async () => (await probe.dom(`[data-library-row="${world.connectionName}"] [data-library-status]`)).elements.map((element) => element.text),
+    { within: 60_000, label: "the connection row asks the member to sign in", until: (chips) => chips.length > 0 },
+  );
+  expect(signInChip).toEqual(["Sign in"]);
+  await user.screenshot();
+
+  await step("the signed-in desktop agent discovers and reads the skill", async () => {
+    expect(world.prompt).not.toContain(world.pluginId);
+    expect(world.prompt).not.toContain(world.proofPhrase);
+    await agent.createSession();
+    await probe.eventually(() => readAvailableModels(world.app), {
+      within: 120_000, label: "the published model reaches the signed-in desktop",
+      until: models => models.some(model => model.name === world.modelId && model.selectable),
+    });
+    await selectModel(world.app, world.modelId, { provider: world.providerName });
+    await using transcript = await observeTranscript(probe, [{ role: "assistant", text: world.proofPhrase }]);
+    await user.screenshot();
+    await agent.send(world.prompt);
+    await user.see({ text: new RegExp(world.proofPhrase) }, { timeoutMs: 120_000 });
+    await user.see("Run task", { timeoutMs: 60_000 });
+    expect(await transcript.finish()).toMatchObject({ seen: [true], stopped: false });
+    const calls = await world.den.mocks.connector.agentRequests({ promptMarker: world.prompt });
+    const tools = calls.filter(call => call.kind === "tool");
+    expect(tools).toHaveLength(2);
+    // The desktop projects the gateway's direct skill tools; the agent lists
+    // the catalog without a keyword search and reads the skill by capability.
+    expect(tools[0]?.toolName).toMatch(/list_skills$/);
+    expect(tools[1]?.toolName).toMatch(/get_skill$/);
+    expect(tools[1]?.arguments.name).toMatch(new RegExp(`^plugin:${world.pluginId}:`));
+    expect(calls.some(call => call.kind === "final" && call.completedTools === 2)).toBe(true);
+    evidence.recordAssertionEvidence("The desktop agent uses the assigned organization skill",
+      "The model was offered list_skills and get_skill, listed the assigned skill without a keyword search, read it by the returned capability, and displayed the unique phrase from the skill.", true);
+    await user.screenshot();
+  });
 });

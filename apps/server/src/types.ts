@@ -103,14 +103,10 @@ export interface ServerConfig {
   hostTokenSource: "cli" | "env" | "file" | "generated";
   logFormat: LogFormat;
   logRequests: boolean;
-  /**
-   * Roll the managed engine over instead of disposing it when a reload is
-   * needed while sessions are live: a standby engine takes new work and the
-   * old one is closed once its runs finish. Off by default (alpha).
-   */
-  engineRollover?: boolean;
   /** In-memory secure key custody supplied by an embedding host such as OpenWork Desktop. */
   localManagedMcpVaultKey?: LocalManagedMcpVaultKeyProvider;
+  /** Desktop-owned managed engines only; never enabled by remote clients. */
+  resumeInterruptedTasks?: boolean;
 }
 
 export interface Capabilities {
@@ -225,6 +221,15 @@ export interface ApprovalRequest {
   paths: string[];
   createdAt: number;
   actor: Actor;
+}
+
+export type UiControlKind = "context" | "query" | "command";
+
+export interface UiControlRequest {
+  id: string;
+  kind: UiControlKind;
+  input?: unknown;
+  createdAt: number;
 }
 
 export interface AuditEntry {

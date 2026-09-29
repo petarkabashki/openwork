@@ -1,10 +1,17 @@
+import type { BrowserEvaluation } from "./browser-script.ts";
 import { probeAppState } from "./app-state.ts";
-import { DEFAULT_CDP_PROBE_TIMEOUT_MS, connect, debuggerUrlFor, evaluate, pickAppTarget } from "./cdp.ts";
+import { callFunction, DEFAULT_CDP_PROBE_TIMEOUT_MS, connect, debuggerUrlFor, evaluate, pickAppTarget } from "./cdp.ts";
 import { firstPageTarget, targetById, waitForCdp } from "./targets.ts";
 import type { AppStateProbe } from "./app-state.ts";
-import type { CdpClient, CdpTarget, EvaluateOptions } from "./cdp.ts";
+import type { CdpClient, CdpFunctionArgument, CdpTarget, EvaluateOptions } from "./cdp.ts";
 
 export type SurfaceKind = "electron" | "chrome";
+
+/** How a locally spawned surface process ended, as Node reports it. */
+export interface SurfaceExit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
 
 export interface SurfaceHandle {
   name: string;
@@ -15,6 +22,8 @@ export interface SurfaceHandle {
   profileDir?: string;
   sandboxId?: string;
   meta?: Record<string, string>;
+  /** Settles when the process this host spawned exits; absent for surfaces on remote hosts. */
+  exit?: Promise<SurfaceExit>;
 }
 
 export interface Surface {
@@ -126,15 +135,29 @@ async function readOnSurface<T>(
  * that here means callers — behaviours, specs, the readiness gate — never carry
  * re-attach bookkeeping.
  */
-export async function evaluateOnSurface(
+export async function evaluateOnSurface<T>(
   surface: Surface,
-  expression: string,
+  expression: BrowserEvaluation<T>,
   opts: EvaluateOptions & { reattachAttempts?: number } = {},
-): Promise<unknown> {
+): Promise<Awaited<T>> {
   const { reattachAttempts = 1, timeoutMs = DEFAULT_CDP_PROBE_TIMEOUT_MS, ...evaluateOptions } = opts;
   return readOnSurface(
     surface,
     (client, attemptTimeoutMs) => evaluate(client, expression, { ...evaluateOptions, timeoutMs: attemptTimeoutMs }),
+    { timeoutMs: Math.max(1, timeoutMs), reattachAttempts },
+  );
+}
+
+export async function callFunctionOnSurface<Args extends CdpFunctionArgument[], T>(
+  surface: Surface,
+  functionDeclaration: (...args: Args) => T,
+  args: [...Args],
+  opts: EvaluateOptions & { reattachAttempts?: number } = {},
+): Promise<Awaited<T>> {
+  const { reattachAttempts = 1, timeoutMs = DEFAULT_CDP_PROBE_TIMEOUT_MS, ...callOptions } = opts;
+  return readOnSurface(
+    surface,
+    (client, attemptTimeoutMs) => callFunction(client, functionDeclaration, args, { ...callOptions, timeoutMs: attemptTimeoutMs }),
     { timeoutMs: Math.max(1, timeoutMs), reattachAttempts },
   );
 }

@@ -1,7 +1,7 @@
 "use client";
 
-import { CheckCircle2, Copy, KeyRound, RefreshCw, Shield, ShieldAlert, Trash2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { CheckCircle2, Copy, KeyRound, LoaderCircle, RefreshCw, Shield, ShieldAlert, Trash2, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { DashboardPageTemplate } from "../../_components/ui/dashboard-page-template";
 import { DenButton } from "../../_components/ui/button";
 import { DenNotice } from "../../_components/ui/notice";
@@ -19,6 +19,12 @@ function formatDateTime(value: string | null) {
 
 type FormMode = "saml" | "oidc";
 
+function readSsoTestMessage(value: unknown) {
+  if (typeof value !== "object" || value === null || !("type" in value) || value.type !== "openwork:sso-test-complete") return null;
+  if (!("intentId" in value) || typeof value.intentId !== "string") return null;
+  return value.intentId;
+}
+
 export function SsoScreen() {
   const { orgId, orgContext, runReauthableAction } = useOrgDashboard();
   const [connection, setConnection] = useState<DenOrgSsoConnection | null>(null);
@@ -30,6 +36,13 @@ export function SsoScreen() {
   const [domainVerificationToken, setDomainVerificationToken] = useState<string | null>(null);
   const [requestingDomainToken, setRequestingDomainToken] = useState(false);
   const [verifyingDomain, setVerifyingDomain] = useState(false);
+  const [testDialogOpen, setTestDialogOpen] = useState(false);
+  const [testIntentId, setTestIntentId] = useState<string | null>(null);
+  const [startingTest, setStartingTest] = useState(false);
+  const [enabling, setEnabling] = useState(false);
+  const [disabling, setDisabling] = useState(false);
+  const testPopupRef = useRef<Window | null>(null);
+  const testPopupWatcherRef = useRef<number | null>(null);
   const [editing, setEditing] = useState(false);
   const [formMode, setFormMode] = useState<FormMode>("saml");
   const [issuer, setIssuer] = useState("");
@@ -52,7 +65,7 @@ export function SsoScreen() {
     [orgContext?.currentMember.isOwner, orgContext?.currentMember.role, orgContext?.roles],
   );
 
-  async function loadSsoConfig(isCurrent = () => true) {
+  async function loadSsoConfig(isCurrent = () => true, quiet = false) {
     if (!orgId || !access.canViewSettings) {
       if (isCurrent()) {
         setConnection(null);
@@ -60,7 +73,7 @@ export function SsoScreen() {
       return;
     }
 
-    if (isCurrent()) {
+    if (isCurrent() && !quiet) {
       setBusy(true);
       setError(null);
     }
@@ -73,19 +86,21 @@ export function SsoScreen() {
       const parsed = parseOrgSsoPayload(payload);
       if (isCurrent()) {
         setConnection(parsed.connection);
-        syncFormFromConnection(parsed.connection);
-        setEditing(false);
+        if (!quiet) {
+          syncFormFromConnection(parsed.connection);
+          setEditing(false);
+        }
       }
     } catch (nextError) {
       if (isReauthRequiredError(nextError)) {
         throw nextError;
       }
 
-      if (isCurrent()) {
+      if (isCurrent() && !quiet) {
         setError(nextError instanceof Error ? nextError.message : "Failed to load SSO settings.");
       }
     } finally {
-      if (isCurrent()) {
+      if (isCurrent() && !quiet) {
         setBusy(false);
       }
     }
@@ -140,6 +155,52 @@ export function SsoScreen() {
     const timeout = window.setTimeout(() => setCopiedValue(null), 1500);
     return () => window.clearTimeout(timeout);
   }, [copiedValue]);
+
+  useEffect(() => {
+    if (!testDialogOpen || connection?.testStatus !== "testing") return;
+    const interval = window.setInterval(() => void loadSsoConfig(() => true, true), 1000);
+    return () => window.clearInterval(interval);
+  }, [testDialogOpen, connection?.testStatus, orgId]);
+
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      const completedIntentId = readSsoTestMessage(event.data);
+      if (event.origin !== window.location.origin || !completedIntentId || completedIntentId !== testIntentId) return;
+      stopTestPopupWatcher();
+      testPopupRef.current?.close();
+      testPopupRef.current = null;
+      void loadSsoConfig(() => true, true);
+    };
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [testIntentId, orgId]);
+
+  function stopTestPopupWatcher() {
+    if (testPopupWatcherRef.current !== null) {
+      window.clearInterval(testPopupWatcherRef.current);
+      testPopupWatcherRef.current = null;
+    }
+  }
+
+  async function cancelTestIntent(intentId: string) {
+    await requestJson(`/v1/sso/test/${encodeURIComponent(intentId)}/cancel`, {
+      method: "POST",
+      headers: getOrgScopedHeaders(),
+      body: JSON.stringify({}),
+    }, 12000);
+    await loadSsoConfig(() => true, true);
+  }
+
+  function watchTestPopup(popup: Window, intentId: string) {
+    stopTestPopupWatcher();
+    testPopupRef.current = popup;
+    testPopupWatcherRef.current = window.setInterval(() => {
+      if (!popup.closed) return;
+      stopTestPopupWatcher();
+      testPopupRef.current = null;
+      void cancelTestIntent(intentId);
+    }, 500);
+  }
 
   async function copyValue(value: string | null, key: string) {
     if (!value) return;
@@ -297,6 +358,105 @@ export function SsoScreen() {
     }
   }
 
+  async function handleStartTest() {
+    if (!orgId || !connection || !access.canManageSso) return;
+    const popup = window.open("", "openwork-sso-test", "popup,width=520,height=720");
+    if (!popup) {
+      setError("OpenWork could not open the SSO test window. Allow popups, then try again.");
+      return;
+    }
+
+    setStartingTest(true);
+    setTestDialogOpen(true);
+    setError(null);
+    try {
+      await runReauthableAction("test-sso-settings", async () => {
+        const { response, payload } = await requestJson("/v1/sso/test", {
+          method: "POST",
+          headers: getOrgScopedHeaders(),
+          body: JSON.stringify({}),
+        }, 12000);
+        if (!response.ok) throw getRequestError(payload, response, `Failed to start the SSO test (${response.status}).`);
+        const intentId = typeof payload === "object" && payload !== null && "intentId" in payload && typeof payload.intentId === "string"
+          ? payload.intentId
+          : "";
+        const testUrl = typeof payload === "object" && payload !== null && "testUrl" in payload && typeof payload.testUrl === "string"
+          ? payload.testUrl
+          : "";
+        if (!intentId || !testUrl) throw new Error("The SSO test response was incomplete. Try again.");
+        setTestIntentId(intentId);
+        popup.location.href = testUrl;
+        watchTestPopup(popup, intentId);
+        await loadSsoConfig(() => true, true);
+      });
+    } catch (nextError) {
+      popup.close();
+      setTestDialogOpen(false);
+      setError(nextError instanceof Error ? nextError.message : "Failed to start the SSO authentication test.");
+    } finally {
+      setStartingTest(false);
+    }
+  }
+
+  function handleOpenTestDialog() {
+    setTestIntentId(null);
+    setTestDialogOpen(true);
+  }
+
+  async function handleEnable() {
+    if (!access.canManageSso) return;
+    setEnabling(true);
+    setError(null);
+    try {
+      await runReauthableAction("enable-sso-settings", async () => {
+        const { response, payload } = await requestJson("/v1/sso/enable", {
+          method: "POST",
+          headers: getOrgScopedHeaders(),
+          body: JSON.stringify({}),
+        }, 12000);
+        if (response.status !== 204 && !response.ok) throw getRequestError(payload, response, `Failed to enable SSO (${response.status}).`);
+        setTestDialogOpen(false);
+        setTestIntentId(null);
+        await loadSsoConfig();
+      });
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed to enable SSO.");
+    } finally {
+      setEnabling(false);
+    }
+  }
+
+  async function handleDisable() {
+    if (!access.canManageSso || !window.confirm("Disable SSO for this workspace? Members will use their other available sign-in methods.")) return;
+    setDisabling(true);
+    setError(null);
+    try {
+      await runReauthableAction("disable-sso-settings", async () => {
+        const { response, payload } = await requestJson("/v1/sso/disable", {
+          method: "POST",
+          headers: getOrgScopedHeaders(),
+          body: JSON.stringify({}),
+        }, 12000);
+        if (response.status !== 204 && !response.ok) throw getRequestError(payload, response, `Failed to disable SSO (${response.status}).`);
+        await loadSsoConfig();
+      });
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed to disable SSO.");
+    } finally {
+      setDisabling(false);
+    }
+  }
+
+  function closeTestDialog() {
+    setTestDialogOpen(false);
+    if (testIntentId && connection?.testStatus === "testing") {
+      testPopupRef.current?.close();
+      void cancelTestIntent(testIntentId);
+    }
+    stopTestPopupWatcher();
+    testPopupRef.current = null;
+  }
+
   function handleCancelEdit() {
     syncFormFromConnection(connection);
     setEditing(false);
@@ -318,13 +478,13 @@ export function SsoScreen() {
   return (
     <DashboardPageTemplate icon={Shield} title="SSO" description="Configure one enterprise SSO connection per workspace and share the generated sign-in URL with your team." colors={["#F5F3FF", "#4C1D95", "#8B5CF6", "#DDD6FE"]}>
       {!access.canViewSettings ? (
-        <div className="rounded-[28px] border border-amber-200 bg-amber-50 px-6 py-5 text-[14px] text-amber-900">Only workspace admins can view SSO.</div>
+        <div className="rounded-[28px] border border-[var(--dls-border)] bg-[var(--dls-hover)] px-6 py-5 text-[14px] text-[var(--dls-text-primary)]">Only workspace admins can view SSO.</div>
       ) : (
         <>
           {!orgContext.entitlements.sso ? <EnterprisePlanNotice feature="SSO" /> : null}
           {error ? <DenNotice message={error} className="mb-6" /> : null}
           {!access.canManageSso ? (
-            <div className="mb-6 rounded-[24px] border border-amber-200 bg-amber-50 px-5 py-4 text-[14px] text-amber-800">
+            <div className="mb-6 rounded-[24px] border border-[var(--dls-border)] bg-[var(--dls-hover)] px-5 py-4 text-[14px] text-[var(--dls-text-primary)]">
               Read-only: owners and super-admins can create, edit, delete, or verify SSO connections.
             </div>
           ) : null}
@@ -434,6 +594,13 @@ export function SsoScreen() {
               {connection && !editing ? (
                 <div className="flex flex-wrap gap-3">
                   <DenButton variant="secondary" onClick={() => setEditing(true)} disabled={!access.canManageSso}>Edit connection</DenButton>
+                  {connection.status === "enabled" ? (
+                    <DenButton variant="secondary" onClick={() => void handleDisable()} disabled={disabling || !access.canManageSso}>{disabling ? "Disabling..." : "Disable SSO"}</DenButton>
+                  ) : connection.testStatus === "succeeded" ? (
+                    <DenButton variant="primary" icon={CheckCircle2} onClick={() => void handleEnable()} disabled={enabling || !access.canManageSso}>{enabling ? "Enabling..." : "Enable SSO"}</DenButton>
+                  ) : (
+                    <DenButton variant="primary" icon={Shield} onClick={handleOpenTestDialog} disabled={!access.canManageSso || !connection.domainVerified}>Enable Config</DenButton>
+                  )}
                   <DenButton variant="secondary" icon={Trash2} onClick={() => void handleDelete()} disabled={deleting || !access.canManageSso}>{deleting ? "Deleting..." : "Delete connection"}</DenButton>
                 </div>
               ) : null}
@@ -444,8 +611,8 @@ export function SsoScreen() {
             {connection ? (
               <div className="mt-5 space-y-4">
                 {!connection.domainVerified ? (
-                  <section data-testid="sso-domain-verification" className="overflow-hidden rounded-[24px] border border-amber-300 bg-[#FFFBEB] text-[14px] text-amber-950 shadow-[0_18px_46px_-34px_rgba(146,64,14,0.55)]">
-                    <div className="flex flex-col gap-4 border-b border-amber-200 bg-amber-100/70 px-5 py-5 sm:flex-row sm:items-start sm:justify-between">
+                  <section data-testid="sso-domain-verification" className="overflow-hidden rounded-[24px] border border-[var(--dls-border)] bg-[var(--dls-surface)] text-[14px] text-[var(--dls-text-primary)]">
+                    <div className="flex flex-col gap-4 border-b border-[var(--dls-border)] bg-[var(--dls-hover)] px-5 py-5 sm:flex-row sm:items-start sm:justify-between">
                       <div className="flex items-start gap-3">
                         <span className="mt-0.5 rounded-full bg-amber-900 p-2 text-amber-50"><ShieldAlert size={18} aria-hidden="true" /></span>
                         <div>
@@ -453,7 +620,7 @@ export function SsoScreen() {
                             <p className="text-[16px] font-semibold tracking-[-0.02em]">Verify your domain first</p>
                             <span className="rounded-full border border-amber-300 bg-white/80 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-amber-800">Pending verification</span>
                           </div>
-                          <p className="mt-1 max-w-2xl leading-6 text-amber-900/80">
+                          <p className="mt-1 max-w-2xl leading-6 text-[var(--dls-text-secondary)]">
                             SSO remains inactive and is not offered to users until this DNS check proves that your workspace controls <strong>{connection.domain}</strong>.
                           </p>
                         </div>
@@ -468,18 +635,18 @@ export function SsoScreen() {
                       </div>
                     </div>
 
-                    <div className="grid gap-px bg-amber-200 md:grid-cols-2">
+                    <div className="grid gap-px bg-[var(--dls-border)] md:grid-cols-2">
                       {[
                         { label: "Record type", value: "TXT", key: "domain-record-type" },
                         { label: "Host / name", value: connection.domainVerificationHost, key: "domain-record-host" },
                         { label: "Full DNS name", value: connection.domainVerificationDnsName, key: "domain-record-name" },
                         { label: "Value", value: domainVerificationToken, key: "domain-token" },
                       ].map((record) => (
-                        <div key={record.key} className="bg-[#FFFEF7] px-5 py-4">
+                        <div key={record.key} className="bg-[var(--dls-surface)] px-5 py-4">
                           <div className="mb-2 flex items-center justify-between gap-3">
-                            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-amber-700">{record.label}</p>
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--dls-text-secondary)]">{record.label}</p>
                             {record.value ? (
-                              <button type="button" className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-[12px] font-medium text-amber-900 transition hover:bg-amber-100" onClick={() => void copyValue(record.value, record.key)}>
+                              <button type="button" className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-[12px] font-medium text-[var(--dls-text-primary)] transition hover:bg-[var(--dls-active)]" onClick={() => void copyValue(record.value, record.key)}>
                                 <Copy size={13} aria-hidden="true" /> {copiedValue === record.key ? "Copied" : "Copy"}
                               </button>
                             ) : null}
@@ -489,15 +656,18 @@ export function SsoScreen() {
                       ))}
                     </div>
 
-                    <div className="grid gap-3 px-5 py-4 text-[13px] leading-5 text-amber-900/80 sm:grid-cols-2">
-                      <p><strong className="text-amber-950">DNS providers differ:</strong> use the host value when your provider appends the domain automatically; otherwise use the full DNS name.</p>
-                      <p><strong className="text-amber-950">One-time proof:</strong> tokens expire after seven days. After verification succeeds, you may remove the TXT record. Changing the domain requires verification again.</p>
+                    <div className="grid gap-3 px-5 py-4 text-[13px] leading-5 text-[var(--dls-text-secondary)] sm:grid-cols-2">
+                      <p><strong className="text-[var(--dls-text-primary)]">DNS providers differ:</strong> use the host value when your provider appends the domain automatically; otherwise use the full DNS name.</p>
+                      <p><strong className="text-[var(--dls-text-primary)]">One-time proof:</strong> tokens expire after seven days. After verification succeeds, you may remove the TXT record. Changing the domain requires verification again.</p>
                     </div>
                   </section>
                 ) : (
                   <div className="flex items-start gap-3 rounded-[20px] border border-emerald-200 bg-emerald-50 px-5 py-4 text-[14px] text-emerald-900">
                     <CheckCircle2 className="mt-0.5 shrink-0" size={18} aria-hidden="true" />
-                    <div><p className="font-semibold">Domain verified · SSO active</p><p className="mt-1 text-emerald-800">The DNS TXT record was a one-time proof and may now be removed.</p></div>
+                    <div>
+                      <p className="font-semibold">Domain verified{connection.status === "enabled" ? " · SSO enabled" : ""}</p>
+                      <p className="mt-1 text-emerald-800">{connection.status === "enabled" ? "This tested configuration is active." : "The configuration is still disabled. Test it before enabling SSO."} The DNS TXT record was a one-time proof and may now be removed.</p>
+                    </div>
                   </div>
                 )}
 
@@ -527,16 +697,62 @@ export function SsoScreen() {
                   </div>
                   <div className="rounded-[20px] border border-gray-200 bg-gray-50 p-4 text-[14px] text-gray-700">
                     <p className="font-medium text-gray-900">Status</p>
-                    <p className="mt-2">{connection.status}</p>
+                    <p className="mt-2">{connection.status === "enabled" ? "Enabled" : "Saved · disabled"}</p>
+                    <p className="mt-2">Test: {connection.testStatus === "succeeded" ? "Successful" : connection.testStatus === "failed" ? "Failed" : connection.testStatus === "testing" ? "In progress" : "Not tested"}</p>
                     <p className="mt-2">Last tested: {formatDateTime(connection.lastTestedAt)}</p>
                     <p className="mt-2">Updated: {formatDateTime(connection.updatedAt)}</p>
                   </div>
                 </div>
 
-                {connection.lastError ? <div className="rounded-[20px] border border-red-200 bg-red-50 p-4 text-[14px] text-red-700">{connection.lastError}</div> : null}
+                {connection.testStatus === "failed" && connection.lastError ? <div data-testid="sso-test-failure" className="rounded-[20px] border border-red-200 bg-red-50 p-4 text-[14px] text-red-700">{connection.lastError}</div> : null}
               </div>
             ) : null}
           </div>
+
+          {testDialogOpen && connection ? (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 px-4 py-6 backdrop-blur-[2px]">
+              <div role="dialog" aria-modal="true" aria-labelledby="sso-test-dialog-title" data-testid="sso-test-dialog" className="w-full max-w-[480px] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-[0_28px_80px_-36px_rgba(15,23,42,0.6)]">
+                <div className="relative border-b border-slate-100 bg-slate-50/70 px-6 pb-5 pt-6">
+                  <button type="button" aria-label="Close SSO test" className="absolute right-4 top-4 flex size-8 items-center justify-center rounded-lg text-slate-400 hover:bg-white hover:text-slate-700" onClick={closeTestDialog}>
+                    <X size={17} aria-hidden="true" />
+                  </button>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Enable configuration</p>
+                  <h2 id="sso-test-dialog-title" className="mt-2 text-[22px] font-semibold tracking-[-0.03em] text-slate-950">Test SSO before enabling it</h2>
+                  <p className="mt-2 pr-8 text-[14px] leading-6 text-slate-600">A separate window performs real authentication with the saved {connection.kind.toUpperCase()} configuration. SSO stays disabled until you explicitly enable it.</p>
+                </div>
+                <div className="space-y-4 px-6 py-5">
+                  {connection.testStatus === "testing" ? (
+                    <div className="flex items-start gap-3 rounded-xl border border-violet-200 bg-violet-50 px-4 py-3 text-[14px] text-violet-900">
+                      <LoaderCircle className="mt-0.5 animate-spin" size={18} aria-hidden="true" />
+                      <div><p className="font-semibold">Authentication test in progress</p><p className="mt-1 text-violet-800">Finish signing in in the new window. This window will update automatically.</p></div>
+                    </div>
+                  ) : connection.testStatus === "succeeded" ? (
+                    <div className="flex items-start gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-[14px] text-emerald-900">
+                      <CheckCircle2 className="mt-0.5" size={18} aria-hidden="true" />
+                      <div><p className="font-semibold">Authentication test successful</p><p className="mt-1 text-emerald-800">The exact saved configuration passed. SSO is still disabled.</p></div>
+                    </div>
+                  ) : connection.testStatus === "failed" ? (
+                    <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[14px] text-red-800">
+                      <p className="font-semibold">Authentication test failed</p>
+                      <p className="mt-1">{connection.lastError ?? "Check the provider configuration and try again."}</p>
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-[14px] text-slate-700">The saved configuration has not been tested.</div>
+                  )}
+                  <div className="flex flex-wrap justify-end gap-3">
+                    <DenButton variant="secondary" onClick={closeTestDialog}>Close</DenButton>
+                    {connection.testStatus === "succeeded" ? (
+                      <DenButton variant="primary" icon={CheckCircle2} onClick={() => void handleEnable()} disabled={enabling}>{enabling ? "Enabling..." : "Enable SSO"}</DenButton>
+                    ) : (
+                      <DenButton variant="primary" icon={Shield} onClick={() => void handleStartTest()} disabled={startingTest || connection.testStatus === "testing"}>
+                        {startingTest ? "Opening SSO login..." : connection.testStatus === "failed" ? "Try SSO login again" : "SSO Login"}
+                      </DenButton>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </>
       )}
     </DashboardPageTemplate>

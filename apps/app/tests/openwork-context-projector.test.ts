@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { openworkContextSnapshotSchema } from "@openwork/types/openwork-context";
 
 import {
   buildOpenworkContext,
@@ -14,14 +15,22 @@ const baseInput: ContextProjectorInput = {
   capturedAt: "2026-07-23T12:00:00.000Z",
   workbench: {
     revision: 4,
-    workspaceId: "workspace-a",
-    workspaceTitle: "Customer workspace",
-    primarySessionId: "session-a",
+    primary: {
+      workspaceId: "workspace-a",
+      workspaceTitle: "Customer workspace",
+      sessionId: "session-a",
+      title: "Primary",
+    },
     tabs: [
-      { workspaceId: "workspace-a", sessionId: "session-a", title: "Primary" },
-      { workspaceId: "workspace-a", sessionId: "session-b", title: "Secondary" },
+      { workspaceId: "workspace-a", workspaceTitle: "Customer workspace", sessionId: "session-a", title: "Primary" },
+      { workspaceId: "workspace-b", workspaceTitle: "Research workspace", sessionId: "session-b", title: "Secondary" },
     ],
-    splitSessionId: "session-b",
+    secondary: {
+      workspaceId: "workspace-b",
+      workspaceTitle: "Research workspace",
+      sessionId: "session-b",
+      title: "Secondary",
+    },
     focusedPane: "secondary",
   },
   ui: {
@@ -36,21 +45,54 @@ const baseInput: ContextProjectorInput = {
       activeTabId: "artifact-a",
     },
   },
+  pinnedSessionIds: [],
   availableAffordances: [],
 };
 
 describe("OpenWork context projector", () => {
+  test("publishes native connection question support without adding affordances", () => {
+    const root = { context: openworkContextSnapshotSchema.parse(buildOpenworkContext(baseInput)) };
+    expect(root.context.features?.connectionQuestions).toBe(true);
+    expect(root.context.availableAffordances).toEqual([]);
+  });
+
+  test("accepts legacy snapshots without advertising connection questions", () => {
+    const snapshot = buildOpenworkContext(baseInput);
+    delete snapshot.features;
+    const root = { context: openworkContextSnapshotSchema.parse(snapshot) };
+    expect(root.context.features).toBeUndefined();
+    expect(root.context.features?.connectionQuestions === true).toBe(false);
+  });
+
+  test("keeps connection question support optional and boolean", () => {
+    const snapshot = buildOpenworkContext(baseInput);
+    for (const features of [{}, { connectionQuestions: false }, { connectionQuestions: true }]) {
+      expect(openworkContextSnapshotSchema.parse({ ...snapshot, features }).features).toEqual(features);
+    }
+    expect(openworkContextSnapshotSchema.safeParse({
+      ...snapshot, features: { connectionQuestions: "true" },
+    }).success).toBe(false);
+  });
+
   test("projects the focused split session and its panel state", () => {
     const context = buildOpenworkContext(baseInput);
 
     expect(context.conversations.layout).toEqual({
       kind: "split",
       primarySessionId: "session-a",
+      primaryWorkspaceId: "workspace-a",
       secondarySessionId: "session-b",
+      secondaryWorkspaceId: "workspace-b",
       focused: "secondary",
     });
     expect(context.resources.find((resource) => resource.kind === "workspace")?.title)
       .toBe("Customer workspace");
+    expect(context.resources.find((resource) => resource.ref === "workspace:workspace-b")?.title)
+      .toBe("Research workspace");
+    expect(context.resources.find((resource) => resource.ref === "session:workspace-a:session-a")?.state.workspaceId)
+      .toBe("workspace-a");
+    expect(context.resources.find((resource) => resource.ref === "session:workspace-b:session-b")?.state.workspaceId)
+      .toBe("workspace-b");
     expect(context.sidePanel).toEqual({
       open: true,
       ownerSessionId: "session-b",
@@ -73,19 +115,31 @@ describe("OpenWork context projector", () => {
     expect(context.sidePanel.tabs).toEqual([]);
     expect(context.sidePanel.activeTabId).toBeNull();
   });
+
+  test("projects pinned session state", () => {
+    const context = buildOpenworkContext({
+      ...baseInput,
+      pinnedSessionIds: ["session-b"],
+    });
+
+    expect(context.conversations.pinnedSessionIds).toEqual(["session-b"]);
+    expect(context.resources.find((resource) => resource.ref === "session:workspace-b:session-b")?.state.pinned)
+      .toBe(true);
+    expect(context.resources.find((resource) => resource.ref === "session:workspace-a:session-a")?.state.pinned)
+      .toBe(false);
+  });
 });
 
 const splitWorkbench: WorkbenchSnapshot = {
+  sideChats: {},
   revision: 5,
-  workspaceId: "workspace-a",
-  workspaceTitle: "Workspace A",
-  primarySessionId: "session-a",
+  primary: { workspaceId: "workspace-a", workspaceTitle: "Workspace A", sessionId: "session-a", title: "Current plan" },
   tabs: [
-    { workspaceId: "workspace-a", sessionId: "session-a", title: "Current plan" },
-    { workspaceId: "workspace-a", sessionId: "session-b", title: "Previous research" },
-    { workspaceId: "workspace-a", sessionId: "session-c", title: "Draft" },
+    { workspaceId: "workspace-a", workspaceTitle: "Workspace A", sessionId: "session-a", title: "Current plan" },
+    { workspaceId: "workspace-a", workspaceTitle: "Workspace A", sessionId: "session-b", title: "Previous research" },
+    { workspaceId: "workspace-a", workspaceTitle: "Workspace A", sessionId: "session-c", title: "Draft" },
   ],
-  splitSessionId: "session-b",
+  secondary: { workspaceId: "workspace-a", workspaceTitle: "Workspace A", sessionId: "session-b", title: "Previous research" },
   focusedPane: "secondary",
 };
 
@@ -116,6 +170,7 @@ function contextForRoute(route: string) {
         activeTabId: "browser-one",
       },
     },
+    pinnedSessionIds: [],
     availableAffordances: [],
   });
 }
@@ -132,10 +187,12 @@ describe("OpenWork context projector", () => {
     expect(context.conversations.layout).toEqual({
       kind: "split",
       primarySessionId: "session-a",
+      primaryWorkspaceId: "workspace-a",
       secondarySessionId: "session-b",
+      secondaryWorkspaceId: "workspace-a",
       focused: "secondary",
     });
-    expect(context.resources.find((resource) => resource.ref === "session:session-b")).toMatchObject({
+    expect(context.resources.find((resource) => resource.ref === "session:workspace-a:session-b")).toMatchObject({
       kind: "session",
       title: "Previous research",
       state: {

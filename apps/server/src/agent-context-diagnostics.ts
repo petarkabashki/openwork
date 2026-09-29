@@ -52,7 +52,9 @@ import {
 import { resolveWorkspaceOpencodeConnection } from "./opencode-connection.js";
 import { buildOpenworkRuntimeConfigObjectFromSnapshot } from "./openwork-runtime-config.js";
 import {
+  ENGINE_GLOBAL_RUNTIME_CONFIG_ID,
   inspectRuntimeOpencodeConfigState,
+  mergeRuntimeOpencodeConfigLayers,
   runtimeMcpMap,
   type RuntimeOpencodeConfig,
   type RuntimeOpencodeConfigInspection,
@@ -262,7 +264,7 @@ export function expectedConnectBranch(snapshot: ConnectSnapshot): AgentContextDi
   const health = snapshot.cloudHealth;
   if (health?.usable === true && health.usableByCurrentModel !== false) return "cloud-active";
   if (health) return "cloud-disconnected";
-  if (!snapshot.connectCatalogEnabled || snapshot.googleWorkspace.legacyConfigured) return "extensions-only";
+  if (!snapshot.connectCatalogEnabled) return "extensions-only";
   return "cloud-disconnected";
 }
 
@@ -336,7 +338,7 @@ function promptEvidence(configuredAgent: Record<string, unknown> | null) {
     markers: {
       searchCapabilities: prompt.includes("search_capabilities"),
       executeCapability: prompt.includes("execute_capability"),
-      memoryBank: prompt.includes("Memory Bank"),
+      artifacts: prompt.includes("## OpenWork Artifacts"),
     },
   };
 }
@@ -1289,10 +1291,20 @@ export async function runAgentContextDiagnostics(input: {
   const managedVaultInspection = input.workspace.workspaceType === "remote"
     ? null
     : await inspectLocalManagedMcpVault(input.config);
+  const globalRuntimeInspection = await inspectRuntimeOpencodeConfigState(
+    input.config,
+    ENGINE_GLOBAL_RUNTIME_CONFIG_ID,
+    { signal: input.dependencies?.signal },
+  );
+  const runtime = input.workspace.workspaceType === "remote"
+    ? globalRuntimeInspection.config
+    : mergeRuntimeOpencodeConfigLayers(globalRuntimeInspection.config, runtimeInspection.config);
   input.dependencies?.signal?.throwIfAborted();
   const runtimeDuration = elapsed(runtimeStarted, now);
-  const runtime = runtimeInspection.config;
-  const expectedRuntimeConfig = buildOpenworkRuntimeConfigObjectFromSnapshot(runtime);
+  // The injected engine config file is rendered from the ENGINE_GLOBAL row
+  // only; the merged per-workspace runtime row informs MCP inventory below
+  // but is not part of the injected file.
+  const expectedRuntimeConfig = buildOpenworkRuntimeConfigObjectFromSnapshot(globalRuntimeInspection.config);
   const expectedAgents = isRecord(expectedRuntimeConfig.agent) ? expectedRuntimeConfig.agent : {};
   const expectedAgent = isRecord(expectedAgents.openwork) ? expectedAgents.openwork : null;
   const effectiveOpenworkAgent = effectiveEngine?.agents.find((agent) => agent.name === "openwork") ?? null;
@@ -1314,7 +1326,7 @@ export async function runAgentContextDiagnostics(input: {
   const expectedPrompt = promptEvidence(expectedAgent);
   const promptMarkersPresent = prompt.markers.searchCapabilities
     && prompt.markers.executeCapability
-    && prompt.markers.memoryBank;
+    && prompt.markers.artifacts;
   const canonicalPromptDigestMatch = prompt.sha256 !== null
     && expectedPrompt.sha256 !== null
     && prompt.sha256 === expectedPrompt.sha256;
@@ -1372,7 +1384,6 @@ export async function runAgentContextDiagnostics(input: {
         directory: null,
         reason: "Passive Connect inspection was unavailable",
       },
-      googleWorkspace: { legacyConfigured: false },
     };
   }
   const selectedCloudMcpPresent = Object.hasOwn(runtimeMcpMap(runtime), OPENWORK_CLOUD_MCP_NAME);
@@ -1586,7 +1597,6 @@ export async function runAgentContextDiagnostics(input: {
         expectedBranch: branch,
         connectStateStatus,
         connectEnabled: connectSnapshot.connectEnabled,
-        legacyGoogleWorkspaceConfigured: connectSnapshot.googleWorkspace.legacyConfigured,
         globalCloudMcpPresent: connectSnapshot.cloudMcpPresent,
         selectedWorkspaceCloudMcpPresent: selectedCloudMcpPresent,
       },
@@ -1979,7 +1989,6 @@ export async function runAgentContextDiagnostics(input: {
     connect: {
       stateStatus: connectSnapshot.status,
       connectEnabled: connectSnapshot.connectEnabled,
-      legacyGoogleWorkspaceConfigured: connectSnapshot.googleWorkspace.legacyConfigured,
       expectedBranch: branch,
       globalCloudMcpPresent: connectSnapshot.cloudMcpPresent,
       selectedWorkspaceCloudMcpPresent: selectedCloudMcpPresent,

@@ -8,19 +8,21 @@ set -euo pipefail
 #   bash .devcontainer/test-server-on-daytona.sh [branch-or-commit] --force-install
 #   bash .devcontainer/test-server-on-daytona.sh [branch-or-commit] --seed
 #
-# Creates a Daytona sandbox, starts MySQL + Den API + Den Web + worker proxy,
+# Creates a Daytona sandbox, starts MySQL + Den API + Den Web,
 # waits for health checks, and prints public preview URLs.
 
 REF=""
 FORCE_INSTALL=0
 RUN_SEED=0
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SANDBOX="openwork-server-$(date +%Y%m%d-%H%M%S)"
+# Pid + random suffix so parallel invocations (multiple features/worktrees)
+# never collide on the second-granularity timestamp.
+SANDBOX="openwork-server-$(date +%Y%m%d-%H%M%S)-$$-$(od -An -N2 -tx2 /dev/urandom | tr -d ' ')"
 DAYTONA_SERVER_SNAPSHOT="${DAYTONA_SERVER_SNAPSHOT:-openwork-server}"
 DAYTONA_TARGET="${DAYTONA_TARGET:-us}"
+DAYTONA_AUTO_STOP_MINUTES="${DAYTONA_AUTO_STOP_MINUTES:-60}"
 DEN_API_PORT="${DEN_API_PORT:-8788}"
 DEN_WEB_PORT="${DEN_WEB_PORT:-3005}"
-DEN_WORKER_PROXY_PORT="${DEN_WORKER_PROXY_PORT:-8789}"
 MAX_WAIT="${DAYTONA_SERVER_MAX_WAIT:-240}"
 DEN_GENERATED_ARTIFACT_VIEWS_ENABLED="${DEN_GENERATED_ARTIFACT_VIEWS_ENABLED:-}"
 if [ -z "$DEN_GENERATED_ARTIFACT_VIEWS_ENABLED" ]; then
@@ -50,6 +52,10 @@ while [ "$#" -gt 0 ]; do
     --name)
       shift
       SANDBOX="${1:?missing sandbox name}"
+      ;;
+    --auto-stop)
+      shift
+      DAYTONA_AUTO_STOP_MINUTES="${1:?missing auto-stop minutes}"
       ;;
     --help|-h)
       sed -n '1,13p' "$0"
@@ -84,12 +90,20 @@ case "$REF" in
     ;;
 esac
 
+case "$DAYTONA_AUTO_STOP_MINUTES" in
+  ""|*[!0-9]*) echo "ERROR: auto-stop minutes must be a whole number from 0 through 1440" >&2; exit 1 ;;
+esac
+if [ "$DAYTONA_AUTO_STOP_MINUTES" -gt 1440 ]; then
+  echo "ERROR: auto-stop minutes must be a whole number from 0 through 1440" >&2
+  exit 1
+fi
+
 snapshot_id() {
   daytona snapshot list -f json | node -e 'const name = process.argv[1]; let input = ""; process.stdin.on("data", (chunk) => input += chunk); process.stdin.on("end", () => { const snapshot = JSON.parse(input).find((item) => item.name === name); if (snapshot) process.stdout.write(snapshot.id || snapshot.name); });' "$1"
 }
 
 SNAPSHOT_ID="$(snapshot_id "$DAYTONA_SERVER_SNAPSHOT")"
-CREATE_ARGS=(--name "$SANDBOX" --auto-stop 60 --public --target "$DAYTONA_TARGET")
+CREATE_ARGS=(--name "$SANDBOX" --auto-stop "$DAYTONA_AUTO_STOP_MINUTES" --public --target "$DAYTONA_TARGET")
 if [ -n "$SNAPSHOT_ID" ]; then
   echo "==> Using Daytona server snapshot: $DAYTONA_SERVER_SNAPSHOT"
   CREATE_ARGS+=(--snapshot "$SNAPSHOT_ID")
@@ -100,7 +114,17 @@ fi
 
 echo "==> Creating server sandbox: $SANDBOX"
 echo "    Ref: $REF"
+created=0
+cleanup_failed_provision() {
+  status=$?
+  if [ "$status" -ne 0 ] && [ "$created" -eq 1 ]; then
+    printf 'y\n' | daytona delete "$SANDBOX" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup_failed_provision EXIT
 daytona create "${CREATE_ARGS[@]}"
+created=1
 
 echo "==> Waiting for sandbox exec readiness..."
 exec_ready=0
@@ -118,7 +142,19 @@ fi
 
 DEN_WEB_URL="$(daytona preview-url "$SANDBOX" -p "$DEN_WEB_PORT" --expires 86400 2>/dev/null | grep -v "^time=")"
 DEN_API_URL="$(daytona preview-url "$SANDBOX" -p "$DEN_API_PORT" --expires 86400 2>/dev/null | grep -v "^time=")"
-DEN_WORKER_PROXY_URL="$(daytona preview-url "$SANDBOX" -p "$DEN_WORKER_PROXY_PORT" --expires 86400 2>/dev/null | grep -v "^time=")"
+
+# Caller Den env may turn on the AI Gateway. The gateway service then runs in
+# this sandbox next to Den, and desktops reach it through its own preview URL.
+GATEWAY_URL=""
+GATEWAY_PORT="${GATEWAY_PORT:-8791}"
+if [ -n "${OPENWORK_DEN_EXTRA_ENV_B64:-}" ]; then
+  extra_env="$(printf %s "$OPENWORK_DEN_EXTRA_ENV_B64" | base64 -d 2>/dev/null || true)"
+  if printf '%s\n' "$extra_env" | grep -qx 'GATEWAY_ENABLED=true'; then
+    extra_port="$(printf '%s\n' "$extra_env" | sed -n 's/^GATEWAY_PORT=\([0-9]\{1,5\}\)$/\1/p' | head -n1)"
+    [ -n "$extra_port" ] && GATEWAY_PORT="$extra_port"
+    GATEWAY_URL="$(daytona preview-url "$SANDBOX" -p "$GATEWAY_PORT" --expires 86400 2>/dev/null | grep -v "^time=")"
+  fi
+fi
 
 # These exact URLs become the Den's public identity (OAuth issuer + MCP
 # resource). Every `daytona preview-url` call signs a fresh hostname, so a
@@ -128,12 +164,13 @@ DEN_WORKER_PROXY_URL="$(daytona preview-url "$SANDBOX" -p "$DEN_WORKER_PROXY_POR
 # write happens on the runner from daytona CLI output only, so sandbox (ref
 # controlled) output can never influence it.
 if [ -n "${OPENWORK_DEN_URLS_FILE:-}" ]; then
-  printf 'DEN_WEB_URL=%s\nDEN_API_URL=%s\nDEN_WORKER_PROXY_URL=%s\n' \
-    "$DEN_WEB_URL" "$DEN_API_URL" "$DEN_WORKER_PROXY_URL" > "$OPENWORK_DEN_URLS_FILE"
+  printf 'DEN_WEB_URL=%s\nDEN_API_URL=%s\n' \
+    "$DEN_WEB_URL" "$DEN_API_URL" > "$OPENWORK_DEN_URLS_FILE"
+  [ -n "$GATEWAY_URL" ] && printf 'GATEWAY_URL=%s\n' "$GATEWAY_URL" >> "$OPENWORK_DEN_URLS_FILE"
 fi
 
 echo "==> Checking out $REF..."
-daytona exec "$SANDBOX" -- "bash -lc 'set -euo pipefail; cd /workspace; REF=\"$REF\"; FORCE_INSTALL=\"$FORCE_INSTALL\"; if git fetch origin \"\$REF\"; then git checkout --detach FETCH_HEAD; else git fetch origin dev --depth 50 || true; git checkout \"\$REF\"; fi; git rev-parse --short HEAD; if [ \"\$FORCE_INSTALL\" = 1 ]; then rm -f .openwork-daytona/pnpm-lock.sha256; fi'"
+daytona exec "$SANDBOX" -- "bash -lc 'set -euo pipefail; cd /workspace; REF=\"$REF\"; FORCE_INSTALL=\"$FORCE_INSTALL\"; git reset --hard HEAD; if git fetch origin \"\$REF\"; then git checkout --detach FETCH_HEAD; else git fetch origin dev --depth 50 || true; git checkout \"\$REF\"; fi; git rev-parse --short HEAD; if [ \"\$FORCE_INSTALL\" = 1 ]; then rm -f .openwork-daytona/pnpm-lock.sha256 .openwork-daytona/den-web-build.tree .openwork-daytona/den-api-assets.tree; fi'"
 
 echo "==> Uploading server start script..."
 START_SCRIPT_B64="$(base64 < "$ROOT_DIR/.devcontainer/start-daytona-server.sh" | tr -d '\n')"
@@ -141,7 +178,13 @@ daytona exec "$SANDBOX" -- "bash -lc 'set -euo pipefail; cd /workspace; mkdir -p
 
 echo "==> Starting OpenWork Den server stack..."
 BOOTSTRAP_ADMIN_EMAILS_B64="$(printf %s "${DEN_BOOTSTRAP_ADMIN_EMAILS:-}" | base64 | tr -d '\n')"
-daytona exec "$SANDBOX" -- "bash -lc 'set -euo pipefail; cd /workspace; DEN_BOOTSTRAP_ADMIN_EMAILS=\"\$(printf %s $BOOTSTRAP_ADMIN_EMAILS_B64 | base64 -d)\" DEN_GENERATED_ARTIFACT_VIEWS_ENABLED=\"$DEN_GENERATED_ARTIFACT_VIEWS_ENABLED\" DEN_WEB_PUBLIC_URL=\"$DEN_WEB_URL\" DEN_API_PUBLIC_URL=\"$DEN_API_URL\" DEN_WORKER_PROXY_PUBLIC_URL=\"$DEN_WORKER_PROXY_URL\" DEN_WEB_PORT=$DEN_WEB_PORT DEN_API_PORT=$DEN_API_PORT DEN_WORKER_PROXY_PORT=$DEN_WORKER_PROXY_PORT RUN_SEED=$RUN_SEED bash .devcontainer/start-daytona-server.sh'"
+# Caller-supplied Den env (base64 KEY=VALUE lines from the eval harness); the
+# start script exports it before launching Den. Base64 keeps values out of
+# this command line.
+case "${OPENWORK_DEN_EXTRA_ENV_B64:-}" in
+  *[!A-Za-z0-9+/=]*) echo "ERROR: OPENWORK_DEN_EXTRA_ENV_B64 must be base64." >&2; exit 1 ;;
+esac
+daytona exec "$SANDBOX" -- "bash -lc 'set -euo pipefail; cd /workspace; OPENWORK_DEN_EXTRA_ENV_B64=\"${OPENWORK_DEN_EXTRA_ENV_B64:-}\" DEN_BOOTSTRAP_ADMIN_EMAILS=\"\$(printf %s $BOOTSTRAP_ADMIN_EMAILS_B64 | base64 -d)\" DEN_GENERATED_ARTIFACT_VIEWS_ENABLED=\"$DEN_GENERATED_ARTIFACT_VIEWS_ENABLED\" DEN_WEB_PUBLIC_URL=\"$DEN_WEB_URL\" DEN_API_PUBLIC_URL=\"$DEN_API_URL\" GATEWAY_PUBLIC_URL=\"$GATEWAY_URL\" DEN_WEB_PORT=$DEN_WEB_PORT DEN_API_PORT=$DEN_API_PORT RUN_SEED=$RUN_SEED bash .devcontainer/start-daytona-server.sh'"
 
 echo "==> Waiting for public Den Web health (up to ${MAX_WAIT}s)..."
 elapsed=0
@@ -161,7 +204,6 @@ if [ "$elapsed" -ge "$MAX_WAIT" ]; then
   echo "Check logs:" >&2
   echo "  daytona exec $SANDBOX -- 'tail -120 /tmp/den-api.log'" >&2
   echo "  daytona exec $SANDBOX -- 'tail -120 /tmp/den-web.log'" >&2
-  echo "  daytona exec $SANDBOX -- 'tail -120 /tmp/den-worker-proxy.log'" >&2
   exit 1
 fi
 
@@ -171,7 +213,7 @@ echo "  Server sandbox ready: $SANDBOX"
 echo ""
 echo "  Den Web:       $DEN_WEB_URL"
 echo "  Den API:       $DEN_API_URL"
-echo "  Worker Proxy:  $DEN_WORKER_PROXY_URL"
+[ -n "$GATEWAY_URL" ] && echo "  AI Gateway:    $GATEWAY_URL"
 echo ""
 echo "  Start Electron against this server:"
 echo "    bash .devcontainer/test-on-daytona.sh $REF --den-base-url $DEN_WEB_URL --den-api-base-url $DEN_API_URL"
@@ -179,3 +221,4 @@ echo ""
 echo "  Cleanup:"
 echo "    daytona delete $SANDBOX"
 echo "============================================"
+created=0

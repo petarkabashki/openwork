@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import { allocateFreePort } from "@openwork/cdp";
-import { electronProfilePaths, electronSurfaceEnv, freePort, resolveChromeBinary } from "../src/local.ts";
+import { electronLaunchEnv, electronProfilePaths, electronSurfaceEnv, freePort, pruneStaleSurfaceProfiles, registerLiveProfileRoot, resolveChromeBinary, stopOwnedElectronSurface, unregisterLiveProfileRoot } from "../src/local.ts";
 
 const ENV_KEYS = [
   "APPDATA",
@@ -97,6 +97,71 @@ test("electronSurfaceEnv matches the isolated Electron demo contract", () => {
   assert.equal(env.XDG_STATE_HOME, paths.stateHome);
 });
 
+test("electronSurfaceEnv maps the v2 eval lane before caller overrides", () => {
+  const previous = process.env.OPENWORK_EVAL_ENGINE;
+  process.env.OPENWORK_EVAL_ENGINE = "V2";
+  try {
+    const paths = electronProfilePaths(join(tmpdir(), "openwork-local-host-v2-env"));
+    const options = {
+      appName: "OpenWork Eval v2",
+      appIdentifier: "com.differentai.openwork.eval.v2",
+      port: 5124,
+      cdpPort: 9124,
+    };
+    assert.equal(electronSurfaceEnv(paths, options).OPENWORK_ENGINE_V2_PREVIEW, "1");
+    assert.equal(
+      electronSurfaceEnv(paths, options, { OPENWORK_ENGINE_V2_PREVIEW: "sidecar" }).OPENWORK_ENGINE_V2_PREVIEW,
+      "sidecar",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.OPENWORK_EVAL_ENGINE;
+    else process.env.OPENWORK_EVAL_ENGINE = previous;
+  }
+});
+
+test("electronLaunchEnv keeps the launching shell's OPENCODE_* out of the app", () => {
+  const paths = electronProfilePaths(join(tmpdir(), "openwork-local-host-launch-env"));
+  const options = {
+    appName: "OpenWork Eval launch",
+    appIdentifier: "com.differentai.openwork.eval.launch",
+    port: 5125,
+    cdpPort: 9125,
+  };
+  // What an OpenWork agent shell exports for the host app's own engine.
+  const shell = {
+    PATH: "/usr/bin:/bin",
+    OPENCODE_DB: "/host/opencode.db",
+    OPENCODE_CONFIG: "/host/opencode.json",
+    OPENCODE_PASSWORD: "host-password",
+  };
+
+  const env = electronLaunchEnv(shell, electronSurfaceEnv(paths, options));
+  assert.equal(env.PATH, "/usr/bin:/bin");
+  assert.equal(env.OPENCODE_DB, undefined);
+  assert.equal(env.OPENCODE_CONFIG, undefined);
+  assert.equal(env.OPENCODE_PASSWORD, undefined);
+  assert.equal(env.OPENCODE_CONFIG_DIR, paths.opencodeConfigDir);
+
+  const explicit = electronLaunchEnv(shell, electronSurfaceEnv(paths, options, { OPENCODE_DB: "/profile/opencode.db" }));
+  assert.equal(explicit.OPENCODE_DB, "/profile/opencode.db");
+});
+
+test("stopOwnedElectronSurface verifies profile ownership before removing it", async () => {
+  const profileDir = await mkdtemp(join(tmpdir(), "openwork-owned-electron-"));
+  const userDataDir = join(profileDir, "electron-userdata");
+  await mkdir(userDataDir, { recursive: true });
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    env: { ...process.env, OPENWORK_ELECTRON_USERDATA: userDataDir },
+    stdio: "ignore",
+  });
+  child.unref();
+  if (!child.pid) throw new Error("Owned Electron fixture did not start.");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await stopOwnedElectronSurface(child.pid, profileDir);
+  await assert.rejects(access(profileDir));
+});
+
 test("resolveChromeBinary honors CHROME_BIN before platform defaults", () => {
   assert.equal(resolveChromeBinary({ CHROME_BIN: "/custom/chrome" }, "linux"), "/custom/chrome");
   assert.equal(resolveChromeBinary({ CHROME_BIN: "C:\\Chrome.exe" }, "win32"), "C:\\Chrome.exe");
@@ -157,5 +222,148 @@ test("freePort kills a real child listener and releases its port", {
     });
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+});
+
+test("surface cleanup leaves a listener from another process group alone", {
+  skip: process.platform !== "darwin" && process.platform !== "linux",
+}, async () => {
+  // A packaged surface allocates a Vite port it never binds; a concurrently
+  // booting app can take that port. Disposing the first surface must not kill it.
+  const port = await allocateFreePort();
+  const bystander = spawn(process.execPath, [
+    "-e",
+    "require('node:net').createServer().listen(Number(process.argv[1]), '127.0.0.1', () => process.stdout.write('ready\\n'))",
+    String(port),
+  ], { detached: true, stdio: ["ignore", "pipe", "inherit"] });
+  const logs: string[] = [];
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Listener child did not bind port ${port}.`)), 5_000);
+      bystander.once("error", reject);
+      bystander.stdout?.once("data", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    assert(bystander.pid);
+    const unrelatedGroup = bystander.pid + 1_000_000;
+
+    await freePort(port, { log: (message) => logs.push(message), ownerProcessGroup: unrelatedGroup });
+
+    assert.equal(bystander.exitCode, null);
+    assert.equal(bystander.signalCode, null);
+    process.kill(bystander.pid, 0);
+    assert(logs.some((message) => message.includes("leaving it alone")));
+  } finally {
+    if (bystander.exitCode === null && bystander.signalCode === null) bystander.kill("SIGKILL");
+  }
+});
+
+test("surface cleanup still stops a listener in the surface's own process group", {
+  skip: process.platform !== "darwin" && process.platform !== "linux",
+}, async () => {
+  const port = await allocateFreePort();
+  const owned = spawn(process.execPath, [
+    "-e",
+    "require('node:net').createServer().listen(Number(process.argv[1]), '127.0.0.1', () => process.stdout.write('ready\\n'))",
+    String(port),
+  ], { detached: true, stdio: ["ignore", "pipe", "inherit"] });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Listener child did not bind port ${port}.`)), 5_000);
+      owned.once("error", reject);
+      owned.stdout?.once("data", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    assert(owned.pid);
+
+    await freePort(port, { ownerProcessGroup: owned.pid });
+
+    await new Promise<void>((resolve, reject) => {
+      const probe = createServer();
+      probe.once("error", reject);
+      probe.listen(port, "127.0.0.1", () => probe.close((error) => error ? reject(error) : resolve()));
+    });
+  } finally {
+    if (owned.exitCode === null && owned.signalCode === null) owned.kill("SIGKILL");
+  }
+});
+
+test("pruneStaleSurfaceProfiles removes untracked profiles and never touches live ones", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "openwork-surface-prune-"));
+  const livePath = resolve(rootDir, "live-a");
+  const stalePath = resolve(rootDir, "stale-b");
+  const killed: string[] = [];
+  try {
+    await mkdir(livePath);
+    await mkdir(stalePath);
+    await writeFile(join(livePath, "marker.txt"), "keep", "utf8");
+    await writeFile(join(stalePath, "marker.txt"), "remove", "utf8");
+
+    const result = await pruneStaleSurfaceProfiles(rootDir, {
+      live: new Set([livePath]),
+      kill: async (path) => { killed.push(path); },
+    });
+
+    assert.deepEqual(result, { removed: [stalePath], kept: [livePath] });
+    assert.equal(await readFile(join(livePath, "marker.txt"), "utf8"), "keep");
+    await assert.rejects(access(stalePath));
+    assert.deepEqual(killed, [stalePath]);
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("pruneStaleSurfaceProfiles kills only processes tied to stale profiles", {
+  skip: process.platform !== "darwin" && process.platform !== "linux",
+}, async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "openwork-surface-process-prune-"));
+  const livePath = resolve(rootDir, "live-a");
+  const stalePath = resolve(rootDir, "stale-b");
+  await mkdir(livePath);
+  await mkdir(stalePath);
+  const liveChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", livePath], { detached: true, stdio: "ignore" });
+  const staleChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", stalePath], { detached: true, stdio: "ignore" });
+  if (!liveChild.pid || !staleChild.pid) throw new Error("Surface process fixtures did not start.");
+  const livePid = liveChild.pid;
+  const stalePid = staleChild.pid;
+  try {
+    await new Promise((done) => setTimeout(done, 100));
+    await pruneStaleSurfaceProfiles(rootDir, { live: new Set([livePath]) });
+    const deadline = Date.now() + 5_000;
+    while (staleChild.exitCode === null && staleChild.signalCode === null && Date.now() < deadline) {
+      await new Promise((done) => setTimeout(done, 50));
+    }
+
+    assert.notEqual(staleChild.signalCode, null, "stale profile process should be dead");
+    assert.doesNotThrow(() => process.kill(livePid, 0));
+  } finally {
+    try { process.kill(livePid, "SIGKILL"); } catch {}
+    try { process.kill(stalePid, "SIGKILL"); } catch {}
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("disposing a surface unregisters its profile so a later prune can remove it", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "openwork-surface-unregister-"));
+  const profilePath = resolve(rootDir, "live-a");
+  await mkdir(profilePath);
+  try {
+    registerLiveProfileRoot(profilePath);
+    assert.deepEqual(await pruneStaleSurfaceProfiles(rootDir, { kill: async () => undefined }), {
+      removed: [],
+      kept: [profilePath],
+    });
+    unregisterLiveProfileRoot(profilePath);
+    assert.deepEqual(await pruneStaleSurfaceProfiles(rootDir, { kill: async () => undefined }), {
+      removed: [profilePath],
+      kept: [],
+    });
+  } finally {
+    unregisterLiveProfileRoot(profilePath);
+    await rm(rootDir, { recursive: true, force: true });
   }
 });

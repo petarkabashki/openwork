@@ -1,10 +1,8 @@
 /** @jsxImportSource react */
-import { Dithering } from "@paper-design/shaders-react";
 import { useState, useSyncExternalStore, type FormEvent, type ReactNode } from "react";
 
 import {
   buildDenAuthUrl,
-  createDenClient,
   readDenBootstrapConfig,
   setDenBootstrapConfig,
 } from "@/app/lib/den";
@@ -15,6 +13,8 @@ import { enterpriseActivationRequired } from "@/app/lib/enterprise-activation";
 import { readDesktopDistributionInfo } from "@/app/lib/desktop";
 import { parseManualAuthInput } from "@/app/lib/manual-auth-input";
 import { normalizeOrganizationServerInput } from "@/app/lib/organization-server-input";
+import { DitherBackdrop } from "@/components/dither-backdrop";
+import { PageTitlebarRegion } from "@/components/page";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { resolveExtensionIconSrc } from "@/react-app/design-system/extension-icon-src";
@@ -84,30 +84,26 @@ function EnterpriseActivationPage() {
     setServerError(null);
     setStatusMessage("Finishing OpenWork Enterprise sign-in…");
     try {
-      // Persist the confirmed server before exchanging so the session is
-      // scoped to this organization's base URL and survives the provider
-      // remount that follows activation.
-      await setDenBootstrapConfig({ baseUrl, requireSignin: true });
+      // The confirmed server, session, and activation stamp commit in one
+      // handoff transaction, so activation can never leave the bootstrap and
+      // the session pointing at different servers.
       const result = await exchangeHandoffAndSignIn(grant, {
         baseUrl,
-        client: createDenClient({ baseUrl }),
         desktopInitiated: true,
         fallbackErrorMessage: "OpenWork Enterprise did not return a session token.",
+        bootstrap: {
+          requireSignin: true,
+          enterpriseActivation: {
+            activatedAt: new Date().toISOString(),
+            denBaseUrl: baseUrl,
+          },
+        },
       });
       if (!result.ok) {
         setStatusMessage(null);
         setAuthError(result.error);
         return;
       }
-
-      await setDenBootstrapConfig({
-        baseUrl,
-        requireSignin: true,
-        enterpriseActivation: {
-          activatedAt: new Date().toISOString(),
-          denBaseUrl: baseUrl,
-        },
-      });
     } catch (error) {
       setStatusMessage(null);
       setAuthError(
@@ -166,20 +162,10 @@ function EnterpriseActivationPage() {
         className="pointer-events-none absolute inset-0 z-0 overflow-hidden opacity-[0.1] dark:invert"
         data-testid="enterprise-activation-background"
       >
-        <Dithering
-          className="size-full"
-          speed={0.01}
-          shape="warp"
-          type="2x2"
-          size={20.3}
-          scale={1.19}
-          frame={264559.21}
-          colorBack="#00000000"
-          colorFront="#000000"
-        />
+        <DitherBackdrop />
       </div>
 
-      <div className="absolute inset-x-0 top-0 z-20 h-10 mac:titlebar-drag" />
+      <PageTitlebarRegion />
 
       <div
         className="relative z-10 flex min-h-dvh items-center justify-center px-6 py-16"

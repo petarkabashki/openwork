@@ -1,5 +1,7 @@
+import { sideChatSystemContext } from "../chat/workbench-store";
 import type { OpenworkServerClient } from "../../../../app/lib/openwork-server";
 import { readOpenworkEnvPendingChanges } from "../../../../app/lib/openwork-env-runtime";
+import { readOpenworkRuntimeFacts, renderOpenworkRuntimeContext } from "./runtime-context";
 
 const DEFAULT_CACHE_KEY = "__openwork_env_default__";
 const MAX_CONTEXT_CACHE_ENTRIES = 100;
@@ -27,6 +29,7 @@ export async function buildOpenworkEnvSystemContext(
     cacheKey?: string;
     runtimeKey?: string | null;
     readPendingChanges?: () => boolean;
+    desktopTransport?: "main";
   } = {},
 ): Promise<string | undefined> {
   if (!client) return undefined;
@@ -40,7 +43,7 @@ export async function buildOpenworkEnvSystemContext(
   }
 
   try {
-    const response = await client.listUserEnvKeys();
+    const response = await client.listUserEnvKeys(options.desktopTransport ? { desktopTransport: options.desktopTransport } : undefined);
     const keys = normalizeEnvKeys(response.keys ?? []);
     if (keys.length === 0) {
       rememberEnvSystemContext(cacheKey, undefined);
@@ -67,4 +70,27 @@ function rememberEnvSystemContext(cacheKey: string, context: string | undefined)
     if (firstKey) envSystemContextCache.delete(firstKey);
   }
   envSystemContextCache.set(cacheKey, context);
+}
+
+/**
+ * The per-message `system` context every send carries: the user's time zone,
+ * local date, and locale (computed fresh each send so a long-lived session
+ * crosses midnight correctly), followed by the cached environment-key names
+ * when the workspace has any.
+ */
+export async function buildOpenworkSessionSystemContext(
+  client: OpenworkServerClient | null,
+  options: {
+    workspaceId?: string;
+    cacheKey?: string;
+    runtimeKey?: string | null;
+    readPendingChanges?: () => boolean;
+    desktopTransport?: "main";
+  } = {},
+): Promise<string> {
+  const envContext = await buildOpenworkEnvSystemContext(client, options);
+  const runtimeContext = renderOpenworkRuntimeContext(readOpenworkRuntimeFacts());
+  const sideChatContext = options.workspaceId && options.cacheKey
+    ? sideChatSystemContext(options.workspaceId, options.cacheKey) : undefined;
+  return [runtimeContext, envContext, sideChatContext].filter(Boolean).join("\n\n");
 }

@@ -3,6 +3,7 @@ import {
   AuthSessionTable,
   MemberTable,
   OAuthAccessTokenTable,
+  OAuthConsentTable,
   OAuthRefreshTokenTable,
 } from "@openwork-ee/den-db/schema"
 import { cache } from "./cache.js"
@@ -55,6 +56,21 @@ export async function revokeMembershipSessionCredentials(input: {
     await db
       .delete(OAuthAccessTokenTable)
       .where(inArray(OAuthAccessTokenTable.id, oauthAccessTokens.map((token) => token.id)))
+  }
+
+  const oauthConsents = await db
+    .select({ id: OAuthConsentTable.id })
+    .from(OAuthConsentTable)
+    .where(and(
+      eq(OAuthConsentTable.userId, input.userId),
+      eq(OAuthConsentTable.referenceId, input.organizationId),
+    ))
+
+  if (oauthConsents.length > 0) {
+    await db
+      .delete(OAuthConsentTable)
+      .where(inArray(OAuthConsentTable.id, oauthConsents.map((consent) => consent.id)))
+    await Promise.all(oauthConsents.map((consent) => cache.auth.revokeGrant(consent.id)))
   }
 
   const oauthRefreshTokens = await db

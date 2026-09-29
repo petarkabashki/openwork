@@ -8,6 +8,7 @@ import type {
 } from "@opencode-ai/sdk/v2/client";
 
 import { t } from "../../../../i18n";
+import { closeSessionBrowserTabs } from "../../../../app/lib/desktop";
 import { unwrap } from "../../../../app/lib/opencode";
 import {
   abortSession as abortSessionTyped,
@@ -30,10 +31,10 @@ import type {
   ModelRef,
 } from "../../../../app/types";
 import { addOpencodeCacheHint, safeStringify } from "../../../../app/utils";
-import { clearSessionDraft, saveSessionDraft } from "./draft-store";
-import { firstLineLocalFileParts } from "./prompt-file-parts";
+import { clearSessionDraft, LOCAL_SESSION_DRAFT_SCOPE, saveSessionDraft } from "./draft-store";
+import { firstLineLocalFileParts, isReadInlineablePath } from "./prompt-file-parts";
 import { composerAttachmentToFilePart } from "./attachment-file-part";
-import { appMentionInstruction } from "../surface/composer/app-mentions";
+import { mentionPromptParts } from "./mention-parts";
 
 type SessionModelConfig = {
   applyPendingSessionChoice: (sessionId: string) => void;
@@ -162,13 +163,19 @@ export function createSessionActionsStore(options: {
         parts.push({ type: "agent", name: part.name } as AgentPartInput);
         continue;
       }
-      if (part.type === "app") {
-        parts.push({ type: "text", text: appMentionInstruction(part.name) } as TextPartInput);
+      if (part.type === "computer" || part.type === "app" || part.type === "skill" || part.type === "connect-skill") {
+        // The resolved user text already contains the visible mention label.
+        const [, instruction] = mentionPromptParts(part);
+        parts.push(instruction);
         continue;
       }
       if (part.type === "file") {
         const absolute = toAbsolutePath(part.path);
         if (!absolute) continue;
+        if (!isReadInlineablePath(absolute)) {
+          parts.push({ type: "text", text: absolute } as TextPartInput);
+          continue;
+        }
         parts.push({
           type: "file",
           mime: "text/plain",
@@ -207,7 +214,7 @@ export function createSessionActionsStore(options: {
     for (const part of draft.parts) {
       if (part.type !== "file") continue;
       const absolute = toAbsolutePath(part.path);
-      if (!absolute) continue;
+      if (!absolute || !isReadInlineablePath(absolute)) continue;
       parts.push({
         type: "file",
         mime: "text/plain",
@@ -396,12 +403,12 @@ export function createSessionActionsStore(options: {
 
       const session = unwrap(rawResult);
       if (initialPrompt) {
-        saveSessionDraft(id, session.id, {
+        saveSessionDraft(LOCAL_SESSION_DRAFT_SCOPE, id, session.id, {
           text: initialPrompt,
           mode: "prompt",
         });
       } else {
-        clearSessionDraft(id, session.id);
+        clearSessionDraft(LOCAL_SESSION_DRAFT_SCOPE, id, session.id);
       }
 
       options.setBusyLabel("status.loading_session");
@@ -489,7 +496,8 @@ export function createSessionActionsStore(options: {
     const c = options.client();
     if (!c) return;
 
-    const compactShortcut = /^\/compact(?:\s+.*)?$/i.test(content);
+    const compactShortcut = !resolvedDraft.text.trimStart().startsWith("[connect-skill ")
+      && /^\/compact(?:\s+.*)?$/i.test(content);
     const compactCommand = resolvedDraft.command?.name === "compact" || compactShortcut;
     const commandName = compactCommand ? "compact" : (resolvedDraft.command?.name ?? null);
     if (compactCommand && !options.selectedSessionId()) {
@@ -527,7 +535,7 @@ export function createSessionActionsStore(options: {
       if (!compactCommand) {
         setLastPromptSent(content);
       }
-      clearSessionDraft(options.selectedWorkspaceId().trim(), sessionID);
+      clearSessionDraft(LOCAL_SESSION_DRAFT_SCOPE, options.selectedWorkspaceId().trim(), sessionID);
       if (!hasExplicitDraft) {
         options.setPrompt("");
       }
@@ -790,8 +798,9 @@ export function createSessionActionsStore(options: {
     const root = options.selectedWorkspaceRoot().trim();
     const directory = toSessionTransportDirectory(root);
     const params = directory ? { sessionID: trimmed, directory } : { sessionID: trimmed };
-    unwrap(await c.session.delete(params));
-    clearSessionDraft(options.selectedWorkspaceId().trim(), trimmed);
+    const deleted = unwrap(await c.session.delete(params));
+    if (deleted) void closeSessionBrowserTabs(trimmed);
+    clearSessionDraft(LOCAL_SESSION_DRAFT_SCOPE, options.selectedWorkspaceId().trim(), trimmed);
 
     options.setSessions(options.sessions().filter((s) => s.id !== trimmed));
     const activeWsId = options.selectedWorkspaceId();

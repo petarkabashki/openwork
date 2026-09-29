@@ -218,7 +218,7 @@ function Sidebar({
       <div
         data-slot="sidebar-gap"
         className={cn(
-          "relative w-(--sidebar-width) bg-transparent transition-[width] duration-200 ease-linear",
+          "relative w-(--sidebar-width) bg-transparent transition-[width] duration-180 ease-out group-data-[state=collapsed]:duration-120 motion-reduce:transition-none",
           "group-data-[collapsible=offcanvas]:w-0",
           "group-data-[side=right]:rotate-180",
           variant === "floating" || variant === "inset"
@@ -229,8 +229,9 @@ function Sidebar({
       <div
         data-slot="sidebar-container"
         data-side={side}
+        inert={state === "collapsed" && collapsible === "offcanvas"}
         className={cn(
-          "fixed inset-y-0 z-10 h-svh w-(--sidebar-width) transition-[left,right,width] duration-200 ease-linear data-[side=left]:left-0 data-[side=left]:group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)] data-[side=right]:right-0 data-[side=right]:group-data-[collapsible=offcanvas]:right-[calc(var(--sidebar-width)*-1)] md:flex",
+          "fixed inset-y-0 z-10 h-svh w-(--sidebar-width) transition-[left,right,width] duration-180 ease-out group-data-[state=collapsed]:duration-120 motion-reduce:transition-none data-[side=left]:left-0 data-[side=left]:group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)] data-[side=right]:right-0 data-[side=right]:group-data-[collapsible=offcanvas]:right-[calc(var(--sidebar-width)*-1)] md:flex",
           collapsible === "none" && "flex",
           // Adjust the padding for floating and inset variants.
           variant === "floating" || variant === "inset"
@@ -272,7 +273,7 @@ function SidebarTrigger({
       }}
       {...props}
     >
-      <PanelLeftIcon className="rtl:rotate-180 size-3.5" />
+      <PanelLeftIcon className="rtl:rotate-180" strokeWidth={1.5} />
       <span className="sr-only">Toggle Sidebar</span>
     </Button>
   )
@@ -375,7 +376,7 @@ function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
       data-slot="sidebar-content"
       data-sidebar="content"
       className={cn(
-        "no-scrollbar flex min-h-0 flex-1 flex-col gap-px overflow-auto [--radius:var(--radius-xl)] group-data-[collapsible=icon]:overflow-hidden",
+        "no-scrollbar flex min-h-0 flex-1 flex-col gap-px overflow-x-hidden overflow-y-auto [--radius:var(--radius-xl)] group-data-[collapsible=icon]:overflow-hidden",
         className
       )}
       {...props}
@@ -388,7 +389,9 @@ function SidebarGroup({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="sidebar-group"
       data-sidebar="group"
-      className={cn("relative flex w-full min-w-0 flex-col mx-2 px-0 py-0", className)}
+      // No `w-full`: with the `mx-2` gutter it made every group 16px wider than
+      // the sidebar, which is what let the list scroll sideways.
+      className={cn("relative flex min-w-0 flex-col mx-2 px-0 py-0", className)}
       {...props}
     />
   )

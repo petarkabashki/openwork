@@ -1,10 +1,13 @@
 import type { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
 import {
+  isTrustedCloudMcpEndpointForGlobalPersist,
   OPENWORK_CLOUD_MCP_NAME,
   readOpenworkCloudMcpHealth,
   reconcileOpenworkCloudMcp,
   refreshOpenworkCloudMcpEngine,
+  refreshOpenworkCloudMcpCatalog,
   type CloudMcpServerMetadata,
+  type CloudMcpNativeEngineResolver,
   type CloudMcpProviderModelContext,
   type CloudMcpRuntimeRegistrar,
   type CloudMcpLiveStatusObserver,
@@ -28,6 +31,7 @@ export type RegisterCloudMcpRoutesOptions = {
   resolveOpencodeDirectory: (workspace: WorkspaceInfo) => string | null;
   createWorkspaceOpencodeClient: (config: ServerConfig, workspace: WorkspaceInfo) => WorkspaceOpencodeClient;
   registerRuntimeMcp: CloudMcpRuntimeRegistrar;
+  nativeEngineForWorkspace?: CloudMcpNativeEngineResolver;
   refreshRegistrationFromLiveStatus?: CloudMcpLiveStatusObserver;
   serverMetadata?: CloudMcpServerMetadata;
 };
@@ -89,6 +93,7 @@ export function registerCloudMcpRoutes(options: RegisterCloudMcpRoutesOptions): 
     resolveOpencodeDirectory,
     createWorkspaceOpencodeClient,
     registerRuntimeMcp,
+    nativeEngineForWorkspace,
     refreshRegistrationFromLiveStatus,
     serverMetadata,
   } = options;
@@ -104,6 +109,7 @@ export function registerCloudMcpRoutes(options: RegisterCloudMcpRoutesOptions): 
       serverMetadata,
       probe: probeFromQuery(ctx.url),
       createWorkspaceOpencodeClient,
+      nativeEngineForWorkspace,
       refreshRegistrationFromLiveStatus,
     });
     return jsonResponse(health);
@@ -139,6 +145,7 @@ export function registerCloudMcpRoutes(options: RegisterCloudMcpRoutesOptions): 
       providerModel: providerModelFromBody(body),
       serverMetadata,
       createWorkspaceOpencodeClient,
+      nativeEngineForWorkspace,
       registerRuntimeMcp,
       refreshRegistrationFromLiveStatus,
       trigger: typeof body.trigger === "string" ? body.trigger : undefined,
@@ -156,6 +163,30 @@ export function registerCloudMcpRoutes(options: RegisterCloudMcpRoutesOptions): 
       throw new ApiError(400, "invalid_payload", "JSON object body is required");
     }
     assertStrictBody(body, workspace);
+    if (body.mode === "refresh_catalog") {
+      if (Object.keys(body).some((key) => !["mode", "workspaceId", "name", "provider", "model"].includes(key))) {
+        throw new ApiError(400, "invalid_payload", "Catalog refresh uses only the persisted Cloud configuration");
+      }
+      return jsonResponse(await refreshOpenworkCloudMcpCatalog({
+        config,
+        workspace,
+        directory: resolveOpencodeDirectory(workspace),
+        providerModel: providerModelFromBody(body),
+        serverMetadata,
+        createWorkspaceOpencodeClient,
+        nativeEngineForWorkspace,
+        registerRuntimeMcp,
+        refreshRegistrationFromLiveStatus,
+      }));
+    }
+    // Reconcile persists the account-global desired config (it reconfigures
+    // Connect for every workspace). Collaborator scope suffices only for
+    // trusted endpoints; anything else needs the owner.
+    const configBody = isRecord(body.config) ? body.config : body;
+    const endpointUrl = typeof configBody.url === "string" ? configBody.url : "";
+    if (!await isTrustedCloudMcpEndpointForGlobalPersist(endpointUrl)) {
+      requireClientScope(ctx, "owner");
+    }
     const health = await reconcileOpenworkCloudMcp({
       config,
       workspace,
@@ -164,6 +195,7 @@ export function registerCloudMcpRoutes(options: RegisterCloudMcpRoutesOptions): 
       providerModel: providerModelFromBody(body),
       serverMetadata,
       createWorkspaceOpencodeClient,
+      nativeEngineForWorkspace,
       registerRuntimeMcp,
       refreshRegistrationFromLiveStatus,
     });

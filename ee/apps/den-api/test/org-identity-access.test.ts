@@ -92,6 +92,11 @@ test("privileged actions require a fresh session", () => {
   }, now)).toBe(false)
 
   expect(sharedModule.hasFreshPrivilegedSession({ session: null }, now)).toBe(false)
+
+  for (const ageMs of [20 * 60_000, 60 * 60_000, 2 * 60 * 60_000, 2 * 60 * 60_000 + 1]) {
+    const session = { createdAt: new Date(now.getTime() - ageMs) }
+    expect(sharedModule.hasFreshPrivilegedSession({ session }, now)).toBe(ageMs <= 2 * 60 * 60_000)
+  }
 })
 
 test("read-only connection settings accept a login from the last 24 hours", () => {

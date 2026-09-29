@@ -4,11 +4,14 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 
 import {
+  BoundedSseFrameBuffer,
   clearEnginePoolForConfig,
   EnginePool,
   computeEngineConfigFingerprint,
+  enginePoolForConfig,
   isEngineConnectionFailure,
   setEnginePoolForConfig,
+  rolloverOutcomeApplied,
   type EnginePoolHooks,
   type EngineSpawnTemplate,
 } from "./engine-pool.js";
@@ -22,11 +25,18 @@ const ENV_NAMES = [
   "OPENWORK_ENGINE_DRAIN_TIMEOUT_MS",
   "OPENWORK_ENGINE_ABORT_SETTLE_MS",
   "OPENWORK_ENGINE_MIN_SPAWN_INTERVAL_MS",
+  "OPENWORK_ENGINE_STANDBY_PREPARE_TIMEOUT_MS",
   "OPENWORK_POOL_LOG",
   "OPENWORK_POOL_STATE",
 ];
 
 const cleanups: Array<() => void | Promise<void>> = [];
+
+test("a completed native live update clears pending refreshes while deferred changes do not", () => {
+  expect(rolloverOutcomeApplied({ action: "updated_live" })).toBe(true);
+  expect(rolloverOutcomeApplied({ action: "coalesced" })).toBe(false);
+  expect(rolloverOutcomeApplied({ action: "skipped", reason: "unchanged" })).toBe(false);
+});
 const savedEnv = new Map<string, string | undefined>();
 
 afterEach(async () => {
@@ -58,11 +68,32 @@ async function writeFakeEngineBin(root: string): Promise<string> {
     "const logPath = process.env.OPENWORK_POOL_LOG;",
     "const statePath = process.env.OPENWORK_POOL_STATE;",
     "const append = (line) => { if (logPath) appendFileSync(logPath, `${line}\\n`); };",
-    "const busySessions = (port) => {",
+    "const busySessions = (port, directory) => {",
     "  try {",
     "    const state = JSON.parse(readFileSync(statePath, 'utf8'));",
-    "    return state[String(port)] ?? [];",
+    "    const value = state[String(port)];",
+    "    if (Array.isArray(value)) return value;",
+    "    if (!value || typeof value !== 'object') return [];",
+    "    return value[directory ?? ''] ?? [];",
     "  } catch { return []; }",
+    "};",
+    "const eventSessions = (port) => {",
+    "  try {",
+    "    const state = JSON.parse(readFileSync(statePath, 'utf8'));",
+    "    const events = state.__events;",
+    "    if (!events || typeof events !== 'object') return null;",
+    "    const value = events[String(port)];",
+    "    return Array.isArray(value) ? value : null;",
+    "  } catch { return null; }",
+    "};",
+    "const eventMode = (port) => {",
+    "  try {",
+    "    const state = JSON.parse(readFileSync(statePath, 'utf8'));",
+    "    const modes = state.__eventMode;",
+    "    if (!modes || typeof modes !== 'object') return null;",
+    "    const value = modes[String(port)];",
+    "    return typeof value === 'string' ? value : null;",
+    "  } catch { return null; }",
     "};",
     "const server = Bun.serve({",
     "  hostname: '127.0.0.1',",
@@ -71,17 +102,60 @@ async function writeFakeEngineBin(root: string): Promise<string> {
     "    const url = new URL(request.url);",
     "    append(`${server.port} ${request.method} ${url.pathname}`);",
     "    if (url.pathname === '/session/status') {",
-    "      const entries = busySessions(server.port).map((id) => [id, { type: 'busy' }]);",
+    "      const entries = busySessions(server.port, url.searchParams.get('directory')).map((id) => [id, { type: 'busy' }]);",
     "      return Response.json(Object.fromEntries(entries));",
     "    }",
     "    if (url.pathname === '/permission') {",
-    "      const sessionID = busySessions(server.port)[0] ?? `ses_${server.port}`;",
-    "      return Response.json([{ id: `req_${server.port}`, sessionID }]);",
+    "      const owner = Number(url.searchParams.get('owner') ?? 0);",
+    "      if (owner && owner !== server.port) return Response.json([]);",
+    "      const sessionID = url.searchParams.get('session') ?? busySessions(server.port, url.searchParams.get('directory'))[0] ?? `ses_${server.port}`;",
+    "      return Response.json([{ id: url.searchParams.get('request') ?? `req_${server.port}`, sessionID }]);",
+    "    }",
+    "    if (url.pathname === '/event' || url.pathname === '/global/event') {",
+    "      const mode = eventMode(server.port);",
+    "      // stall: accept the socket but never answer with headers.",
+    "      if (mode === 'stall') return new Promise(() => {});",
+    "      // giant: one unterminated frame far above the cap on a stream that never closes.",
+    "      if (mode === 'giant') {",
+    "        const body = new ReadableStream({",
+    "          start(controller) {",
+    "            const chunk = new TextEncoder().encode('data: ' + 'x'.repeat(1024 * 1024));",
+    "            for (let i = 0; i < 6; i += 1) controller.enqueue(chunk);",
+    "          },",
+    "        });",
+    "        return new Response(body, { headers: { 'content-type': 'text/event-stream' } });",
+    "      }",
+    "    }",
+    "    if (url.pathname === '/global/event') {",
+    "      const frame = (id) => `data: ${JSON.stringify({ directory: '/workspace', payload: { type: 'session.updated', properties: { sessionID: id } } })}\\n\\n`;",
+    "      if (eventSessions(server.port) !== null) {",
+    "        // Test-controlled live bus: emit an event per configured session",
+    "        // every 50ms on a held stream, re-reading state between beats.",
+    "        let timer = null;",
+    "        const body = new ReadableStream({",
+    "          start(controller) {",
+    "            timer = setInterval(() => {",
+    "              for (const id of eventSessions(server.port) ?? []) controller.enqueue(new TextEncoder().encode(frame(id)));",
+    "            }, 50);",
+    "          },",
+    "          cancel() { if (timer) clearInterval(timer); },",
+    "        });",
+    "        return new Response(body, { headers: { 'content-type': 'text/event-stream' } });",
+    "      }",
+    "      return new Response(frame(`ses_${server.port}`), { headers: { 'content-type': 'text/event-stream' } });",
     "    }",
     "    if (url.pathname === '/event') {",
-    "      const sessionID = busySessions(server.port)[0] ?? `ses_${server.port}`;",
-    "      const payload = { type: 'session.updated', properties: { sessionID } };",
-    "      return new Response(`data: ${JSON.stringify(payload)}\\n\\n`, { headers: { 'content-type': 'text/event-stream' } });",
+    "      const frame = (id) => `data: ${JSON.stringify({ type: 'session.updated', properties: { sessionID: id } })}\\n\\n`;",
+    "      const sessionID = busySessions(server.port, url.searchParams.get('directory'))[0] ?? `ses_${server.port}`;",
+    "      if (url.searchParams.has('hold')) {",
+    "        const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(frame(sessionID))); } });",
+    "        return new Response(body, { headers: { 'content-type': 'text/event-stream' } });",
+    "      }",
+    "      return new Response(frame(sessionID), { headers: { 'content-type': 'text/event-stream' } });",
+    "    }",
+    "    if (url.pathname.endsWith('/reply')) {",
+    "      const owner = Number(url.searchParams.get('owner') ?? 0);",
+    "      if (owner && owner !== server.port) return Response.json({ ok: false }, { status: 404 });",
     "    }",
     "    return Response.json({ ok: true, port: server.port, path: url.pathname });",
     "  },",
@@ -115,6 +189,9 @@ type Fixture = {
   hookCalls: { reloadInPlace: number; postRefreshSync: number };
   hooks: EnginePoolHooks;
   setBusy: (port: number, sessionIds: string[]) => Promise<void>;
+  setBusyForDirectory: (port: number, directory: string, sessionIds: string[]) => Promise<void>;
+  setEventSessions: (port: number, sessionIds: string[] | null) => Promise<void>;
+  setEventMode: (port: number, mode: "stall" | "giant" | null) => Promise<void>;
   logLines: () => Promise<string[]>;
   setRuntimeConfig: (content: string) => Promise<void>;
   spawnPrimary: () => Promise<ManagedOpencodeServer>;
@@ -167,7 +244,6 @@ async function createFixture(options?: { bin?: "ready" | "unready" }): Promise<F
     hostTokenSource: "cli",
     logFormat: "pretty",
     logRequests: false,
-    engineRollover: true,
   } as ServerConfig;
 
   const template: EngineSpawnTemplate = {
@@ -197,9 +273,57 @@ async function createFixture(options?: { bin?: "ready" | "unready" }): Promise<F
   };
 
   const setBusy = async (port: number, sessionIds: string[]): Promise<void> => {
-    const state = JSON.parse(await readFile(statePath, "utf8").catch(() => "{}")) as Record<string, string[]>;
+    const state = JSON.parse(await readFile(statePath, "utf8").catch(() => "{}")) as Record<string, string[] | Record<string, string[]>>;
     if (sessionIds.length === 0) delete state[String(port)];
     else state[String(port)] = sessionIds;
+    await writeFile(statePath, JSON.stringify(state));
+  };
+
+  const setBusyForDirectory = async (port: number, directory: string, sessionIds: string[]): Promise<void> => {
+    const state = JSON.parse(await readFile(statePath, "utf8").catch(() => "{}")) as Record<string, string[] | Record<string, string[]>>;
+    const current = state[String(port)];
+    const byDirectory = current !== undefined && !Array.isArray(current) ? current : {};
+    if (sessionIds.length === 0) delete byDirectory[directory];
+    else byDirectory[directory] = sessionIds;
+    if (Object.keys(byDirectory).length === 0) delete state[String(port)];
+    else state[String(port)] = byDirectory;
+    await writeFile(statePath, JSON.stringify(state));
+  };
+
+  /**
+   * Configure which sessions the fake engine's event bus reports as active.
+   * An array (even empty) switches that engine to a held live stream; null
+   * restores the legacy single-shot event body.
+   */
+  const setEventSessions = async (port: number, sessionIds: string[] | null): Promise<void> => {
+    const state = JSON.parse(await readFile(statePath, "utf8").catch(() => "{}")) as Record<string, string[] | Record<string, string[]>>;
+    const current = state.__events;
+    const events = current !== undefined && !Array.isArray(current) ? current : {};
+    if (sessionIds === null) delete events[String(port)];
+    else events[String(port)] = sessionIds;
+    if (Object.keys(events).length === 0) delete state.__events;
+    else state.__events = events;
+    await writeFile(statePath, JSON.stringify(state));
+  };
+
+  /**
+   * Force a misbehaving event endpoint on one engine: "stall" accepts the
+   * socket but never returns headers; "giant" streams one unterminated frame
+   * far above the frame cap; null restores normal behavior.
+   */
+  const setEventMode = async (port: number, mode: "stall" | "giant" | null): Promise<void> => {
+    const state = JSON.parse(await readFile(statePath, "utf8").catch(() => "{}")) as Record<string, unknown>;
+    const current = state.__eventMode;
+    const modes: Record<string, string> = {};
+    if (current !== undefined && typeof current === "object" && current !== null && !Array.isArray(current)) {
+      for (const [key, value] of Object.entries(current)) {
+        if (typeof value === "string") modes[key] = value;
+      }
+    }
+    if (mode === null) delete modes[String(port)];
+    else modes[String(port)] = mode;
+    if (Object.keys(modes).length === 0) delete state.__eventMode;
+    else state.__eventMode = modes;
     await writeFile(statePath, JSON.stringify(state));
   };
 
@@ -219,6 +343,9 @@ async function createFixture(options?: { bin?: "ready" | "unready" }): Promise<F
     hookCalls,
     hooks,
     setBusy,
+    setBusyForDirectory,
+    setEventSessions,
+    setEventMode,
     logLines: async () => (await readFile(logPath, "utf8").catch(() => "")).split("\n").filter(Boolean),
     setRuntimeConfig: (content: string) => writeFile(runtimeConfigPath, content),
     spawnPrimary,
@@ -284,6 +411,59 @@ describe("engine pool", () => {
     expect(fixture.hookCalls.reloadInPlace).toBe(0);
   });
 
+  test("explicit engine reload refreshes an idle engine even when its config is unchanged", async () => {
+    const fixture = await createFixture();
+    const { pool, primary } = await createPool(fixture);
+    const fingerprint = await computeEngineConfigFingerprint(fixture.template);
+    const server = await startServer(fixture.config);
+    cleanups.push(() => server.stop());
+
+    // Provider credentials live outside the runtime config. Saving or rotating
+    // a key must refresh the cached provider list even with identical config.
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const response = await fetch(`http://127.0.0.1:${server.port}/workspace/ws_pool/engine/reload`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${fixture.config.token}` },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true });
+      expect(fixture.hookCalls.reloadInPlace).toBe(attempt);
+      expect(pool.primaryUrl()).toBe(primary.url);
+      expect(await computeEngineConfigFingerprint(fixture.template)).toBe(fingerprint);
+    }
+
+    // Background reconciliation should retain its unchanged-config fast path.
+    expect(await pool.requestRollover({ reason: "unchanged", workspace: fixture.workspace }))
+      .toEqual({ action: "skipped", reason: "unchanged" });
+    expect(fixture.hookCalls.reloadInPlace).toBe(2);
+  });
+
+  test("explicit engine reload with unchanged config preserves busy sessions on the old engine", async () => {
+    const fixture = await createFixture();
+    const { pool, primary } = await createPool(fixture);
+    const oldPort = portOf(primary.url);
+    await fixture.setBusy(oldPort, ["ses_live"]);
+    const server = await startServer(fixture.config);
+    cleanups.push(() => server.stop());
+
+    const response = await fetch(`http://127.0.0.1:${server.port}/workspace/ws_pool/engine/reload`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${fixture.config.token}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true });
+    expect(pool.primaryUrl()).not.toBe(primary.url);
+    expect(primary.isAlive()).toBe(true);
+    expect(fixture.hookCalls.reloadInPlace).toBe(0);
+    expect(pool.routeRequest("POST", "/session/ses_live/prompt_async")?.target.baseUrl).toBe(primary.url);
+    const primaryUrl = pool.primaryUrl();
+    if (primaryUrl === null) throw new Error("Explicit reload left no primary engine");
+    expect(pool.routeRequest("POST", "/session/ses_new/prompt_async")?.target.baseUrl).toBe(primaryUrl);
+
+    await fixture.setBusy(oldPort, []);
+    expect(await waitUntil(() => !primary.isAlive(), 5_000)).toBe(true);
+  });
+
   test("reloads in place instead of spawning when the engine is idle", async () => {
     const fixture = await createFixture();
     const { pool, primary } = await createPool(fixture);
@@ -302,6 +482,43 @@ describe("engine pool", () => {
     expect(await pool.requestRollover({ reason: "repeat", workspace: fixture.workspace }))
       .toEqual({ action: "skipped", reason: "unchanged" });
     expect(fixture.hookCalls.reloadInPlace).toBe(1);
+  });
+
+  test("an in-place reload of one workspace does not skip the other workspaces' stale instances", async () => {
+    // In-place reload disposes ONE directory instance. The other workspaces'
+    // instances were built against the previous config and stay stale until
+    // their own reload, so the fingerprint guard must be per directory.
+    const fixture = await createFixture();
+    const { pool, primary } = await createPool(fixture);
+    const reloaded: string[] = [];
+    fixture.hooks.reloadInPlace = async (_config, workspace) => { reloaded.push(workspace.id); };
+    const second: WorkspaceInfo = { ...fixture.workspace, id: "ws_second", path: join(fixture.root, "second") };
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    expect(await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace }))
+      .toEqual({ action: "reloaded_in_place" });
+    expect(await pool.requestRollover({ reason: "config_changed", workspace: second }))
+      .toEqual({ action: "reloaded_in_place" });
+    expect(reloaded).toEqual([fixture.workspace.id, second.id]);
+    expect(pool.primaryUrl()).toBe(primary.url);
+
+    // Both directories now match the current config: repeats are no-ops.
+    expect(await pool.requestRollover({ reason: "repeat", workspace: fixture.workspace }))
+      .toEqual({ action: "skipped", reason: "unchanged" });
+    expect(await pool.requestRollover({ reason: "repeat", workspace: second }))
+      .toEqual({ action: "skipped", reason: "unchanged" });
+    expect(reloaded).toEqual([fixture.workspace.id, second.id]);
+
+    // A rollover to a fresh process rebuilds every instance, so nothing is
+    // stale until the config changes again.
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 3 }));
+    await fixture.setBusy(portOf(primary.url), ["ses_live"]);
+    expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
+      .toBe("rolled_over");
+    expect(await pool.requestRollover({ reason: "repeat", workspace: second }))
+      .toEqual({ action: "skipped", reason: "unchanged" });
+    expect(reloaded).toEqual([fixture.workspace.id, second.id]);
+    await fixture.setBusy(portOf(primary.url), []);
   });
 
   test("provider sync holds the serving primary until a standby is healthy and keeps it on spawn failure", async () => {
@@ -349,13 +566,24 @@ describe("engine pool", () => {
     const replacementUrl = pool.primaryUrl();
     expect(replacementUrl).not.toBe(primary.url);
     expect(standbyHealthChecks).toBe(1);
+    expect(await waitUntil(() => pool.snapshot().generations.length === 1, 5_000)).toBe(true);
 
-    expect(await pool.requestRollover({
-      reason: "cloud_provider_sync_unchanged",
+    // Provider sync only asks for a standby when it knows something changed,
+    // and a rotated credential never shows up in the config fingerprint. A
+    // forced request must therefore apply even when the bytes are unchanged;
+    // reporting "skipped" here is what left the engine on the old key.
+    delete fixture.hooks.waitForHealthy;
+    const forcedUnchanged = await pool.requestRollover({
+      reason: "cloud_provider_sync_credential_rotated",
       workspace: fixture.workspace,
       forceStandby: true,
-    })).toEqual({ action: "skipped", reason: "unchanged" });
-    expect(standbyHealthChecks).toBe(1);
+    });
+    expect(forcedUnchanged.action).toBe("rolled_over");
+    const rotatedUrl = pool.primaryUrl();
+    expect(rotatedUrl).not.toBe(replacementUrl);
+    // The plain (unforced) path still skips a byte-identical config.
+    expect(await pool.requestRollover({ reason: "unchanged", workspace: fixture.workspace }))
+      .toEqual({ action: "skipped", reason: "unchanged" });
 
     expect(await waitUntil(() => pool.snapshot().generations.length === 1, 5_000)).toBe(true);
     await fixture.setRuntimeConfig(JSON.stringify({ generation: 3 }));
@@ -368,7 +596,7 @@ describe("engine pool", () => {
       forceStandby: true,
     })).rejects.toThrow("standby spawn failed");
 
-    expect(pool.primaryUrl()).toBe(replacementUrl);
+    expect(pool.primaryUrl()).toBe(rotatedUrl);
     expect(pool.snapshot().generations).toEqual([expect.objectContaining({ role: "primary" })]);
     expect((await fixture.logLines()).some((line) => line.endsWith("POST /instance/dispose"))).toBe(false);
   });
@@ -443,10 +671,190 @@ describe("engine pool", () => {
     expect(await fixture.logLines()).toContain(`${oldPort} SIGTERM`);
   });
 
+  test("reports an active draining generation until it retires", async () => {
+    const fixture = await createFixture();
+    const { pool, primary } = await createPool(fixture);
+    const oldPort = portOf(primary.url);
+    expect(pool.hasDrainingGeneration()).toBe(false);
+    await fixture.setBusy(oldPort, ["ses_live"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace });
+
+    expect(pool.hasDrainingGeneration()).toBe(true);
+    expect(primary.isAlive()).toBe(true);
+    await fixture.setBusy(oldPort, []);
+    expect(await waitUntil(() => !pool.hasDrainingGeneration(), 5_000)).toBe(true);
+    // Retirement removes the draining status before asynchronous process exit.
+    expect(await waitUntil(() => !primary.isAlive(), 5_000)).toBe(true);
+  });
+
+  test("seeds the healthy standby before flipping and keeps the live engine when seeding fails", async () => {
+    const fixture = await createFixture();
+    const seeded: Array<{ generationId: string; baseUrl: string; primaryAtSeed: string | null; hasAuth: boolean }> = [];
+    let failSeed = false;
+    fixture.hooks.prepareStandby = async (_config, standby) => {
+      const pool = enginePoolForConfig(fixture.config);
+      seeded.push({
+        generationId: standby.generationId,
+        baseUrl: standby.baseUrl,
+        primaryAtSeed: pool?.primaryUrl() ?? null,
+        hasAuth: standby.username.length > 0 && standby.password.length > 0,
+      });
+      if (failSeed) throw new Error("engine auth API rejected the seed");
+    };
+    const { pool, primary } = await createPool(fixture);
+    await fixture.setBusy(portOf(primary.url), ["ses_live"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    const outcome = await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace });
+    expect(outcome.action).toBe("rolled_over");
+    if (outcome.action !== "rolled_over") throw new Error("expected a rollover");
+
+    // Seeded exactly once, with the standby's own connection, while the old
+    // engine was still primary: the new generation never served unseeded.
+    expect(seeded).toHaveLength(1);
+    expect(seeded[0]?.generationId).toBe(outcome.generationId);
+    const promotedUrl = pool.primaryUrl();
+    if (!promotedUrl) throw new Error("expected a promoted primary");
+    expect(seeded[0]?.baseUrl).toBe(promotedUrl);
+    expect(seeded[0]?.baseUrl).not.toBe(primary.url);
+    expect(seeded[0]?.primaryAtSeed).toBe(primary.url);
+    expect(seeded[0]?.hasAuth).toBe(true);
+
+    // A standby whose credential seed failed would serve every request with
+    // "API key is missing". It must never become primary: the live engine
+    // keeps serving, the standby is closed, and the caller learns the reload
+    // did not land so it can retry instead of reporting success.
+    await fixture.setBusy(portOf(primary.url), []);
+    expect(await waitUntil(async () => pool.snapshot().generations.length === 1, 5_000)).toBe(true);
+    const secondPrimaryUrl = pool.primaryUrl();
+    await fixture.setBusy(portOf(secondPrimaryUrl ?? "http://127.0.0.1:0"), ["ses_live_2"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 3 }));
+    failSeed = true;
+    await expect(pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace, manual: true }))
+      .rejects.toThrow("engine auth API rejected the seed");
+    expect(seeded).toHaveLength(2);
+    expect(pool.primaryUrl()).toBe(secondPrimaryUrl);
+    expect(pool.snapshot().generations).toEqual([expect.objectContaining({ role: "primary" })]);
+    expect(await waitUntil(async () => (await fixture.logLines()).includes(`${portOf(seeded[1]?.baseUrl ?? "http://127.0.0.1:0")} SIGTERM`), 5_000)).toBe(true);
+
+    // Once seeding works again the same change lands on a fresh standby.
+    failSeed = false;
+    const third = await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace, manual: true });
+    expect(third.action).toBe("rolled_over");
+    expect(seeded).toHaveLength(3);
+    expect(pool.primaryUrl()).not.toBe(secondPrimaryUrl);
+  });
+
+  test("a hung standby seed is bounded and leaves the live engine serving", async () => {
+    setEnv("OPENWORK_ENGINE_STANDBY_PREPARE_TIMEOUT_MS", "300");
+    const fixture = await createFixture();
+    let seeds = 0;
+    fixture.hooks.prepareStandby = () => {
+      seeds += 1;
+      return new Promise<void>(() => undefined);
+    };
+    const { pool, primary } = await createPool(fixture);
+    await fixture.setBusy(portOf(primary.url), ["ses_live"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    const startedAt = Date.now();
+    await expect(pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace }))
+      .rejects.toThrow(/standby preparation/i);
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
+    expect(seeds).toBe(1);
+    expect(pool.primaryUrl()).toBe(primary.url);
+    expect(fixture.config.opencodeBaseUrl).toBe(primary.url);
+    expect(pool.snapshot().generations).toEqual([expect.objectContaining({ role: "primary" })]);
+  });
+
+  test("a request coalesced into an in-flight rollover settles only once its own rollover lands", async () => {
+    const fixture = await createFixture();
+    let releaseSpawn: () => void = () => undefined;
+    const spawnReleased = new Promise<void>((resolve) => {
+      releaseSpawn = resolve;
+    });
+    let spawns = 0;
+    const realSpawn = createManagedOpencodeServer;
+    fixture.hooks.spawn = async (template) => {
+      spawns += 1;
+      if (spawns === 1) await spawnReleased;
+      const handle = await realSpawn({ bin: template.bin, cwd: template.cwd, env: template.env });
+      cleanups.push(() => handle.close().catch(() => undefined));
+      return handle;
+    };
+    const { pool, primary } = await createPool(fixture);
+    await fixture.setBusy(portOf(primary.url), ["ses_live"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    const first = pool.requestRollover({ reason: "first", workspace: fixture.workspace });
+    expect(await waitUntil(() => spawns === 1, 2_000)).toBe(true);
+
+    // The second request carries a change the in-flight spawn may not have
+    // read (a rotated credential). Its promise must not resolve with a bare
+    // "coalesced" ack: that let the caller record the reload as landed while
+    // the engine was still being replaced with stale inputs.
+    const second = pool.requestRollover({ reason: "credential_rotated", workspace: fixture.workspace, forceStandby: true });
+    let secondSettled = false;
+    void second.then(() => { secondSettled = true; }, () => { secondSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    try {
+      expect(secondSettled).toBe(false);
+    } finally {
+      releaseSpawn();
+    }
+    expect((await first).action).toBe("rolled_over");
+    const afterFirst = pool.primaryUrl();
+    // Let the first drain finish so the forced follow-up can take its turn.
+    await fixture.setBusy(portOf(primary.url), []);
+    const outcome = await second;
+    expect(outcome.action).toBe("rolled_over");
+    expect(spawns).toBe(2);
+    // The last spawned generation is the one serving: the coalesced request
+    // landed after the in-flight one, with the final desired inputs.
+    expect(pool.primaryUrl()).not.toBe(afterFirst);
+    expect(pool.primaryUrl()).not.toBe(primary.url);
+  });
+
+  test("keeps a live session from another workspace on the draining generation", async () => {
+    const fixture = await createFixture();
+    const secondWorkspace: WorkspaceInfo = {
+      ...fixture.workspace,
+      id: "ws_pool_second",
+      name: "Second pool workspace",
+      path: join(fixture.root, "second"),
+    };
+    fixture.config.workspaces.push(secondWorkspace);
+    const { pool, primary } = await createPool(fixture);
+    const oldPort = portOf(primary.url);
+    await fixture.setBusyForDirectory(oldPort, fixture.workspace.path, ["ses_first_workspace"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    const outcome = await pool.requestRollover({
+      reason: "second_workspace_sync",
+      workspace: secondWorkspace,
+      forceStandby: true,
+    });
+
+    expect(outcome.action).toBe("rolled_over");
+    if (outcome.action !== "rolled_over") throw new Error("expected a rollover");
+    expect(outcome.drainingSessions).toBe(1);
+    expect(primary.isAlive()).toBe(true);
+    expect(pool.routeRequest("GET", "/session/ses_first_workspace/message")?.target.baseUrl).toBe(primary.url);
+
+    await fixture.setBusyForDirectory(oldPort, fixture.workspace.path, []);
+    expect(await waitUntil(() => !primary.isAlive(), 5_000)).toBe(true);
+  });
+
   test("keeps live session and prompt traffic on the draining generation", async () => {
     const fixture = await createFixture();
     const { pool, primary } = await createPool(fixture);
     const oldPort = portOf(primary.url);
+    // A lone primary forwards frames verbatim; nothing needs the parsed payload.
+    const lonePrimary = pool.connections().find((connection) => connection.role === "primary");
+    expect(pool.eventForwardMode(lonePrimary?.generationId ?? "")).toBe("forward");
+    expect(pool.eventForwardMode("gen_unknown")).toBe("drop");
     await fixture.setBusy(oldPort, ["ses_live"]);
     await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
 
@@ -458,6 +866,8 @@ describe("engine pool", () => {
     const draining = connections.find((connection) => connection.role === "draining");
     expect(current?.baseUrl).not.toBe(primary.url);
     expect(draining?.baseUrl).toBe(primary.url);
+    expect(pool.eventForwardMode(current?.generationId ?? "")).toBe("filter");
+    expect(pool.eventForwardMode(draining?.generationId ?? "")).toBe("filter");
 
     expect(pool.routeRequest("GET", "/session/ses_live/message")?.target.baseUrl).toBe(primary.url);
     expect(pool.routeRequest("POST", "/session/ses_live/prompt_async")?.target.baseUrl).toBe(primary.url);
@@ -480,6 +890,8 @@ describe("engine pool", () => {
     const remainingPrimaryUrl = pool.primaryUrl();
     if (!remainingPrimaryUrl) throw new Error("expected the primary engine to remain live");
     expect(pool.routeRequest("GET", "/session/ses_live/message")?.target.baseUrl).toBe(remainingPrimaryUrl);
+    // Once the drained generation and its pins are gone, verbatim forwarding resumes.
+    expect(pool.eventForwardMode(current?.generationId ?? "")).toBe("forward");
   });
 
   test("proxies owned sessions to the old engine and merges cross-generation reads", async () => {
@@ -515,6 +927,31 @@ describe("engine pool", () => {
 
     const reply = await (await proxy(`/permission/req_${oldPort}/reply`, "POST")).json() as { port: number };
     expect(reply.port).toBe(oldPort);
+
+    const lateUrl = new URL(`http://127.0.0.1/opencode/permission?request=req_late&owner=${newPort}&session=ses_live`);
+    const latePending = await proxyOpencodeRequest({
+      config: fixture.config,
+      request: new Request(lateUrl),
+      url: lateUrl,
+      workspace: fixture.workspace,
+      proxyPath: "/permission",
+    });
+    expect(await latePending.json()).toEqual([{ id: "req_late", sessionID: "ses_live" }]);
+    const lateReply = await (await proxy("/permission/req_late/reply", "POST")).json() as { port: number };
+    expect(lateReply.port).toBe(oldPort);
+
+    const currentGeneration = pool.connections().find((connection) => connection.role === "primary");
+    if (!currentGeneration) throw new Error("expected a current generation");
+    pool.observePendingRequests(currentGeneration.generationId, [{ id: "req_stale", sessionID: "ses_new" }]);
+    const staleUrl = new URL(`http://127.0.0.1/opencode/permission/req_stale/reply?owner=${oldPort}`);
+    const staleReply = await proxyOpencodeRequest({
+      config: fixture.config,
+      request: new Request(staleUrl, { method: "POST" }),
+      url: staleUrl,
+      workspace: fixture.workspace,
+      proxyPath: "/permission/req_stale/reply",
+    });
+    expect(await staleReply.json()).toMatchObject({ port: oldPort });
 
     const events = await (await proxy("/event")).text();
     expect(events).toContain('"sessionID":"ses_live"');
@@ -587,14 +1024,42 @@ describe("engine pool", () => {
     lease.release();
   });
 
-  test("aborts the remaining sessions once the drain grace period expires", async () => {
+  test("closes an existing event response when a generation flips", async () => {
+    const fixture = await createFixture();
+    const { pool, primary } = await createPool(fixture);
+    await fixture.setBusy(portOf(primary.url), ["ses_live"]);
+    const url = new URL("http://127.0.0.1/opencode/event?hold=1");
+    const response = await proxyOpencodeRequest({
+      config: fixture.config,
+      request: new Request(url),
+      url,
+      workspace: fixture.workspace,
+      proxyPath: "/event",
+    });
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("expected an event response body");
+    expect((await reader.read()).done).toBe(false);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
+      .toBe("rolled_over");
+    const closed = await Promise.race([
+      reader.read().then((result) => result.done),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_000)),
+    ]);
+    expect(closed).toBe(true);
+  });
+
+  test("aborts the remaining sessions once the drain inactivity grace period expires", async () => {
     setEnv("OPENWORK_ENGINE_DRAIN_TIMEOUT_MS", "300");
     setEnv("OPENWORK_ENGINE_ABORT_SETTLE_MS", "100");
     const fixture = await createFixture();
     const { pool, primary } = await createPool(fixture);
     const oldPort = portOf(primary.url);
-    // This session never finishes, so only the grace timeout can end the drain.
+    // This session reports busy forever but never emits an event, so only the
+    // inactivity grace timeout can end the drain.
     await fixture.setBusy(oldPort, ["ses_stuck"]);
+    await fixture.setEventSessions(oldPort, []);
     await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
 
     expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
@@ -605,6 +1070,48 @@ describe("engine pool", () => {
     const lines = await fixture.logLines();
     expect(lines).toContain(`${oldPort} POST /session/ses_stuck/abort`);
     expect(lines).toContain(`${oldPort} SIGTERM`);
+  });
+
+  test("uses one global activity stream across many workspaces and never aborts an active session", async () => {
+    setEnv("OPENWORK_ENGINE_DRAIN_TIMEOUT_MS", "300");
+    setEnv("OPENWORK_ENGINE_ABORT_SETTLE_MS", "100");
+    const fixture = await createFixture();
+    for (let index = 1; index < 32; index += 1) {
+      fixture.config.workspaces.push({
+        ...fixture.workspace,
+        id: `ws_pool_${index}`,
+        name: `Pool workspace ${index}`,
+        path: join(fixture.root, `workspace-${index}`),
+      });
+    }
+    const { pool, primary } = await createPool(fixture);
+    const oldPort = portOf(primary.url);
+    // The run keeps streaming: the engine event bus names it continuously.
+    await fixture.setBusy(oldPort, ["ses_streaming"]);
+    await fixture.setEventSessions(oldPort, ["ses_streaming"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+
+    expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
+      .toBe("rolled_over");
+    expect(await waitUntil(async () => (await fixture.logLines()).includes(`${oldPort} GET /global/event`), 2_000))
+      .toBe(true);
+
+    // Wait out four full grace periods: an actively working session must
+    // never be aborted, so the draining engine stays alive the whole time.
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    expect(primary.isAlive()).toBe(true);
+    const activeLines = await fixture.logLines();
+    expect(activeLines.filter((line) => line === `${oldPort} GET /global/event`)).toHaveLength(1);
+    expect(activeLines.some((line) => line === `${oldPort} GET /event`)).toBe(false);
+    expect(activeLines.some((line) => line.includes("/abort"))).toBe(false);
+
+    // The run finishes: the engine idles and the drained generation closes
+    // without ever aborting anything.
+    await fixture.setEventSessions(oldPort, []);
+    await fixture.setBusy(oldPort, []);
+    expect(await waitUntil(() => !primary.isAlive(), 5_000)).toBe(true);
+    expect((await fixture.logLines()).some((line) => line.includes("/abort"))).toBe(false);
+    expect(await fixture.logLines()).toContain(`${oldPort} SIGTERM`);
   });
 
   test("never runs more than one primary and one draining engine", async () => {
@@ -660,5 +1167,119 @@ describe("engine pool", () => {
     const lines = await fixture.logLines();
     expect(lines).toContain(`${portOf(primary.url)} SIGTERM`);
     expect(lines).toContain(`${portOf(replacementUrl ?? "http://127.0.0.1:0")} SIGTERM`);
+  });
+});
+
+describe("BoundedSseFrameBuffer", () => {
+  const encoder = new TextEncoder();
+
+  test("splits frames across chunk boundaries and both delimiter styles", () => {
+    const buffer = new BoundedSseFrameBuffer(64);
+    expect(buffer.push(encoder.encode("data: one\n\ndata: tw"))).toEqual({ frames: ["data: one"], overflow: false });
+    expect(buffer.push(encoder.encode("o\r\n\r\ndata: three"))).toEqual({ frames: ["data: two"], overflow: false });
+    expect(buffer.push(encoder.encode("\n\n"))).toEqual({ frames: ["data: three"], overflow: false });
+  });
+
+  test("keeps completed frames and flags overflow once the unterminated remainder exceeds the cap", () => {
+    const buffer = new BoundedSseFrameBuffer(8);
+    expect(buffer.push(encoder.encode("data: a\n\n0123456789"))).toEqual({ frames: ["data: a"], overflow: true });
+  });
+
+  test("never overflows while frames keep terminating", () => {
+    const buffer = new BoundedSseFrameBuffer(16);
+    for (let index = 0; index < 100; index += 1) {
+      expect(buffer.push(encoder.encode("data: abcdefgh\n\n"))).toEqual({ frames: ["data: abcdefgh"], overflow: false });
+    }
+  });
+});
+
+describe("engine event stream bounds", () => {
+  const proxyEvent = async (fixture: Fixture, path: string): Promise<Response> => {
+    const url = new URL(`http://127.0.0.1/opencode${path}`);
+    return proxyOpencodeRequest({
+      config: fixture.config,
+      request: new Request(url),
+      url,
+      workspace: fixture.workspace,
+      proxyPath: url.pathname.slice("/opencode".length),
+    });
+  };
+
+  test("a sibling that never returns headers does not stall the client event stream", async () => {
+    setEnv("OPENWORK_ENGINE_EVENT_ESTABLISH_TIMEOUT_MS", "300");
+    const fixture = await createFixture();
+    const { pool, primary } = await createPool(fixture);
+    const oldPort = portOf(primary.url);
+    await fixture.setBusy(oldPort, ["ses_live"]);
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+    expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
+      .toBe("rolled_over");
+    const newPort = portOf(pool.primaryUrl() ?? "http://127.0.0.1:0");
+    // The draining sibling accepts the socket but never answers with headers.
+    await fixture.setEventMode(oldPort, "stall");
+
+    const startedAt = Date.now();
+    const response = await proxyEvent(fixture, "/event");
+    const events = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(events).toContain(`"sessionID":"ses_${newPort}"`);
+  });
+
+  test("a quiet live event stream stays open past the establishment deadline", async () => {
+    setEnv("OPENWORK_ENGINE_EVENT_ESTABLISH_TIMEOUT_MS", "300");
+    const fixture = await createFixture();
+    await createPool(fixture);
+
+    // hold=1 sends one frame and then goes silent on an open stream.
+    const response = await proxyEvent(fixture, "/event?hold=1");
+    expect(response.status).toBe(200);
+    if (!response.body) throw new Error("expected a streaming body");
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+
+    // The establishment deadline is long past; only establishment is bounded,
+    // so the silent-but-live body must still be open.
+    const idle = await Promise.race([
+      reader.read().then((chunk) => (chunk.done ? "closed" : "data")),
+      new Promise<string>((resolve) => setTimeout(() => resolve("open"), 1_200)),
+    ]);
+    expect(idle).toBe("open");
+    await reader.cancel().catch(() => undefined);
+  });
+
+  test("closes an event connection whose frame never terminates instead of buffering it", async () => {
+    const fixture = await createFixture();
+    const { primary } = await createPool(fixture);
+    await fixture.setEventMode(portOf(primary.url), "giant");
+
+    const response = await proxyEvent(fixture, "/event");
+    expect(response.status).toBe(200);
+    // The runaway frame hits the cap: the connection is dropped and the
+    // merged stream closes instead of buffering the frame forever.
+    const events = await response.text();
+    expect(events).toBe("");
+  });
+
+  test("the drain activity watch drops a runaway frame stream and reconnects", async () => {
+    setEnv("OPENWORK_ENGINE_DRAIN_ACTIVITY_RECONNECT_MS", "100");
+    const fixture = await createFixture();
+    const { pool, primary } = await createPool(fixture);
+    const oldPort = portOf(primary.url);
+    await fixture.setBusy(oldPort, ["ses_stuck"]);
+    await fixture.setEventMode(oldPort, "giant");
+    await fixture.setRuntimeConfig(JSON.stringify({ generation: 2 }));
+    expect((await pool.requestRollover({ reason: "config_changed", workspace: fixture.workspace })).action)
+      .toBe("rolled_over");
+
+    // Every malformed stream is dropped at the frame cap and re-dialed;
+    // without the bound the first connection would buffer forever and a
+    // second dial would never happen.
+    expect(await waitUntil(async () => {
+      const lines = await fixture.logLines();
+      return lines.filter((line) => line === `${oldPort} GET /global/event`).length >= 2;
+    }, 10_000)).toBe(true);
   });
 });

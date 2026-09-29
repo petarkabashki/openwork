@@ -1,14 +1,14 @@
 import type { DynamicToolUIPart, ToolUIPart } from "ai"
 
-import { isToolPartInFlight } from "@/lib/tool-activity"
+// Relative so app-less evals specs can import this module without the app's
+// "@/" path alias.
+import { isToolPartInFlight } from "./tool-activity"
 
 type AnyToolPart = ToolUIPart | DynamicToolUIPart
 
 /**
- * Client-side duration tracking. Tool parts carry no timing metadata, so
- * we record when a call is first seen in flight and freeze the elapsed
- * time on completion. Restored history (never seen running) gets no
- * duration rather than a fabricated one.
+ * Prefer native timing forwarded through provider metadata. Optimistic parts
+ * use first observation until the engine reports its persisted start.
  */
 const startedAtByCallId = new Map<string, number>()
 const durationByCallId = new Map<string, number>()
@@ -19,7 +19,7 @@ export function trackToolCallDuration(part: AnyToolPart): string | null {
   if (frozen !== undefined) return formatToolCallDuration(frozen)
 
   if (isToolPartInFlight(part)) {
-    if (!startedAtByCallId.has(callId)) startedAtByCallId.set(callId, Date.now())
+    getToolCallStartedAt(part)
     return null
   }
 
@@ -29,6 +29,38 @@ export function trackToolCallDuration(part: AnyToolPart): string | null {
   durationByCallId.set(callId, elapsed)
   startedAtByCallId.delete(callId)
   return formatToolCallDuration(elapsed)
+}
+
+/**
+ * Epoch ms when this call started. Native timing wins across hydration;
+ * optimistic parts retain their first-observed time across component remounts.
+ * A restored engine part without timing stays explicitly unknown.
+ */
+export function getToolCallStartedAt(part: AnyToolPart): number | null {
+  if (!isToolPartInFlight(part)) return null
+  const callId = part.toolCallId
+  const persisted = part.callProviderMetadata?.openwork?.toolStartedAt
+  if (typeof persisted === "number" && Number.isFinite(persisted)) {
+    startedAtByCallId.set(callId, persisted)
+    return persisted
+  }
+  const existing = startedAtByCallId.get(callId)
+  if (existing !== undefined) return existing
+  if (typeof part.callProviderMetadata?.opencode?.partId === "string") return null
+  const now = Date.now()
+  startedAtByCallId.set(callId, now)
+  return now
+}
+
+/**
+ * Live elapsed counters ("Working 12s") tick in whole seconds. Once a run
+ * crosses a minute, show minutes and seconds ("Working 6m 43s") instead of
+ * an ever-growing raw second count.
+ */
+export function formatElapsedSeconds(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}m ${seconds % 60}s`
 }
 
 export function formatToolCallDuration(ms: number): string {

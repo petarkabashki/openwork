@@ -8,8 +8,6 @@ export default defineConfig({
     cssCodeSplit: false,
     emptyOutDir: true,
     modulePreload: { polyfill: false },
-    rollupOptions: {
-      input: "skill-created.html",
-    },
+    rollupOptions: { input: "connection-action.html" },
   },
 })

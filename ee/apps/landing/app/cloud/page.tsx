@@ -8,15 +8,16 @@ import { LpAlphaBadge, LpArrowLink, LpSectionHeader, LpTonalCard } from "../../c
 import { SiteFooter } from "../../components/site-footer";
 import { SiteNav } from "../../components/site-nav";
 import { getGithubData } from "../../lib/github";
+import { withSocialMetadata } from "../../lib/seo";
 
 const CLOUD_SIGNUP_URL = "https://app.openworklabs.com";
 
-export const metadata: Metadata = {
+export const metadata: Metadata = withSocialMetadata({
   title: "OpenWork Cloud — the dashboard for your whole org",
   description:
     "OpenWork Cloud is where you run OpenWork as a team — provision model providers, deploy skills and MCP servers, manage members and policies. OpenWork Web and the Connect gateway are built in.",
   alternates: { canonical: "/cloud" }
-};
+});
 
 const dashboardFeatures = [
   {
@@ -46,7 +47,6 @@ export default async function CloudPage() {
       <div className="relative z-10">
         <SiteNav
           stars={github.stars}
-          downloadHref={github.downloads.macos}
           callUrl={callHref}
           mobilePrimaryHref={CLOUD_SIGNUP_URL}
           mobilePrimaryLabel="Get started for free"
@@ -105,7 +105,11 @@ export default async function CloudPage() {
           </section>
 
           <section className="mt-[120px]">
-            <LpSectionHeader label="The dashboard" heading="Run agents like a fleet, not a folder of setups." />
+            <LpSectionHeader
+              label="The dashboard"
+              heading="Run agents like a fleet, not a folder of setups."
+              right={<LpArrowLink href="/dashboard">See OpenWork Dashboard</LpArrowLink>}
+            />
             <div className="mt-10 grid gap-6 md:grid-cols-2">
               {dashboardFeatures.map((feature) => (
                 <div key={feature.title} className="rounded-[24px] bg-[var(--lp-tonal)] p-7">

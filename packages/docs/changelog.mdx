@@ -1,6 +1,199 @@
 ---
 title: "Changelog"
+description: "OpenWork release notes: new features, improvements, and bug fixes."
+"og:description": "OpenWork release notes: new features, improvements, and bug fixes."
 ---
+<Update label="September 25th" tags={["🚀 New Features", "🐛 Bug Fixes"]}>
+
+  ## [v0.18.54](https://github.com/different-ai/openwork/compare/v0.18.52...v0.18.54): Enterprise sign-in and version pinning are back, plus Amazon Bedrock and model shortcuts
+
+  - **Organization sign-in and allowed versions work again.** OpenWork Enterprise and OpenWork Cloud desktops once again ask people to sign in to their organization before they start working, and desktop updates skip any version an admin removed from **Allowed desktop versions**. Other desktop policies stay saved but are not enforced on the desktop while they are redesigned.
+  - **Amazon Bedrock in AI Gateway.** For admins: add Amazon Bedrock and Amazon Bedrock (OpenAI) with an AWS region and access keys, and reuse the saved keys for the second one. Anthropic effort choices are kept through the gateway.
+  - **Switch models with a key.** In Settings › Keyboard shortcuts you can bind a key to a saved model with its reasoning level and Fast. ⌃⇧F (Ctrl+Alt+F on Windows and Linux) turns Fast on or off, and the model name shows "· Fast" while it's on.
+  - **Chat keeps its place.** Editing a message while a reply is running replaces it instead of queueing the edit. Conversations stay in their folder when an agent changes directory, and questions and approvals no longer disappear. You can switch between OpenCode engines from the command palette and choose whether to copy older chats across. Agent tool work is summarized by what it did instead of raw tool names.
+  - **Simpler connector setup.** For admins in OpenWork Cloud: API-key, custom sign-in, Google Workspace and Microsoft 365 connectors use the new setup flow and can be edited in place, and Plugins has clearer filters. Apps like Claude Code, Codex and Cursor can connect to OpenWork Connect without registering first, failed sign-ins explain what to do next, and the MCP docs have one-click Cursor and VS Code install links.
+  - **Also in this release.** Windows installers are published again. Updating no longer fails with a checksum error after a release is re-run. Update controls in Settings are more compact, a second OpenWork profile no longer stops the first one's engine, and the website shows OpenWork's completed SOC 2 Type II audit.
+
+</Update>
+
+<Update label="September 24th" tags={["🚀 New Features", "🐛 Bug Fixes"]}>
+
+  ## [v0.18.52](https://github.com/different-ai/openwork/compare/v0.18.50...v0.18.52): Manage your Library from the desktop, find anything from one + menu, and a rebuilt AI Gateway
+
+  - **Your Library works fully on the desktop.** You can now add, share, edit and delete skills, connectors and plugins without leaving the app. A new Connectors tab lists your connectors, adding one starts from a catalog with service logos, and an MCP server's address is checked before it's saved. Each item's page has **Chat**, which starts a task with that item ready to use, and **Share** on items you own. When a skill shapes an answer, chat names the skill. Signed out, the Library shows one clear **Sign in to OpenWork Cloud** button instead of an "Add to library" button that did nothing. Lists also load faster.
+  - **One + menu in the composer finds everything.** The paperclip and tools buttons are now a single **+** menu that opens on a search across your files, skills, connectors, plugins and commands. It still finds what you meant when you make a typo ("hubsopt" finds HubSpot). Attaching a file is the first option, or press ⌘U (Ctrl+U on Windows and Linux).
+  - **Usage limits are clearer.** When you reach your organization's usage limit, the chat says which limit you hit and when it resets, and you can ask for more right there. The account menu shows how much of each limit you have left, and the new Settings › Usage page has the details. The chat no longer also shows a misleading "too many requests" error under the limit.
+  - **AI Gateway is rebuilt and available to every organization.** For admins: AI Gateway is now a regular page in the sidebar. Add a provider from a catalog, then set its key, who can use it and which models in one form. Overview shows who spends what and on which models, with a page for each person. Limits lets you cap spend per day, week or month for everyone, a team or one person, and you can undo a deleted limit. Users & Teams shows everyone's providers, limits and last 31 days of spend. Mistral is now supported. Members can sign in to Gemini and Claude on Google Cloud with their own Google account from the new Models section of My Library, which replaces the old My Model Connections page.
+  - **Connectors and plugins are simpler to manage.** For admins in OpenWork Cloud: add a connector in a few steps, choose whether each person signs in or one account is shared by everyone, and pick which teams get it. **Add any MCP** adds a server that isn't in the catalog, or you can paste its address into the search. Manage › Plugins lists every plugin with who has it. You can create one and give it to teams right there, then search by name or filter by team or person. Removing a connector or plugin now asks first, and switching a connector to one shared account warns you before it signs you out. Owners can also approve their self-hosted OpenWork web address in Org settings so members can sign in there, even if they belong to several organizations.
+  - **Also in this release.** The first time you click a link, OpenWork asks whether to open it in OpenWork or your usual browser and can remember your choice. You can change it later in Settings › Preferences › Browser, or right-click a link to choose once. Session search and notifications sit next to the OpenWork name at the top of the sidebar, and window controls look native on macOS, Windows and Linux. The built-in browser no longer has a Suspend button. After you sign in, Settings › AI providers works right away, even before you create your first workspace. If you use OpenWork from Claude Code, Cursor or Codex, agents can update shared skills. When a long document or email is cut short, they're told the full length and how to read the rest.
+
+</Update>
+
+<Update label="September 22nd" tags={["🚀 New Features", "🐛 Bug Fixes", "🏗️ Refactoring"]}>
+
+  ## [v0.18.50](https://github.com/different-ai/openwork/compare/v0.18.49...v0.18.50): Run OpenWork on your own server with one command
+
+  - **Self-host OpenWork with one command.** For self-hosters: `npm i -g openwork-server && openwork-server web` now runs the full OpenWork web app on a home server or VPS. It downloads the matching engine on first run and keeps its access tokens across restarts, and `npm i -g openwork-server@latest` updates it. Before, you had to clone and build the repo, install the engine yourself, and recreate tokens after every restart.
+  - **Connecting an account in chat no longer gets stuck.** When the agent needs you to connect a service, you now always get a clear card to connect or skip, with **Try again** if sign-in doesn't finish. Before, chat could wait forever on "Checking connection request…".
+  - **Chat replies are simpler.** Creating or sharing a skill, asking for a mockup, being asked for an environment variable, and browsing connectors now reply in plain text instead of embedded cards. The connection card is the only one that stays.
+  - **Your email stays out of the sidebar.** The account row now shows your name and "OpenWork Cloud" instead of your email address. Your email is still at the top of the account menu.
+  - **If you use OpenWork from Claude Code, Cursor, or Codex:** agents can now list your organization's skills and open any of them directly. Before, they had to guess search keywords, so organization skills often went unused.
+  - **Clearer pricing everywhere.** The website, docs, and sign-up now all show the same plans: Free, Team at $10 per seat per month, and Enterprise at $40 per user billed annually, with Cloud Computer and OpenWork models as add-ons. The website and docs also have refreshed branding.
+
+</Update>
+
+<Update label="September 21st" tags={["🐛 Bug Fixes", "🚀 New Features", "🏗️ Refactoring"]}>
+
+  ## [v0.18.49](https://github.com/different-ai/openwork/compare/v0.18.48...v0.18.49): Agent sessions recover more reliably and provider connections stay consistent
+
+  - Conversations now reopen and continue more reliably, with history pages filling correctly and background streaming preserved.
+  - Mobile chat is easier to use, with steadier submission, scrolling, keyboard, composer, and sidebar behavior.
+  - Provider connections and cloud workspace startup now handle credentials, readiness, and recovery more reliably.
+  - Removed custom agents and added clearer linked task references and alpha build information.
+
+</Update>
+
+<Update label="September 9th" tags={["🐛 Bug Fixes", "🏗️ Refactoring"]}>
+
+  ## [v0.18.44](https://github.com/different-ai/openwork/compare/v0.18.43...v0.18.44): Sessions preserve live progress and drafts
+
+  - Sessions now preserve live progress when cached threads are restored.
+  - Composer drafts stay in place, and instant sends are verified.
+  - Shared callback modes are recorded correctly for isolated MCP rows.
+  - Removed the legacy embedded connection app and gateway launch path.
+
+</Update>
+
+<Update label="September 9th" tags={["🚀 New Features", "🐛 Bug Fixes", "🏗️ Refactoring"]}>
+
+  ## [v0.18.43](https://github.com/different-ai/openwork/compare/v0.18.42...v0.18.43): Desktop connections unify and agent work recovers more reliably
+
+  - Desktop connection status now uses one clear native card, while sign-in and managed credentials recover more reliably.
+  - Browser tasks can use site tools, page controls, tab suspension and reload, selected logins, and user takeover.
+  - Agent runs recover more smoothly from stalled sends, interruptions, restarts, and follow-up turns, with drafts and sent messages staying visible.
+  - Computer Use adds hosted approval, native previews, scoped sessions, and continuation after takeover or refresh.
+  - Organization access, workflow apps, analytics, onboarding, and desktop policies are clearer and more dependable.
+
+</Update>
+
+<Update label="September 2nd" tags={["🚀 New Features", "🐛 Bug Fixes", "🏗️ Refactoring"]}>
+
+  ## [v0.18.42](https://github.com/different-ai/openwork/compare/v0.18.41...v0.18.42): MCP connections become standard servers and desktop flows stay reliable
+
+  - MCP connections can now be exposed directly as standard MCP servers.
+  - OpenWork Dashboard now has its own page and interactive preview, with a new guide for MCP App widgets.
+  - Fixed browser opening, narrow-window Settings navigation, session visibility, permission requests, image lightboxes, and queued drafts so everyday work stays reliable.
+  - Added clearer Automations examples and Google SSO and SCIM guidance, while SSO setup now validates its configuration before enforcement.
+
+</Update>
+
+<Update label="September 2nd" tags={["🐛 Bug Fixes", "🚀 New Features"]}>
+
+  ## [v0.18.41](https://github.com/different-ai/openwork/compare/v0.18.40...v0.18.41): Session status gets honest and cloud providers connect with saved credentials
+
+  - The Working indicator now tells the truth: it stops when a run errors or the engine is unreachable, and shows minutes once a run passes the first hour.
+  - Sessions reconcile more cleanly — completions are detected while you're working elsewhere, queued messages send even when the session is out of view, and archiving works from any workspace.
+  - Cloud providers now connect using the credentials saved on your desktop, and Google Workspace retrieval is more resilient.
+  - Published the SOC 2 badge and compliance status on the landing page.
+  - Hardened security by fixing static-analysis findings and isolating provider sync contexts, alongside internal test and release tooling improvements.
+
+</Update>
+
+<Update label="August 31st" tags={["🚀 New Features", "🐛 Bug Fixes", "🏗️ Refactoring"]}>
+
+  ## [v0.18.40](https://github.com/different-ai/openwork/compare/v0.18.39...v0.18.40): Portable Agent Plugins arrive and desktop sessions run calmer
+
+  - OpenWork can now import and run portable Agent Plugins, bringing Anthropic-compatible plugin packs into the desktop app.
+  - Automations can be pinned to a specific workspace, and remote-session commands now arrive in native local sessions on your desktop.
+  - Fixed request storms and reload loops across Settings, the Library, the composer, and desktop policies, so long sessions stay fast.
+  - Gmail replies support collapsible quoting and attachments, and OpenWork Cloud members get complimentary OpenWork Web access.
+  - Strengthened sign-in and access security and made the desktop recover cleanly from socket and renderer crashes.
+
+</Update>
+
+<Update label="August 27th" tags={["🚀 New Features", "🐛 Bug Fixes", "🏗️ Refactoring"]}>
+
+  ## [v0.18.39](https://github.com/different-ai/openwork/compare/v0.18.38...v0.18.39): Richer session artifacts and more resilient agent runs
+
+  - Session files now live in the artifact rail instead of interrupting the chat transcript, with safer badge layout and responsive behavior on narrow screens.
+  - Markdown can render Mermaid diagrams safely, and code blocks offer a word-wrap control for long lines.
+  - Agent runs recover more reliably from idle admissions, queued follow-ups, event-stream restarts, Settings visits, and large workspace session histories.
+  - OpenWork Cloud adds per-member managed-model credentials, paid browser access, desktop delivery for remote-session commands, and more reliable worker recovery.
+  - Electron file transfers now work correctly across the remote bridge, and LiteLLM examples include synchronized model metadata.
+
+  ## [v0.18.38](https://github.com/different-ai/openwork/compare/v0.18.37...v0.18.38): Split-view workflows and live sessions get more dependable
+
+  - Added cross-workspace split view and transcript actions for resuming interrupted runs.
+  - Live session status now survives navigation, workspace switches, and reattachment while long-running streams remain responsive.
+  - Refined tool-call activity, thought grouping, artifact controls, and Library choices so active work is easier to follow and manage.
+  - Cloud extension status now reflects real connectivity, remote-session capabilities reach cloud targets, and worker recovery avoids competing owners.
+  - Added a pull-only Docker evaluation stack and strengthened enterprise licensing documentation and stewardship metadata.
+
+</Update>
+
+<Update label="August 26th" tags={["🚀 New Features", "🐛 Bug Fixes"]}>
+
+  ## [v0.18.37](https://github.com/different-ai/openwork/compare/v0.18.36...v0.18.37): Managed dashboards arrive and everyday navigation gets faster
+
+  - Organization-managed MCP App dashboards now render on desktop, with a personal grid and an add-from-Connect picker that refreshes automatically.
+  - Code Mode and MCP Apps are enabled by default, and Dashboard visibility follows each deployment's availability controls.
+  - Added an artifact code browser, branded connector tool calls, delegated-task shimmer, and smoother keyboard, Library, model, and chat controls.
+  - Improved streaming and render performance, stabilized sidebar ordering and Settings state, and kept composer focus through refreshes.
+  - Fixed Azure managed-provider credential selection and clarified Azure Foundry resource names for bring-your-own-key setup.
+
+</Update>
+
+<Update label="August 24th" tags={["🚀 New Features", "🐛 Bug Fixes"]}>
+
+  ## [v0.18.36](https://github.com/different-ai/openwork/compare/v0.18.35...v0.18.36): Hosted MCP Apps and cloud sign-in become more reliable
+
+  - Hosted MCP Apps now render through the credential-bound Den gateway, and Connect refreshes its MCP App catalog when cached inventory is incomplete.
+  - Fixed Den callback routing, API-origin derivation, and cookie forwarding so hosted sign-in remains on the correct domain.
+  - Workspace switches preserve live agent runs under load, while stale tool activity and scrolling no longer disrupt the active transcript.
+  - Desktop update channel selection stays stable, Automation control-plane traffic is bounded, and standalone MCP requests stop retrying indefinitely.
+  - Clarified the difference between local setup, managed OpenWork Cloud, OpenCode models, and OpenWork-managed models.
+
+</Update>
+
+<Update label="August 20th" tags={["🚀 New Features", "🐛 Bug Fixes", "🏗️ Refactoring"]}>
+
+  ## [v0.18.35](https://github.com/different-ai/openwork/compare/v0.18.34...v0.18.35): Desktop respects Automation deployment controls
+
+  - Desktop now shows Automation navigation and proposals and registers a runner only when the connected deployment explicitly enables Automations.
+  - Older and self-hosted deployments that do not advertise Automation availability remain safely disabled.
+
+  ## [v0.18.34](https://github.com/different-ai/openwork/compare/v0.18.33...v0.18.34): MCP Apps guide connection setup and Desktop automations recover cleanly
+
+  - First-party MCP App cards now guide connection, plugin, and skill-created flows directly in chat, including useful recovery cards when a connection fails.
+  - Desktop automations report outcomes, open their execution threads, and recover missed runs and credential failures more reliably.
+  - Programs are now called Workflows, with obsolete selection tools and legacy MCP App surfaces removed.
+  - MCP connections are more resilient to server recovery, protocol changes, OAuth refresh bursts, and stale credentials.
+  - Added current product screenshots, enterprise desktop deployment guidance, and a deployment-level Automation control.
+
+</Update>
+
+<Update label="August 19th" tags={["🚀 New Features", "🐛 Bug Fixes", "🏗️ Refactoring"]}>
+
+  ## [v0.18.33](https://github.com/different-ai/openwork/compare/v0.18.32...v0.18.33): Library setup gets clearer and background connections recover cleanly
+
+  - The Library Add flow now starts with clear choices for skills, MCP connections, plugins, and repositories.
+  - Desktop automations recover rejected credentials and slow down repeated reconnect attempts instead of getting stuck.
+  - Cloud MCP health checks and GitHub token requests are bounded, preventing background connection work from running away.
+  - Added a Google Cloud deployment prompt, stronger MCP OAuth validation, and more reliable release publishing.
+
+  ## [v0.18.32](https://github.com/different-ai/openwork/compare/v0.18.31...v0.18.32): Workspace imports and SAML replay protection get safer
+
+  - Workspace imports now reject archives that expand beyond safe file-count or size limits.
+  - Fixed SAML replay protection so its reservation IDs remain compatible with stored identity records.
+  - Clarified how administrators can validate a live Okta SCIM setup.
+
+  ## [v0.18.31](https://github.com/different-ai/openwork/compare/v0.18.30...v0.18.31): Enterprise identity records stay valid
+
+  - Linked SSO and SCIM accounts now always use valid identity IDs, preventing malformed enterprise account records.
+  - Release validation is faster and extended-test failures produce clearer alerts.
+
+</Update>
+
 <Update label="August 18th" tags={["🚀 New Features", "🐛 Bug Fixes", "🏗️ Refactoring"]}>
 
   ## [v0.18.30](https://github.com/different-ai/openwork/compare/v0.18.29...v0.18.30): Queue follow-ups and simplify the session workspace
@@ -373,7 +566,7 @@ title: "Changelog"
 
 </Update>
 
-<Update label="March 11th" tags={["🚀 New features", "🐛 Bug Fixes"]}>
+<Update label="March 11th" tags={["🚀 New Features", "🐛 Bug Fixes"]}>
 
   ## [v0.11.140](https://github.com/different-ai/openwork/compare/v0.11.136...v0.11.140): Improved workers, sharing skills, GOAuth
 

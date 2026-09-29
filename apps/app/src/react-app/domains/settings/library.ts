@@ -178,7 +178,7 @@ export function openComposerConfigure(
   handlers.openLibrary(destination.path);
 }
 
-export const LIBRARY_ADD_KINDS = ["skill", "command", "agent", "mcp", "plugin", "connection"] as const;
+export const LIBRARY_ADD_KINDS = ["skill", "command", "agent", "mcp", "workspace-mcp", "plugin", "connection"] as const;
 
 export type LibraryAddKind = (typeof LIBRARY_ADD_KINDS)[number];
 
@@ -190,7 +190,7 @@ const LIBRARY_ITEM_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 export function libraryAddKindsForFilter(filter: string): LibraryAddKind[] {
   switch (filter) {
     case "all":
-      return [...LIBRARY_ADD_KINDS];
+      return ["skill", "connection", "plugin"];
     case "skill":
       return ["skill"];
     case "command":
@@ -213,29 +213,61 @@ export function isLibraryAuthorableKind(kind: LibraryAddKind): kind is LibraryAu
 }
 
 export type LibraryAddAction =
-  | { type: "den-url"; kind: "connection" }
-  | { type: "den-modal"; kind: LibraryAuthorableKind };
+  | { type: "connector-catalog" }
+  | { type: "den-modal"; kind: LibraryAuthorableKind }
+  | { type: "workspace-mcp" };
 
-/** Library Add always creates in OpenWork Cloud. Local workspace files are not an authoring path. */
+/** Resolve Cloud authoring separately from local workspace MCP configuration. */
 export function libraryAddAction(
   addKind: LibraryAddKind,
   options: {
     cloudSignedIn: boolean;
+    allowManageExtensions: boolean;
   },
 ): LibraryAddAction | null {
+  if (addKind === "workspace-mcp") {
+    return options.allowManageExtensions ? { type: "workspace-mcp" } : null;
+  }
   if (!options.cloudSignedIn) return null;
-  if (addKind === "connection") return { type: "den-url", kind: "connection" };
+  if (addKind === "connection") return { type: "connector-catalog" };
   if (isLibraryAuthorableKind(addKind)) return { type: "den-modal", kind: addKind };
   return null;
 }
 
 export type LibraryPluginComponentKind = "skill" | "command" | "agent" | "mcp";
 
+export type LibraryMcpAuthType = "oauth" | "apikey" | "none";
+export type LibraryMcpCredentialMode = "per_member" | "shared";
+
+/**
+ * Connector setup captured while an MCP server is added to a plugin: the same
+ * authentication questions Den's Connectors form asks. Owners and admins only;
+ * Den refuses it from other members.
+ */
+export type LibraryMcpConnectionForm = {
+  authType: LibraryMcpAuthType;
+  credentialMode: LibraryMcpCredentialMode;
+  apiKey: string;
+  useOAuthClient: boolean;
+  oauthClientId: string;
+  oauthClientSecret: string;
+};
+
+/** The `connection` body Den accepts on an mcp component of `POST /v1/plugins`. */
+export type LibraryMcpConnectionRequest = {
+  authType: LibraryMcpAuthType;
+  credentialMode: LibraryMcpCredentialMode;
+  apiKey?: string;
+  oauthClient?: { clientId: string; clientSecret?: string };
+};
+
 export type LibraryPluginComponentDraft = {
   kind: LibraryPluginComponentKind;
   name: string;
   description: string;
   content: string;
+  /** MCP components only. */
+  connection?: LibraryMcpConnectionForm;
 };
 
 export type CreateLibraryItemInput = {
@@ -245,6 +277,8 @@ export type CreateLibraryItemInput = {
   orgWide?: boolean;
   marketplaceId?: string;
   components?: LibraryPluginComponentDraft[];
+  /** Connector setup for the `mcp` kind. */
+  connection?: LibraryMcpConnectionForm;
 };
 
 export type DenLibraryPluginCreateRequest = {
@@ -259,10 +293,64 @@ export type DenLibraryPluginCreateRequest = {
       normalizedPayloadJson?: Record<string, unknown>;
       metadata: { name: string; description?: string };
     };
+    connection?: LibraryMcpConnectionRequest;
   }>;
 };
 
-function skillMarkdown(name: string, description: string, instructions: string) {
+export function emptyLibraryMcpConnectionForm(): LibraryMcpConnectionForm {
+  return {
+    authType: "oauth",
+    credentialMode: "per_member",
+    apiKey: "",
+    useOAuthClient: false,
+    oauthClientId: "",
+    oauthClientSecret: "",
+  };
+}
+
+/** Switching away from OAuth drops the OAuth-only answers, as the Connectors form does. */
+export function withLibraryMcpAuthType(form: LibraryMcpConnectionForm, authType: LibraryMcpAuthType): LibraryMcpConnectionForm {
+  return authType === "oauth"
+    ? { ...form, authType }
+    : { ...form, authType, useOAuthClient: false, oauthClientId: "", oauthClientSecret: "" };
+}
+
+export function libraryMcpConnectionFormIncomplete(form: LibraryMcpConnectionForm): boolean {
+  return form.authType === "apikey" && !form.apiKey.trim();
+}
+
+/** Sends only the answers that apply to the chosen authentication. */
+export function libraryMcpConnectionRequest(form: LibraryMcpConnectionForm): LibraryMcpConnectionRequest {
+  const apiKey = form.apiKey.trim();
+  const clientId = form.oauthClientId.trim();
+  const clientSecret = form.oauthClientSecret.trim();
+  return {
+    authType: form.authType,
+    credentialMode: form.authType === "oauth" ? form.credentialMode : "shared",
+    ...(form.authType === "apikey" && apiKey ? { apiKey } : {}),
+    ...(form.authType === "oauth" && form.useOAuthClient && clientId
+      ? { oauthClient: { clientId, ...(clientSecret ? { clientSecret } : {}) } }
+      : {}),
+  };
+}
+
+/** Reads the SKILL.md written by `skillMarkdown` back into its fields. */
+export function parseSkillMarkdown(raw: string): { name: string; description: string; body: string } {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(raw);
+  if (!match) return { name: "", description: "", body: raw.trim() };
+  const fields = new Map<string, string>();
+  for (const line of (match[1] ?? "").split(/\r?\n/)) {
+    const separator = line.indexOf(":");
+    if (separator > 0) fields.set(line.slice(0, separator).trim(), line.slice(separator + 1).trim());
+  }
+  return {
+    name: fields.get("name") ?? "",
+    description: fields.get("description") ?? "",
+    body: (match[2] ?? "").trim(),
+  };
+}
+
+export function skillMarkdown(name: string, description: string, instructions: string) {
   return [
     "---",
     `name: ${name}`,
@@ -291,6 +379,7 @@ export function denLibraryPluginComponentBody(component: LibraryPluginComponentD
           ...(description ? { description } : {}),
         },
       },
+      ...(component.connection ? { connection: libraryMcpConnectionRequest(component.connection) } : {}),
     };
   }
   return {
@@ -312,13 +401,14 @@ export function denLibraryPluginCreateRequest(
   kind: LibraryAuthorableKind,
   input: CreateLibraryItemInput,
 ): DenLibraryPluginCreateRequest {
-  const drafts = input.components && input.components.length > 0
+  const drafts: LibraryPluginComponentDraft[] = input.components && input.components.length > 0
     ? input.components
     : [{
       kind: kind === "plugin" ? "skill" : kind,
       name: input.name,
       description: input.description,
       content: input.instructions,
+      ...(kind === "mcp" && input.connection ? { connection: input.connection } : {}),
     }];
   return {
     name: input.name.trim(),

@@ -6,6 +6,8 @@ import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { ORGANIZATION_AUDIT_ACTIONS, recordOrganizationAuditEvent } from "../../audit-events.js"
 import { db } from "../../db.js"
+import { invitationBillingUrl } from "../../agent-links.js"
+import { invitationHasAdminTeam, withOrganizationTeamMutation } from "../../organization-team-roles.js"
 import { jsonValidator, orgRoleRoute, paramValidator } from "../../middleware/index.js"
 import { denTypeIdSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, successSchema, unauthorizedSchema } from "../../openapi.js"
 import { appLogger } from "../../observability/logger.js"
@@ -15,7 +17,7 @@ import { isEmailAllowedForOrganization, listAssignableRoles, removeOrganizationM
 import { getOrganizationSeatAddEligibility } from "../../stripe-billing.js"
 import { DenEmailSendError, sendEmail } from "../../utils/email/send-email.js"
 import type { OrgRouteVariables } from "./shared.js"
-import { buildInvitationLink, createInvitationId, createInvitationToken, ensureInviteManager, idParamSchema, normalizeRoleName, orgAccessFailureStatus } from "./shared.js"
+import { buildInvitationLink, createInvitationId, createInvitationToken, ensureInviteManager, ensureOrganizationSuperAdmin, idParamSchema, normalizeRoleName, orgAccessFailureStatus } from "./shared.js"
 
 const inviteMemberSchema = z.object({
   email: z.string().email(),
@@ -52,6 +54,7 @@ const invitePaymentRequiredSchema = z.object({
   currentCount: z.number(),
   freeSeatCount: z.number(),
   message: z.string(),
+  billingUrl: z.string().url().describe("Open in a browser to start seat billing; an owner can finish it there, then retry the invitation."),
 }).meta({ ref: "InvitePaymentRequiredError" })
 
 const invitationNotPendingSchema = z.object({
@@ -87,13 +90,13 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
     describeRoute({
       tags: ["Invitations"],
       summary: "Create organization invitation",
-      description: "Creates or refreshes a pending organization invitation for an email address and sends the invite email. Returns 502 when the invitation row is persisted but the configured email provider failed to send; the client should surface the error and give the user a retry affordance.",
+      description: "Creates or refreshes a pending organization invitation for an email address and sends the invite email. Returns 502 when the invitation row is persisted but the configured email provider failed to send; the client should surface the error and give the user a retry affordance. Returns 402 with billingUrl when the workspace has used its free members: give the user billingUrl to start seat billing, then invite again.",
       responses: {
         200: jsonResponse("Existing invitation refreshed successfully.", invitationResponseSchema),
         201: jsonResponse("Invitation created successfully.", invitationResponseSchema),
         400: jsonResponse("The invitation request body or path parameters were invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to invite organization members.", unauthorizedSchema),
-        402: jsonResponse("A seat subscription is required before inviting more members.", invitePaymentRequiredSchema),
+        402: jsonResponse("A seat subscription is required before inviting more members. The body includes billingUrl, where an owner starts seat billing.", invitePaymentRequiredSchema),
         403: jsonResponse("Only workspace owners and admins can create invitations. Admins can only invite members.", forbiddenSchema),
         404: jsonResponse("The organization could not be found.", notFoundSchema),
         409: jsonResponse("The email address is outside this workspace's allowed domains.", inviteEmailDomainNotAllowedSchema),
@@ -174,6 +177,10 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
       }
 
       if (existingInvitation) {
+        if (await invitationHasAdminTeam(tx, existingInvitation)) {
+          const permission = ensureOrganizationSuperAdmin(c, "Only workspace owners and super-admins can manage invitations with Admin team access.")
+          if (!permission.ok) return { status: "team_forbidden" as const, response: permission.response }
+        }
         const refreshRole = validateInvitationRefreshRole({
           existingRole: existingInvitation.role,
           availableRoles,
@@ -275,6 +282,9 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
         message: "That email address is already a member of this organization.",
       }, 409)
     }
+    if (invitationWrite.status === "team_forbidden") {
+      return c.json(invitationWrite.response, 403)
+    }
     if (invitationWrite.status === "role_error") {
       const validation = invitationWrite.validation
       if (validation.error === "invalid_role") {
@@ -290,7 +300,8 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
         subscriptionType: "seat",
         currentCount: seatEligibility.currentCount,
         freeSeatCount: seatEligibility.freeSeatCount,
-        message: `This workspace includes ${seatEligibility.freeSeatCount} free members. Start seat billing before inviting another member.`,
+        message: `This workspace includes ${seatEligibility.freeSeatCount} free seats. Start seat billing at ${invitationBillingUrl()} to invite more people.`,
+        billingUrl: invitationBillingUrl(),
       }, 402)
     }
 
@@ -399,13 +410,15 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
       return c.json({ error: "invitation_not_found" }, 404)
     }
 
-    const cancellation = await db.transaction(async (tx) => {
+    const cancellation = await withOrganizationTeamMutation(payload.organization.id, async (tx) => {
       const invitationRows = await tx
         .select({
           id: InvitationTable.id,
           email: InvitationTable.email,
           role: InvitationTable.role,
           status: InvitationTable.status,
+          organizationId: InvitationTable.organizationId,
+          teamId: InvitationTable.teamId,
         })
         .from(InvitationTable)
         .where(and(eq(InvitationTable.id, invitationId), eq(InvitationTable.organizationId, payload.organization.id)))
@@ -416,6 +429,10 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
       }
       if (invitation.status !== "pending") {
         return { status: "not_pending" as const, invitation }
+      }
+      if (await invitationHasAdminTeam(tx, invitation)) {
+        const permission = ensureOrganizationSuperAdmin(c, "Only workspace owners and super-admins can cancel invitations with Admin team access.")
+        if (!permission.ok) return { status: "team_forbidden" as const, response: permission.response }
       }
 
       const invitedMemberRows = await tx
@@ -438,6 +455,9 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
 
     if (cancellation.status === "not_found") {
       return c.json({ error: "invitation_not_found" }, 404)
+    }
+    if (cancellation.status === "team_forbidden") {
+      return c.json(cancellation.response, 403)
     }
 
     if (cancellation.status === "not_pending") {

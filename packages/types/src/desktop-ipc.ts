@@ -87,7 +87,14 @@ export type DesktopIntegrationResult = {
 
 export type OpenworkServerInfo = {
   running: boolean;
-  engineRollover: boolean;
+  /**
+   * Monotonic per-start identity of the embedded server within this desktop
+   * process. Sticky ports and persisted tokens keep the connection details
+   * identical across restarts, so clients that must re-deliver state to a new
+   * server lifetime (e.g. the Connect policy) key on this value. Null when
+   * the bridge predates the field or no start completed yet.
+   */
+  generation: number | null;
   remoteAccessEnabled: boolean;
   host: string | null;
   port: number | null;
@@ -100,6 +107,8 @@ export type OpenworkServerInfo = {
   hostToken: string | null;
   managedOpencodeBinPath: string | null;
   managedOpencodeBinSource: string | null;
+  /** Structured server log on disk, or null when the server runs without a file sink. */
+  logFilePath: string | null;
   pid: number | null;
   lastStdout: string | null;
   lastStderr: string | null;
@@ -290,6 +299,7 @@ export type NukeReceipt = {
 };
 
 export type DesktopFetchInit = {
+  transferId?: string;
   method?: string;
   headers?: Record<string, string>;
   body?: string;
@@ -304,6 +314,48 @@ export type DesktopFetchResult = {
   statusText: string;
   headers: [string, string][];
   body: string;
+};
+
+/**
+ * Outcome of opening a workspace file from chat. The host resolves the file on disk and
+ * only launches it when it is a real file inside the real workspace root; a file that
+ * resolves elsewhere is shown in its folder instead of being handed to an application.
+ */
+export type DesktopWorkspaceFileOpenResult =
+  | { ok: true; action: "opened" | "revealed" }
+  | { ok: false; error: string };
+
+export type DesktopMultipartUploadInput = {
+  transferId: string;
+  url: string;
+  bytes: ArrayBuffer;
+  filename: string;
+  size: number;
+  contentType?: string;
+  fieldName?: string;
+  fields?: Record<string, string>;
+  method?: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+};
+
+export type DesktopBinaryDownloadInput = {
+  transferId: string;
+  url: string;
+  destinationPath: string;
+  maxBytes?: number;
+  method?: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+};
+
+export type DesktopBinaryDownloadResult = {
+  status: number;
+  statusText: string;
+  headers: [string, string][];
+  path: string | null;
+  bytes: number;
+  body?: string;
 };
 
 export type WorkspaceCreateInput = {
@@ -341,6 +393,8 @@ export type ComputerUsePermissions = {
   ok: boolean;
   accessibility: boolean;
   screenRecording: boolean;
+  supported?: boolean;
+  protocolVersion?: string;
   error?: string;
 };
 
@@ -432,6 +486,8 @@ export type DesktopCommandMap = {
   getUiControlBridgeInfo: { args: []; result: UiControlBridgeInfo | null };
   getOpenworkUiMcpCommand: { args: []; result: string[] };
   getComputerUseMcpCommand: { args: []; result: string[] };
+  getComputerUseState: { args: []; result: unknown };
+  computerUseAction: { args: [value: { connectionId: string; id: string; action: string; windowId?: number }]; result: void };
   getOpenworkUiMcpEnvironment: { args: []; result: Record<string, string> };
 
   // Computer use
@@ -532,7 +588,10 @@ export type DesktopCommandMap = {
   setWindowDecorations: { args: [decorated: boolean]; result: unknown };
 
   // Window / OS utilities (dunder commands)
+  __showContextMenu: { args: [request: NativeContextMenuRequest]; result: string | null };
+  __cancelContextMenu: { args: [requestId: string]; result: boolean };
   __openPath: { args: [target: string]; result: unknown };
+  __openWorkspaceFile: { args: [workspaceRoot: string, target: string]; result: DesktopWorkspaceFileOpenResult };
   __revealItemInDir: { args: [target: string]; result: unknown };
   __getFileIcon: { args: [target: string, size?: "small" | "normal" | "large"]; result: string | null };
   __applyBrandAppName: { args: [appName: string | null]; result: { ok: true; appName: string } };
@@ -540,13 +599,32 @@ export type DesktopCommandMap = {
   __getBrandIconState: { args: []; result: BrandIconState };
   __evalRelaunch: { args: []; result: EvalRelaunchResult };
   __getApplicationsForFile: { args: [target: string]; result: { name: string; appPath: string; icon: string | null }[] };
-  __openWithApp: { args: [target: string, appPath: string]; result: unknown };
+  __openWithApp: { args: [target: string, appPath: string, workspaceRoot: string]; result: unknown };
   __fetch: { args: [url: string, init?: DesktopFetchInit]; result: DesktopFetchResult };
+  __uploadMultipart: { args: [input: DesktopMultipartUploadInput]; result: DesktopFetchResult };
+  __downloadBinary: { args: [input: DesktopBinaryDownloadInput]; result: DesktopBinaryDownloadResult };
+  __cancelTransfer: { args: [transferId: string]; result: boolean };
   __homeDir: { args: []; result: string };
   __joinPath: { args: [...segments: string[]]; result: string };
   __setZoomFactor: { args: [factor: number]; result: boolean };
   __setNativeTheme: { args: [theme: string]; result: unknown };
   __setApplicationMenuVisible: { args: [visible: boolean]; result: unknown };
+};
+
+/** Data-only context menu contract; callbacks and privileged Electron roles never cross IPC. */
+export type NativeContextMenuItem = { type: "separator" } | {
+  type: "item";
+  id: string;
+  label: string;
+  enabled?: boolean;
+  submenu?: NativeContextMenuItem[];
+};
+
+export type NativeContextMenuRequest = {
+  requestId?: string;
+  items: NativeContextMenuItem[];
+  point: { x: number; y: number };
+  includeEditing?: boolean;
 };
 
 export type DesktopCommandName = keyof DesktopCommandMap;

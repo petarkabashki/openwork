@@ -243,7 +243,7 @@ export const pluginArchEndpointContracts: Record<string, EndpointContract> = {
   },
   createConfigObject: {
     audience: "member",
-    description: "Create a cloud or imported config object and optionally attach it to plugins.",
+    description: "Create a cloud or imported skill, agent, or other config object; optionally add the new component to existing plugins using pluginIds.",
     method: "POST",
     path: pluginArchRoutePaths.configObjects,
     request: { body: configObjectCreateSchema },
@@ -297,7 +297,7 @@ export const pluginArchEndpointContracts: Record<string, EndpointContract> = {
   },
   attachConfigObjectToPlugin: {
     audience: "admin",
-    description: "Attach a config object to a plugin using plugin-scoped write access. Attaching a Program additionally requires manager access to that Program because Plugin or Marketplace membership can expand its audience.",
+    description: "Attach a config object to a plugin using plugin-scoped write access. Attaching a Workflow additionally requires manager access to that Workflow because Plugin or Marketplace membership can expand its audience.",
     method: "POST",
     path: pluginArchRoutePaths.configObjectPlugins,
     request: { body: configObjectPluginAttachSchema, params: configObjectParamsSchema },
@@ -306,7 +306,7 @@ export const pluginArchEndpointContracts: Record<string, EndpointContract> = {
   },
   removeConfigObjectFromPlugin: {
     audience: "admin",
-    description: "Remove one active plugin membership from a config object. Removing a Program additionally requires manager access to that Program because it revokes inherited Plugin or Marketplace access.",
+    description: "Remove one active plugin membership from a config object. Removing a Workflow additionally requires manager access to that Workflow because it revokes inherited Plugin or Marketplace access.",
     method: "DELETE",
     path: pluginArchRoutePaths.configObjectPlugin,
     request: { params: configObjectParamsSchema.extend({ pluginId: pluginParamsSchema.shape.pluginId }) },

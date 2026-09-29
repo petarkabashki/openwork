@@ -98,6 +98,20 @@ function authorizationHeader(request: IncomingMessage): string | null {
   return null;
 }
 
+function requestBody(request: IncomingMessage): Promise<string> {
+  request.setEncoding("utf8");
+  return new Promise((resolveBody, reject) => {
+    let body = "";
+    request.on("data", (chunk: string) => { body += chunk; });
+    request.on("end", () => resolveBody(body));
+    request.on("error", reject);
+  });
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function contentDigest(files: Record<string, string>): string {
   const entries = Object.entries(files).sort(([left], [right]) => left.localeCompare(right));
   return JSON.stringify(entries);
@@ -143,7 +157,6 @@ function repositoryJson(repository: MockGithubRepository): Record<string, unknow
     private: repository.private,
   };
 }
-
 function positiveInteger(value: string | null, fallback: number): number {
   if (!value) return fallback;
   const parsed = Number(value);

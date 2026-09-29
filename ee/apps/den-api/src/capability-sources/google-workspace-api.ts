@@ -1,4 +1,6 @@
 import { truncateText } from "./binary-content.js"
+import { Parser } from "htmlparser2"
+import type { GmailDraftQuote } from "./gmail.js"
 
 export { truncateText } from "./binary-content.js"
 
@@ -67,6 +69,8 @@ type GmailBodyState = {
 }
 
 const GMAIL_QUOTE_BODY_LIMIT = 10_000
+const GMAIL_HTML_INPUT_BYTE_LIMIT = 1_000_000
+const GMAIL_MESSAGE_BODY_LIMIT = 100_000
 const UTC_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 const UTC_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -94,27 +98,52 @@ function readNumber(record: Record<string, unknown>, key: string): number | null
   return typeof value === "number" && Number.isFinite(value) ? value : null
 }
 
-function decodeBase64Url(value: string): string {
+function decodeBase64Url(value: string, byteLimit?: number): string {
   try {
-    return Buffer.from(value, "base64url").toString("utf8")
+    const encoded = byteLimit === undefined ? value : value.slice(0, Math.floor(byteLimit / 3) * 4)
+    return Buffer.from(encoded, "base64url").toString("utf8")
   } catch {
     return ""
   }
 }
 
-function stripHtml(value: string): string {
-  return value
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/g, "'")
+function withoutDeclaredHtmlEntities(value: string): string {
+  const lower = value.toLowerCase()
+  const declaration = lower.indexOf("<!entity")
+  if (declaration === -1) return value
+  const end = lower.indexOf("]>", declaration)
+  return end === -1 ? "" : value.slice(end + 2)
+}
+
+function htmlToPlainText(value: string): string {
+  let text = ""
+  let omittedDepth = 0
+  const parser = new Parser({
+    onopentag(name) {
+      if (omittedDepth > 0) {
+        omittedDepth += 1
+      } else if (name === "script" || name === "style") {
+        text += " "
+        omittedDepth = 1
+      } else {
+        text += name === "br" ? "\n" : " "
+      }
+    },
+    ontext(content) {
+      if (omittedDepth === 0) text += content
+    },
+    onclosetag(name) {
+      if (omittedDepth > 0) {
+        omittedDepth -= 1
+        if (omittedDepth === 0) text += " "
+      } else {
+        text += name === "p" ? "\n" : " "
+      }
+    },
+  }, { decodeEntities: true })
+  parser.end(withoutDeclaredHtmlEntities(value))
+  return text
+    .replaceAll("\u00a0", " ")
     .replace(/[ \t\f\v]+/g, " ")
     .replace(/\n\s+/g, "\n")
     .trim()
@@ -140,7 +169,7 @@ function collectGmailPart(part: Record<string, unknown>, state: GmailBodyState) 
       state.plain = decodeBase64Url(data)
     }
     if (data && mimeType === "text/html" && state.html === null) {
-      state.html = stripHtml(decodeBase64Url(data))
+      state.html = htmlToPlainText(decodeBase64Url(data, GMAIL_HTML_INPUT_BYTE_LIMIT))
     }
   }
 
@@ -191,12 +220,11 @@ export function gmailBodyHasQuotedHistory(body: string): boolean {
   return /^>\s?/m.test(body) && /^.*wrote:\s*$/m.test(body)
 }
 
-export function buildGmailQuoteBlock(input: { from: string; date: string; body: string }): string {
-  const header = input.date ? `On ${formatGmailQuoteDate(input.date)}, ${input.from} wrote:` : `${input.from} wrote:`
+export function buildGmailQuote(input: { from: string; date: string; body: string }): GmailDraftQuote {
+  const attribution = input.date ? `On ${formatGmailQuoteDate(input.date)}, ${input.from} wrote:` : `${input.from} wrote:`
   const truncated = input.body.length > GMAIL_QUOTE_BODY_LIMIT
-  const quotedLines = input.body.slice(0, GMAIL_QUOTE_BODY_LIMIT).replace(/\r\n?/g, "\n").split("\n").map((line) => `> ${line}`)
-  if (truncated) quotedLines.push("> [message trimmed]")
-  return [header, ...quotedLines].join("\n")
+  const body = input.body.slice(0, GMAIL_QUOTE_BODY_LIMIT).replace(/\r\n?/g, "\n")
+  return { attribution, body: truncated ? `${body}\n[message trimmed]` : body }
 }
 
 export function extractGmailThreadQuoteInput(json: unknown): { from: string; date: string; body: string } | null {
@@ -211,12 +239,13 @@ export function extractGmailThreadQuoteInput(json: unknown): { from: string; dat
   const headers = readGmailHeaders(payload)
   const state: GmailBodyState = { plain: null, html: null, attachments: [] }
   collectGmailPart(payload, state)
-  if (!state.plain) return null
+  const body = state.plain || state.html
+  if (!body) return null
 
   return {
     from: headers.get("from") ?? "",
     date: headers.get("date") ?? "",
-    body: state.plain,
+    body,
   }
 }
 
@@ -250,7 +279,7 @@ export function extractGmailMessage(payloadJson: unknown): GoogleWorkspaceGmailM
   const state: GmailBodyState = { plain: null, html: null, attachments: [] }
   collectGmailPart(payload, state)
   const snippet = readString(message, "snippet")
-  const body = truncateText(state.plain ?? state.html ?? snippet, 100_000).text
+  const body = truncateText(state.plain ?? state.html ?? snippet, GMAIL_MESSAGE_BODY_LIMIT).text
 
   return {
     id: readString(message, "id"),

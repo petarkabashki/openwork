@@ -1,5 +1,25 @@
 # OpenWork Host (Docker)
 
+## Pull-only evaluation stack
+
+Run Den API, Den web, and MySQL from published images without cloning or building the repository:
+
+```bash
+curl -fsSLo docker-compose.eval.yml \
+  https://raw.githubusercontent.com/different-ai/openwork/79636623bfbed3e2e5daff48b8550cb2ba220d77/packaging/docker/docker-compose.eval.yml
+printf '%s  %s\n' \
+  '7b94efe1ac4be68d56b8ecb91206e9c005360b0f7954ba36c6f6ae7bd87a9430' \
+  'docker-compose.eval.yml' | shasum -a 256 --check
+umask 077
+printf 'OPENWORK_AUTH_SECRET=%s\nOPENWORK_DB_ENCRYPTION_KEY=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+docker compose -f docker-compose.eval.yml up -d --wait
+```
+
+Open `http://localhost:3005` and create an account. See the [evaluation guide](../../packages/docs/self-host/evaluate-with-docker-compose.mdx) for configuration, secure remote access, limitations, and cleanup.
+
+This stack is for evaluation only. Its HTTP ports bind to loopback, but it still enables public signup, uses development credentials, and does not provide production workers, sandboxes, or email delivery.
+
 ## Den local stack (Docker)
 
 One command for the Den control plane, local MySQL, and the cloud web app.
@@ -27,7 +47,7 @@ What it does:
 Production-oriented EE images:
 - `Dockerfile.den` -> `ghcr.io/different-ai/openwork-den-api`
 - `Dockerfile.den-web` -> `ghcr.io/different-ai/openwork-den-web`
-- `Dockerfile.inference` -> `ghcr.io/different-ai/openwork-inference`
+- `Dockerfile.gateway` -> `ghcr.io/different-ai/openwork-inference` (OpenWork Gateway; image repository retained for existing deployments)
 
 These images are intended for Terraform, Helm, ECS, EKS, and customer-cloud deployments. Prefer immutable tags or digests in production.
 
@@ -38,7 +58,7 @@ Publish flow:
 
 Health and smoke expectations:
 - Published service images include shallow Docker healthchecks for the HTTP process only.
-- Den API and inference probe `GET /health`; Den web probes `GET /api/health`.
+- Den API and Gateway probe `GET /health`; Den web probes `GET /api/health`.
 - The publish workflow loads each PR image locally and probes the same endpoint without cloud secrets. Production deployments should still add dependency-aware readiness checks where needed.
 
 ### Demo org seed
@@ -107,12 +127,15 @@ bash packaging/docker/otel-hono-live-validate.sh
 The validator merges `docker-compose.den-dev.yml` and
 `docker-compose.otel-lgtm.yml`, configures both Den services for OTLP/HTTP,
 builds and starts the stack, waits for health, and makes a real request to
-`/api/den/openapi.json?token=super-secret`. It then polls Grafana's Tempo,
-Loki, and Prometheus datasource proxy APIs with a bounded timeout. The JSON
-report proves the connected `den-web` → `den-api` trace, normalized Hono route
-and request ID, secret redaction, correlated Den Web and Den API OTLP request
-logs, Hono duration and active-request metric series, and absence of unhandled
-runtime errors.
+`/api/auth/get-session?token=super-secret`. That path is served by Den Web's
+server-side upstream proxy, so one trace spans both services (`/api/den/*` is a
+307 redirect to Den API and would never reach the proxy; the validator rejects
+redirects). It then polls Grafana's Tempo, Loki, and Prometheus datasource
+proxy APIs with a bounded timeout. The JSON report proves the connected
+`den-web` → `den-api` trace, normalized Hono route (`/api/auth/*`) and request
+ID, secret redaction, correlated Den Web and Den API OTLP request logs, Hono
+duration and active-request metric series, and absence of unhandled runtime
+errors.
 
 After the OTEL phase passes, the same validator recreates only `den` and `web`
 with `DEN_OBSERVABILITY_BACKEND=none` while keeping MySQL and LGTM running. It
@@ -252,13 +275,9 @@ Caveats: `grafana/otel-lgtm` is intended for development, demos, and tests, not 
 
 ### Install links (self-host)
 
-Run the install-link migration once against the Den database:
+Install links are enabled for every organization by default; there is no separate migration step or `/admin` toggle. The regular `den-migrate` job creates the tables, and organization owners mint links from the dashboard or with `POST /v1/orgs/{organizationId}/install-links`. A platform admin can disable minting for one organization by setting `metadata.capabilities.installLinks: false` on it.
 
-```bash
-docker compose -f packaging/docker/docker-compose.den-dev.yml exec den sh -lc "node /app/ee/packages/den-db/dist/scripts/bootstrap.js"
-```
-
-Set `DEN_BOOTSTRAP_ADMIN_EMAILS` on the Den API service, restart it, open `/admin`, and toggle `Install links` for each org. Optional installer artifact env vars are `OPENWORK_INSTALLER_RELEASE_TAG`, `OPENWORK_INSTALLER_RELEASE_REPO`, and `OPENWORK_INSTALLER_ARTIFACTS_DIR`; see the [operator guide](../../docs/org-install-links.md).
+With no `allowedDesktopVersions` policy on the organization, a self-hosted (single-org) Den installs its own release version. Set `allowedDesktopVersions` to pin or advance the fleet, or set `OPENWORK_INSTALLER_RELEASE_TAG` to override the default. Optional installer artifact env vars are `OPENWORK_INSTALLER_RELEASE_TAG`, `OPENWORK_INSTALLER_RELEASE_REPO`, and `OPENWORK_INSTALLER_ARTIFACTS_DIR`; see the [operator guide](../../docs/org-install-links.md) and [Installer delivery](../../packages/docs/start-here/installer-delivery.mdx).
 
 ### Faster inner-loop alternative
 

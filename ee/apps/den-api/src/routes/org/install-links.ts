@@ -51,7 +51,9 @@ const createInstallLinkBodySchema = z.object({
 
 const createInstallLinkResponseSchema = z.object({
   token: z.string(),
-  installPageUrl: z.string().url(),
+  installPageUrl: z.string().url().describe("Share this page: it downloads the OpenWork desktop app for this organization."),
+  connectUrl: z.string().describe("Open on a computer that already has OpenWork installed to point the desktop app at this organization. Short-lived; mint a new link when it expires."),
+  connectExpiresAt: z.string().datetime(),
 }).meta({ ref: "CreateInstallLinkResponse" })
 
 const installLinkQuerySchema = z.object({
@@ -156,7 +158,7 @@ function buildInstallConfig(input: { organization: { name: string; logo: string 
   return installConfigSchema.parse({
     appName: typeof metadata.brandAppName === "string" ? metadata.brandAppName : "OpenWork",
     clientName: input.organization.name,
-    webUrl: env.betterAuthUrl,
+    webUrl: env.webUrl,
     apiUrl: resolvePublicOrigin(input.request, env.apiPublicUrl),
     requireSignin: true,
     logoUrl: typeof metadata.brandLogoUrl === "string" ? metadata.brandLogoUrl : input.organization.logo ?? null,
@@ -247,7 +249,7 @@ function maxAllowedDesktopVersion(versions: string[]) {
   return maxVersion
 }
 
-async function installerReleaseTagForMetadata(metadataInput: unknown) {
+export async function installerReleaseTagForMetadata(metadataInput: unknown) {
   const metadata = normalizeOrganizationMetadata(organizationMetadataInput(metadataInput)).metadata
   const allowedVersions = metadata.allowedDesktopVersions
   if (!allowedVersions?.length) {
@@ -266,6 +268,26 @@ async function resolveInstallConfigForOrganization(input: {
     config: buildInstallConfig(input),
     installerReleaseTag: await installerReleaseTagForMetadata(input.organization.metadata),
   }
+}
+
+type InstallConfig = ReturnType<typeof buildInstallConfig>
+
+async function mintInstallHandoff(
+  installer: InstallExperienceDependencies,
+  input: { installLinkId: Parameters<InstallExperienceDependencies["mintConnectGrant"]>[0]["installLinkId"]; config: InstallConfig },
+) {
+  const connectInput = {
+    installLinkId: input.installLinkId,
+    organizationName: input.config.clientName,
+    appName: input.config.appName,
+    logoUrl: input.config.logoUrl,
+    iconUrl: input.config.iconUrl,
+    webUrl: input.config.webUrl,
+    apiUrl: input.config.apiUrl,
+  }
+  const exchangeHandoff = await installer.mintConnectGrant(connectInput)
+  const handoff = mintDesktopConnectLink(connectInput) ?? exchangeHandoff
+  return { handoff, exchangeHandoff }
 }
 
 async function resolveInstallConfigForToken(token: string, request: Request) {
@@ -351,8 +373,8 @@ export function registerOrgInstallLinkRoutes<T extends { Variables: OrgRouteVari
     "/v1/orgs/:organizationId/install-links",
     describeRoute({
       tags: ["Organizations"],
-      summary: "Create organization install link",
-      description: "Mints a shareable OpenWork desktop install link for a signed-in organization member. Older active links remain valid unless an owner or admin explicitly requests rotation.",
+      summary: "Create organization install link (download desktop app, install OpenWork)",
+      description: "Download the desktop app and install OpenWork pointed at this organization. Returns installPageUrl, a shareable page that downloads OpenWork for this organization, and connectUrl, a short-lived link that opens an already-installed desktop app signed in to this organization. Any member can mint one. Older active links remain valid unless an owner or admin explicitly requests rotation.",
       responses: {
         200: jsonResponse("Install link created successfully.", createInstallLinkResponseSchema),
         400: jsonResponse("The install-link request was invalid.", invalidRequestSchema),
@@ -404,7 +426,17 @@ export function registerOrgInstallLinkRoutes<T extends { Variables: OrgRouteVari
         return c.json({ error: "capability_disabled", capability: "installLinks" }, 403)
       }
 
-      return c.json(installLink)
+      const { handoff } = await mintInstallHandoff(installer, {
+        installLinkId: installLink.installLinkId,
+        config: buildInstallConfig({ organization: payload.organization, request: c.req.raw }),
+      })
+
+      return c.json({
+        token: installLink.token,
+        installPageUrl: installLink.installPageUrl,
+        connectUrl: handoff.connectUrl,
+        connectExpiresAt: handoff.connectExpiresAt,
+      })
     },
   )
 
@@ -477,6 +509,7 @@ export function registerOrgInstallLinkRoutes<T extends { Variables: OrgRouteVari
     "/v1/install-config",
     describeRoute({
       tags: ["Organizations"],
+      security: [],
       summary: "Resolve install-link configuration",
       description: "Returns organization setup details and a fresh desktop connection handoff for a valid install link token.",
       responses: {
@@ -501,17 +534,10 @@ export function registerOrgInstallLinkRoutes<T extends { Variables: OrgRouteVari
         return c.json({ error: "install_link_not_found" }, 404)
       }
 
-      const connectInput = {
+      const { handoff, exchangeHandoff } = await mintInstallHandoff(installer, {
         installLinkId: resolved.installLinkId,
-        organizationName: resolved.config.clientName,
-        appName: resolved.config.appName,
-        logoUrl: resolved.config.logoUrl,
-        iconUrl: resolved.config.iconUrl,
-        webUrl: resolved.config.webUrl,
-        apiUrl: resolved.config.apiUrl,
-      }
-      const exchangeHandoff = await installer.mintConnectGrant(connectInput)
-      const handoff = mintDesktopConnectLink(connectInput) ?? exchangeHandoff
+        config: resolved.config,
+      })
 
       return c.json({
         ...resolved.config,
@@ -529,6 +555,7 @@ export function registerOrgInstallLinkRoutes<T extends { Variables: OrgRouteVari
     "/v1/install-connect/status",
     describeRoute({
       tags: ["Organizations"],
+      security: [],
       summary: "Inspect desktop connection status",
       description: "Reports whether a short-lived organization connection code is still pending or has been accepted by a desktop.",
       responses: {
@@ -569,6 +596,7 @@ export function registerOrgInstallLinkRoutes<T extends { Variables: OrgRouteVari
       `/v1/install-connect/${mode}`,
       describeRoute({
         tags: ["Organizations"],
+        security: [],
         summary: mode === "preview" ? "Preview desktop connection" : "Accept desktop connection",
         description: mode === "preview"
           ? "Resolves a short-lived organization connection code without consuming it."
@@ -613,6 +641,7 @@ export function registerOrgInstallLinkRoutes<T extends { Variables: OrgRouteVari
     "/v1/install/:platform",
     describeRoute({
       tags: ["Organizations"],
+      security: [],
       summary: "Download managed OpenWork desktop",
       description: "Redirects hosted Cloud deployments to the sign-in-required Cloud app and private single-org deployments to the activation-required Enterprise app.",
       responses: {

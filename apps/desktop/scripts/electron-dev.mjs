@@ -225,9 +225,12 @@ if (process.env.OPENWORK_ELECTRON_SKIP_SHARED_PREPARE !== "1") {
   runSync(nodeCmd, [resolve(__dirname, "prepare-computer-use-helper.mjs"), "--force", "--outdir", electronHelperDir], { cwd: desktopRoot });
 }
 
-// Build the server TS → JS so Electron can import it in-process
-console.log("[electron-dev] Building openwork-server (tsc)...");
-runSync(pnpmCmd, ["--filter", "openwork-server", "build"], { cwd: repoRoot });
+// Build workspace packages that Electron imports from their dist output.
+if (process.env.OPENWORK_ELECTRON_SKIP_WORKSPACE_BUILD !== "1") {
+  console.log("[electron-dev] Building Electron workspace dependencies...");
+  runSync(pnpmCmd, ["--filter", "@openwork/headless-threads", "build"], { cwd: repoRoot });
+  runSync(pnpmCmd, ["--filter", "openwork-server", "build"], { cwd: repoRoot });
+}
 
 const initialProbeUrls = [startUrl, ...viteProbeUrls].filter(Boolean);
 let viteReady = false;

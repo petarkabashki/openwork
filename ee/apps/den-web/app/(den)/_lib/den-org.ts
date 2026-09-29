@@ -1,3 +1,5 @@
+import { parseDeploymentCapabilities, type DeploymentCapabilities } from "@openwork/types/den/deployment-capabilities";
+
 export type DenOrgSummary = {
   id: string;
   name: string;
@@ -18,6 +20,8 @@ export type DenOrgMember = {
   userId: string | null;
   inviteId: string | null;
   role: string;
+  effectiveRole: string;
+  adminTeams: { id: string; name: string }[];
   createdAt: string | null;
   joinedAt: string | null;
   isOwner: boolean;
@@ -46,6 +50,7 @@ export type DenOrgTeam = {
   updatedAt: string | null;
   memberIds: string[];
   managedByScim: boolean;
+  grantsOrganizationAdmin: boolean;
 };
 
 export type DenCurrentMemberTeam = {
@@ -161,7 +166,9 @@ export type DenOrgSsoConnection = {
   kind: "oidc" | "saml";
   issuer: string;
   domain: string;
-  status: string;
+  status: "disabled" | "enabled";
+  testStatus: "untested" | "testing" | "succeeded" | "failed";
+  testExpiresAt: string | null;
   signInPath: string;
   signInUrl: string;
   redirectUrl: string;
@@ -215,6 +222,8 @@ export type DenOrgContext = {
     role: string;
     createdAt: string | null;
     isOwner: boolean;
+    directRole: string;
+    adminTeams: { id: string; name: string }[];
   };
   members: DenOrgMember[];
   invitations: DenOrgInvitation[];
@@ -224,6 +233,7 @@ export type DenOrgContext = {
   entitlements: DenOrgEntitlements;
   authMethods: DenOrgAuthMethods;
   capabilities: DenOrgCapabilities;
+  deploymentCapabilities: DeploymentCapabilities;
 };
 
 export type DenOrgAuthMethods = {
@@ -236,14 +246,20 @@ export type DenOrgEntitlements = {
   desktopPolicies: boolean;
   orgControls: boolean;
   analytics: boolean;
+  auditLogs: boolean;
 };
 
-/** Per-org feature flags controlled by platform admins; everything defaults to off. */
+/** Server-advertised and per-org capabilities; optional fields default to off. */
 export type DenOrgCapabilities = {
+  /** Effective organization rollout and deployment visibility, separate from capture entitlement. */
+  auditLogs: boolean;
+  orgManagedDashboards: boolean;
   installLinks: boolean;
   mcpConnections: boolean;
-  codemodeScripts: boolean;
-  remoteMcpApps: boolean;
+  /** Always on: Workflows/Code Mode shipped for every organization. Older servers may still return false. */
+  workflows: boolean;
+  /** Effective Web offer; true for the global switch or this organization's complimentary admin grant. */
+  openworkWeb: boolean;
   cloud: boolean;
 };
 
@@ -282,7 +298,6 @@ export const DEN_ROLE_PERMISSION_OPTIONS = {
 
 export const PENDING_ORG_INVITATION_STORAGE_KEY = "openwork:web:pending-org-invitation";
 export const PENDING_WORKSPACE_CLAIM_STORAGE_KEY = "openwork:web:pending-workspace-claim";
-export const PENDING_ORG_SELECTION_STORAGE_KEY = "openwork:web:pending-org-selection";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -294,6 +309,13 @@ function asIsoString(value: unknown): string | null {
 
 function asBoolean(value: unknown): boolean {
   return value === true;
+}
+
+function parseAdminTeams(value: unknown): { id: string; name: string }[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((team) => isRecord(team) && typeof team.id === "string" && typeof team.name === "string"
+    ? [{ id: team.id, name: team.name }]
+    : []);
 }
 
 function asString(value: unknown): string | null {
@@ -479,14 +501,6 @@ export function getOrgAccessFlags(roleValue: string, isOwner: boolean, _roleDefi
   };
 }
 
-export function shouldRequireOrgSelection(orgs: readonly DenOrgSummary[]): boolean {
-  return orgs.length > 1 && !orgs.some((org) => org.isActive);
-}
-
-export function shouldOfferOrgSelection(orgs: readonly DenOrgSummary[]): boolean {
-  return orgs.length > 1;
-}
-
 export function formatRoleLabel(role: string): string {
   return role
     .split(/[-_\s]+/)
@@ -503,6 +517,14 @@ export function getMarketplaceOnboardingRoute(_orgSlug?: string | null): string 
   return `${getOrgDashboardRoute(_orgSlug)}/onboarding`;
 }
 
+export function getOnboardingToolsRoute(orgSlug?: string | null): string {
+  return `${getMarketplaceOnboardingRoute(orgSlug)}/tools`;
+}
+
+export function getOnboardingPeopleRoute(orgSlug?: string | null): string {
+  return `${getMarketplaceOnboardingRoute(orgSlug)}/people`;
+}
+
 export function getJoinOrgRoute(invitationId: string): string {
   return `/join-org?invite=${encodeURIComponent(invitationId)}`;
 }
@@ -511,8 +533,16 @@ export function getWorkspaceClaimRoute(token: string): string {
   return `/workspace-claim?token=${encodeURIComponent(token)}`;
 }
 
+export function getAuditLogsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/audit-logs`;
+}
+
 export function getAnalyticsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/analytics`;
+}
+
+export function getModelsAnalyticsRoute(orgSlug?: string | null): string {
+  return `${getAnalyticsRoute(orgSlug)}/models`;
 }
 
 export function getManageMembersRoute(orgSlug?: string | null): string {
@@ -531,8 +561,8 @@ export function getBackgroundAgentsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/background-agents`;
 }
 
-export function getScriptRunsRoute(orgSlug?: string | null): string {
-  return `${getOrgDashboardRoute(orgSlug)}/script-runs`;
+export function getWorkflowRunsRoute(orgSlug?: string | null): string {
+  return `${getAnalyticsRoute(orgSlug)}/workflow-runs`;
 }
 
 export function getAutomationsRoute(orgSlug?: string | null): string {
@@ -544,7 +574,7 @@ export function getCustomLlmProvidersRoute(orgSlug?: string | null): string {
 }
 
 export function getInferenceRoute(orgSlug?: string | null): string {
-  return `${getOrgDashboardRoute(orgSlug)}/inference`;
+  return `${getAiGatewayRoute(orgSlug)}?tab=openwork-models`;
 }
 
 export function getWebRoute(orgSlug?: string | null): string {
@@ -553,6 +583,14 @@ export function getWebRoute(orgSlug?: string | null): string {
 
 export function getLlmProvidersRoute(orgSlug?: string | null): string {
   return getCustomLlmProvidersRoute(orgSlug);
+}
+
+export function getManagedDashboardsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/dashboards`;
+}
+
+export function getManagedDashboardRoute(orgSlug: string | null | undefined, dashboardId: string): string {
+  return `${getManagedDashboardsRoute(orgSlug)}/${encodeURIComponent(dashboardId)}`;
 }
 
 export function getDesktopPoliciesRoute(orgSlug?: string | null): string {
@@ -577,6 +615,54 @@ export function getEditLlmProviderRoute(orgSlug: string | null | undefined, llmP
 
 export function getNewLlmProviderRoute(orgSlug?: string | null): string {
   return `${getLlmProvidersRoute(orgSlug)}/new`;
+}
+
+export function getAiGatewayRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/ai-gateway`;
+}
+
+export function getAiGatewayProvidersRoute(orgSlug?: string | null): string {
+  return `${getAiGatewayRoute(orgSlug)}?tab=ai-providers`;
+}
+
+export function getNewAiGatewayProviderRoute(orgSlug?: string | null, providerId?: string): string {
+  const base = `${getAiGatewayRoute(orgSlug)}/providers/new`;
+  return providerId ? `${base}?provider=${encodeURIComponent(providerId)}` : base;
+}
+
+export function getAiGatewayProviderRoute(orgSlug: string | null | undefined, inferenceProviderId: string): string {
+  return `${getAiGatewayRoute(orgSlug)}/providers/${encodeURIComponent(inferenceProviderId)}`;
+}
+
+export function getEditAiGatewayProviderRoute(orgSlug: string | null | undefined, inferenceProviderId: string): string {
+  return `${getAiGatewayProviderRoute(orgSlug, inferenceProviderId)}/edit`;
+}
+
+export function getAiGatewayLimitsRoute(orgSlug?: string | null, deletedPolicyId?: string): string {
+  const base = `${getAiGatewayRoute(orgSlug)}?tab=limits`;
+  return deletedPolicyId ? `${base}&deleted=${encodeURIComponent(deletedPolicyId)}` : base;
+}
+
+export function getNewAiGatewayLimitRoute(orgSlug?: string | null, target?: { memberId: string } | { teamId: string }): string {
+  const base = `${getAiGatewayRoute(orgSlug)}/limits/new`;
+  if (!target) return base;
+  return "memberId" in target
+    ? `${base}?memberId=${encodeURIComponent(target.memberId)}`
+    : `${base}?teamId=${encodeURIComponent(target.teamId)}`;
+}
+
+export function getAiGatewayLimitRoute(orgSlug: string | null | undefined, policyId: string): string {
+  return `${getAiGatewayRoute(orgSlug)}/limits/${encodeURIComponent(policyId)}`;
+}
+
+export function getAiGatewayUsersTeamsRoute(orgSlug?: string | null, filter?: { view: "teams" } | { teamId: string }): string {
+  const base = `${getAiGatewayRoute(orgSlug)}?tab=users-and-teams`;
+  if (!filter) return base;
+  return "teamId" in filter ? `${base}&team=${encodeURIComponent(filter.teamId)}` : `${base}&view=teams`;
+}
+
+export function getAiGatewayPersonRoute(orgSlug: string | null | undefined, memberId: string): string {
+  return `${getAiGatewayRoute(orgSlug)}/people/${encodeURIComponent(memberId)}`;
 }
 
 export function getBillingRoute(orgSlug?: string | null): string {
@@ -627,6 +713,11 @@ export function getEditPluginSkillRoute(orgSlug: string | null | undefined, plug
   return `${getPluginSkillRoute(orgSlug, pluginId, skillId)}/edit`;
 }
 
+/** The full plugin editor: hooks, agents, marketplaces and skill files. */
+export function getPluginDetailsRoute(orgSlug: string | null | undefined, pluginId: string): string {
+  return `${getPluginRoute(orgSlug, pluginId)}/details`;
+}
+
 export function getNewPluginRoute(orgSlug?: string | null): string {
   return `${getPluginsRoute(orgSlug)}/new`;
 }
@@ -647,12 +738,21 @@ export function getIntegrationsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/integrations`;
 }
 
+export function getPluginSourcesRoute(orgSlug?: string | null): string {
+  return `${getPluginsRoute(orgSlug)}?view=sources`;
+}
+
 export function getGithubIntegrationRoute(orgSlug?: string | null): string {
   return `${getIntegrationsRoute(orgSlug)}/github`;
 }
 
 export function getMcpConnectionsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/mcp-connections`;
+}
+
+/** A configured connector's page in Manage, Google Workspace and Microsoft 365 included. */
+export function getMcpConnectionRoute(orgSlug: string | null | undefined, connectorId: string): string {
+  return `${getMcpConnectionsRoute(orgSlug)}/${encodeURIComponent(connectorId)}`;
 }
 
 export function getYourConnectionsRoute(orgSlug?: string | null): string {
@@ -669,6 +769,39 @@ export function getLibraryRoute(orgSlug?: string | null): string {
 
 export function getLibraryPluginRoute(orgSlug: string | null | undefined, pluginId: string): string {
   return `${getLibraryRoute(orgSlug)}/plugins/${encodeURIComponent(pluginId)}`;
+}
+
+export function getLibraryPluginShareRoute(orgSlug: string | null | undefined, pluginId: string): string {
+  return `${getLibraryPluginRoute(orgSlug, pluginId)}/share`;
+}
+
+export function getLibraryNewPluginRoute(orgSlug?: string | null, start?: "skill"): string {
+  return `${getLibraryRoute(orgSlug)}/plugins/new${start ? `?start=${start}` : ""}`;
+}
+
+export function getLibraryModelsRoute(orgSlug?: string | null): string {
+  return `${getLibraryRoute(orgSlug)}?show=models`;
+}
+
+export function getLibraryModelRoute(orgSlug: string | null | undefined, providerId: string): string {
+  return `${getLibraryRoute(orgSlug)}/models/${encodeURIComponent(providerId)}`;
+}
+
+export function getLibraryConnectorRoute(orgSlug: string | null | undefined, connectionId: string): string {
+  return `${getLibraryRoute(orgSlug)}/connectors/${encodeURIComponent(connectionId)}`;
+}
+
+export function getLibraryConnectorShareRoute(orgSlug: string | null | undefined, connectionId: string): string {
+  return `${getLibraryConnectorRoute(orgSlug, connectionId)}/share`;
+}
+
+/** The connector catalog, or one entry's setup checks when a catalog id is given. */
+export function getLibraryAddConnectorRoute(orgSlug?: string | null, catalogId?: string): string {
+  return `${getLibraryRoute(orgSlug)}/connectors/new${catalogId ? `/${encodeURIComponent(catalogId)}` : ""}`;
+}
+
+export function getAddConnectorRoute(orgSlug?: string | null, catalogId?: string): string {
+  return `${getMcpConnectionsRoute(orgSlug)}/new${catalogId ? `/${encodeURIComponent(catalogId)}` : ""}`;
 }
 
 export function getGithubIntegrationSetupRoute(orgSlug: string | null | undefined, connectorInstanceId: string): string {
@@ -772,6 +905,8 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
             userId,
             inviteId: asString(entry.inviteId),
             role,
+            effectiveRole: asString(entry.effectiveRole) ?? role,
+            adminTeams: parseAdminTeams(entry.adminTeams),
             createdAt: asIsoString(entry.createdAt),
             joinedAt: asIsoString(entry.joinedAt),
             isOwner: asBoolean(entry.isOwner),
@@ -858,6 +993,7 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
             updatedAt: asIsoString(entry.updatedAt),
             memberIds,
             managedByScim: asBoolean(entry.managedByScim),
+            grantsOrganizationAdmin: asBoolean(entry.grantsOrganizationAdmin),
           } satisfies DenOrgTeam;
         })
         .filter((entry): entry is DenOrgTeam => entry !== null)
@@ -912,6 +1048,8 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
       id: currentMemberId,
       userId: currentMemberUserId,
       role: currentMemberRole,
+      directRole: asString(currentMember.directRole) ?? currentMemberRole,
+      adminTeams: parseAdminTeams(currentMember.adminTeams),
       createdAt: asIsoString(currentMember.createdAt),
       isOwner: asBoolean(currentMember.isOwner),
     },
@@ -923,6 +1061,7 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
     entitlements: parseOrgEntitlements(payload.entitlements),
     authMethods: parseOrgAuthMethods(payload.authMethods),
     capabilities: parseOrgCapabilities(payload.capabilities),
+    deploymentCapabilities: parseDeploymentCapabilities(payload.deploymentCapabilities),
   };
 }
 
@@ -939,23 +1078,25 @@ function parseOrgAuthMethods(value: unknown): DenOrgAuthMethods {
 
 function parseOrgCapabilities(value: unknown): DenOrgCapabilities {
   if (!isRecord(value)) {
-    return { installLinks: false, mcpConnections: false, codemodeScripts: false, remoteMcpApps: false, cloud: false };
+    return { auditLogs: false, orgManagedDashboards: false, installLinks: false, mcpConnections: false, workflows: true, openworkWeb: false, cloud: false };
   }
 
   return {
+    auditLogs: value.auditLogs === true,
+    orgManagedDashboards: value.orgManagedDashboards === true,
     installLinks: value.installLinks === true,
     mcpConnections: value.mcpConnections === true,
-    codemodeScripts: value.codemodeScripts === true,
-    remoteMcpApps: value.remoteMcpApps === true,
+    // Workflows are enabled everywhere on current servers; only an explicit
+    // false from an older server still hides the surface.
+    workflows: value.workflows !== false,
+    openworkWeb: value.openworkWeb === true,
     cloud: value.cloud === true,
   };
 }
 
 function parseOrgEntitlements(value: unknown): DenOrgEntitlements {
-  // Older servers do not return entitlements; treat everything as available
-  // so gating only applies when the API explicitly reports it.
   if (!isRecord(value)) {
-    return { sso: true, desktopPolicies: true, orgControls: true, analytics: true };
+    return { sso: true, desktopPolicies: true, orgControls: true, analytics: true, auditLogs: false };
   }
 
   return {
@@ -963,6 +1104,7 @@ function parseOrgEntitlements(value: unknown): DenOrgEntitlements {
     desktopPolicies: value.desktopPolicies !== false,
     orgControls: value.orgControls !== false,
     analytics: value.analytics !== false,
+    auditLogs: value.auditLogs === true,
   };
 }
 
@@ -1159,6 +1301,7 @@ export function parseOrgSsoPayload(payload: unknown): {
         const issuer = asString(rawConnection.issuer);
         const domain = asString(rawConnection.domain);
         const status = asString(rawConnection.status);
+        const testStatus = asString(rawConnection.testStatus);
         const signInPath = asString(rawConnection.signInPath);
         const signInUrl = asString(rawConnection.signInUrl);
         const redirectUrl = asString(rawConnection.redirectUrl);
@@ -1168,7 +1311,7 @@ export function parseOrgSsoPayload(payload: unknown): {
         const rawSaml = isRecord(rawConnection.saml) ? rawConnection.saml : null;
         const tokenEndpointAuthentication = asString(rawOidc?.tokenEndpointAuthentication);
 
-        if (!id || !providerId || !issuer || !domain || !status || !signInPath || !signInUrl || !redirectUrl || !domainVerificationHost || !domainVerificationDnsName || (kind !== "oidc" && kind !== "saml")) {
+        if (!id || !providerId || !issuer || !domain || (status !== "disabled" && status !== "enabled") || (testStatus !== "untested" && testStatus !== "testing" && testStatus !== "succeeded" && testStatus !== "failed") || !signInPath || !signInUrl || !redirectUrl || !domainVerificationHost || !domainVerificationDnsName || (kind !== "oidc" && kind !== "saml")) {
           return null;
         }
 
@@ -1179,6 +1322,8 @@ export function parseOrgSsoPayload(payload: unknown): {
           issuer,
           domain,
           status,
+          testStatus,
+          testExpiresAt: asIsoString(rawConnection.testExpiresAt),
           signInPath,
           signInUrl,
           redirectUrl,

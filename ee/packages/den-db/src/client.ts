@@ -1,10 +1,12 @@
 import { Client } from "@planetscale/database"
+import { createRetryingPlanetScaleFetch } from "./transient-retry"
 import { drizzle } from "drizzle-orm/mysql2"
 import { drizzle as drizzlePlanetScale } from "drizzle-orm/planetscale-serverless"
 import type { FieldPacket, QueryOptions, QueryResult } from "mysql2"
 import mysql from "mysql2/promise"
 import { parseMySqlConnectionConfig } from "./mysql-config"
 import * as schema from "./schema"
+import type { Logger } from "drizzle-orm/logger"
 
 export type DenDbMode = "mysql" | "planetscale"
 type DenDb = ReturnType<typeof drizzlePlanetScale>
@@ -73,6 +75,43 @@ function isRetryableReadQuery(sql: string | null): boolean {
   return RETRYABLE_QUERY_PREFIXES.some((prefix) => normalized.startsWith(prefix))
 }
 
+/**
+ * MariaDB does not parse the SQL-standard `FOR SHARE` that drizzle emits for
+ * `.for("share")`; it only knows `LOCK IN SHARE MODE`, which MySQL 8 still
+ * accepts as an alias. Rewriting the trailing clause keeps one spelling that
+ * both engines run (self-hosted Den images and the Daytona server snapshot ship
+ * MariaDB) without touching every locking read.
+ */
+export function rewriteShareLock(sql: string): string {
+  // Trim first so the match itself has no ambiguous trailing quantifiers.
+  const statement = sql.trimEnd().replace(/;$/, "").trimEnd()
+  const match = /\bfor\s+share$/i.exec(statement)
+  return match ? `${statement.slice(0, match.index)}lock in share mode` : sql
+}
+
+function rewriteQueryInput(input: string): string
+function rewriteQueryInput(input: QueryOptions): QueryOptions
+function rewriteQueryInput(input: string | QueryOptions): string | QueryOptions
+function rewriteQueryInput(input: string | QueryOptions): string | QueryOptions {
+  if (typeof input === "string") return rewriteShareLock(input)
+  return { ...input, sql: rewriteShareLock(input.sql) }
+}
+
+type QueryRunner = <T extends QueryResult>(sqlOrOptions: string | QueryOptions, values?: unknown) => Promise<[T, FieldPacket[]]>
+
+/** Drizzle runs transaction statements on a checked-out connection, so pooled connections need the same rewrite. */
+function rewriteConnectionQueries(connection: mysql.PoolConnection): mysql.PoolConnection {
+  if (rewrittenConnections.has(connection)) return connection
+  rewrittenConnections.add(connection)
+  const query = connection.query.bind(connection) as QueryRunner
+  const execute = connection.execute.bind(connection) as QueryRunner
+  connection.query = ((sqlOrOptions: string | QueryOptions, values?: unknown) => query(rewriteQueryInput(sqlOrOptions), values)) as typeof connection.query
+  connection.execute = ((sqlOrOptions: string | QueryOptions, values?: unknown) => execute(rewriteQueryInput(sqlOrOptions), values)) as typeof connection.execute
+  return connection
+}
+
+const rewrittenConnections = new WeakSet<mysql.PoolConnection>()
+
 async function retryReadQuery<T>(label: "query" | "execute", sql: string | null, run: () => Promise<T>): Promise<T> {
   try {
     return await run()
@@ -112,6 +151,7 @@ export function createDenDb(input: {
   databaseUrl?: string | null
   mode?: DenDbMode
   planetscale?: PlanetScaleCredentials | null
+  logger?: Logger
 }) {
   const mode = resolveDbMode(input)
 
@@ -121,10 +161,10 @@ export function createDenDb(input: {
       throw new Error("PlanetScale mode requires DATABASE_HOST, DATABASE_USERNAME, and DATABASE_PASSWORD")
     }
 
-    const client = new Client(credentials)
+    const client = new Client({ ...credentials, fetch: createRetryingPlanetScaleFetch() })
     return {
       client,
-      db: drizzlePlanetScale(client, { schema }) as unknown as DenDb,
+      db: drizzlePlanetScale(client, { schema, logger: input.logger }) as unknown as DenDb,
     }
   }
 
@@ -153,8 +193,9 @@ export function createDenDb(input: {
     sqlOrOptions: string | QueryOptions,
     values?: unknown,
   ): Promise<[T, FieldPacket[]]> {
-    const sql = extractSql(sqlOrOptions)
-    return retryReadQuery("query", sql, () => query<T>(sqlOrOptions as never, values as never))
+    const rewritten = rewriteQueryInput(sqlOrOptions)
+    const sql = extractSql(rewritten)
+    return retryReadQuery("query", sql, () => query<T>(rewritten as never, values as never))
   }
 
   client.query = retryingQuery
@@ -169,14 +210,18 @@ export function createDenDb(input: {
     sqlOrOptions: string | QueryOptions,
     values?: unknown,
   ): Promise<[T, FieldPacket[]]> {
-    const sql = extractSql(sqlOrOptions)
-    return retryReadQuery("execute", sql, () => execute<T>(sqlOrOptions as never, values as never))
+    const rewritten = rewriteQueryInput(sqlOrOptions)
+    const sql = extractSql(rewritten)
+    return retryReadQuery("execute", sql, () => execute<T>(rewritten as never, values as never))
   }
 
   client.execute = retryingExecute
 
+  const getConnection = client.getConnection.bind(client)
+  client.getConnection = async () => rewriteConnectionQueries(await getConnection())
+
   return {
     client,
-    db: drizzle(client, { schema, mode: "default" }) as unknown as DenDb,
+    db: drizzle(client, { schema, mode: "default", logger: input.logger }) as unknown as DenDb,
   }
 }

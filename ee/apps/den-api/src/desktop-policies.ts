@@ -12,12 +12,13 @@ import {
   calculateEffectiveDesktopPolicy,
   desktopPolicyDefaults,
   normalizeDesktopPolicyDocument,
-  normalizeDesktopPolicyValue,
+  resolveDesktopExecutionPolicy,
   selectEffectiveOnboardingPromptConfig,
   type DesktopConfig,
   type DesktopPolicyValue,
 } from "@openwork/types/den/desktop-policies"
 import { db } from "./db.js"
+import { matchingDesktopPolicyAssignmentRoles } from "./desktop-policy-role-assignments.js"
 
 export type DesktopPolicyId = typeof DesktopPolicyTable.$inferSelect.id
 export type DesktopPolicyRow = typeof DesktopPolicyTable.$inferSelect
@@ -25,7 +26,7 @@ export type DesktopPolicyMemberRow = typeof DesktopPolicyMemberTable.$inferSelec
 export type OrgId = typeof DesktopPolicyTable.$inferSelect.organizationId
 export type OrgMemberId = typeof DesktopPolicyTable.$inferSelect.createdByOrgMemberId
 export type TeamId = typeof TeamTable.$inferSelect.id
-export type EffectiveDesktopPolicyConfig = Required<DesktopPolicyValue> & Pick<DesktopConfig, "onboardingPrompts" | "onboardingPromptDescriptions">
+export type EffectiveDesktopPolicyConfig = Required<DesktopPolicyValue> & Pick<DesktopConfig, "onboardingPrompts" | "onboardingPromptDescriptions" | "execution">
 
 export const DEFAULT_DESKTOP_POLICY_NAME = "Default desktop policy"
 
@@ -113,23 +114,17 @@ export async function calculateDesktopPolicyForOrgMember(input: {
     .limit(1)
   const memberRole = memberRows[0]?.role ?? null
   const teamIds = await listTeamIdsForOrgMember(input)
-  const assignedWhere = memberRole
-    ? teamIds.length > 0
-      ? or(
-          eq(DesktopPolicyMemberTable.orgMemberId, input.orgMemberId),
-          inArray(DesktopPolicyMemberTable.teamId, teamIds),
-          eq(DesktopPolicyMemberTable.role, memberRole),
-        )
-      : or(
-          eq(DesktopPolicyMemberTable.orgMemberId, input.orgMemberId),
-          eq(DesktopPolicyMemberTable.role, memberRole),
-        )
-    : teamIds.length > 0
-      ? or(
-          eq(DesktopPolicyMemberTable.orgMemberId, input.orgMemberId),
-          inArray(DesktopPolicyMemberTable.teamId, teamIds),
-        )
-      : eq(DesktopPolicyMemberTable.orgMemberId, input.orgMemberId)
+  const matchingRoles = memberRole ? matchingDesktopPolicyAssignmentRoles(memberRole) : []
+  const assignedWhere = teamIds.length > 0
+    ? or(
+        eq(DesktopPolicyMemberTable.orgMemberId, input.orgMemberId),
+        inArray(DesktopPolicyMemberTable.teamId, teamIds),
+        inArray(DesktopPolicyMemberTable.role, matchingRoles),
+      )
+    : or(
+        eq(DesktopPolicyMemberTable.orgMemberId, input.orgMemberId),
+        inArray(DesktopPolicyMemberTable.role, matchingRoles),
+      )
 
   const assignedPolicies = assignedWhere
     ? await db
@@ -159,7 +154,7 @@ export async function calculateDesktopPolicyForOrgMember(input: {
   const effectivePolicy = calculateEffectiveDesktopPolicy({
     orgPolicyCount: orgPolicies.length,
     defaultPolicy: defaultPolicy?.policy ?? {},
-    assignedPolicies: uniqueAssignedPolicies.map((row) => normalizeDesktopPolicyValue(row.policy)),
+    assignedPolicies: uniqueAssignedPolicies.map((row) => row.policy),
   })
   const onboardingPromptConfig = selectEffectiveOnboardingPromptConfig({
     defaultPolicy: defaultPolicy?.policy ?? {},
@@ -173,6 +168,7 @@ export async function calculateDesktopPolicyForOrgMember(input: {
 
   return {
     ...effectivePolicy,
+    execution: resolveDesktopExecutionPolicy([defaultPolicy?.policy, ...uniqueAssignedPolicies.map((row) => row.policy)]),
     ...(onboardingPromptConfig !== undefined ? onboardingPromptConfig : {}),
   }
 }
